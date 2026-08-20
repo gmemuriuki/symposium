@@ -104,7 +104,12 @@
       - [Proposed: Agent Plugins packages](./rfds/agent-plugins/proposed-reference.md)
       - [Proposed: How extensions are installed](./rfds/agent-plugins/proposed-install.md)
     - [Agent interaction testing](./rfds/agent-interaction-testing/README.md)
-        - [Proposed: Agent interaction tests](./rfds/agent-interaction-testing/proposed-agent-interaction-testing.md)
+      - [Scenario model](./rfds/agent-interaction-testing/scenario-model/README.md)
+      - [Agent adapters](./rfds/agent-interaction-testing/agent-adapters/README.md)
+      - [Execution environments](./rfds/agent-interaction-testing/environments/README.md)
+      - [Evidence and results](./rfds/agent-interaction-testing/evidence/README.md)
+      - [Coverage and CI](./rfds/agent-interaction-testing/coverage-and-ci/README.md)
+      - [Proposed: Agent interaction tests](./rfds/agent-interaction-testing/proposed-guide/README.md)
   - [Completed](./rfds/completed.md) <!-- move completed rfds to this section -->
     - [Configuration parsing and normalization](./rfds/config-normalization/README.md)
     - [RFD Process](./rfds/rfd-process/README.md)
