@@ -58,19 +58,19 @@ A result may also carry modifiers that preserve important qualifications without
 - `non-authoritative(contaminated-auth-context)` means local credentials could not be separated from user or agent configuration.
 - `stability-warning(recovered-infrastructure-error)` means a recognized infrastructure failure occurred before the complete fresh-state retry passed.
 
-Modifiers are recorded in the summary, journal, and aggregate reports. They never turn `Failed` into `Passed` or make a non-authoritative run satisfy a conformance or release requirement.
+Modifiers are recorded in the summary, journal, and aggregate reports. They never turn `Failed` into `Passed` or make a non-authoritative run satisfy a conformance requirement.
 
 Explicitly requesting an unavailable combination exits unsuccessfully; ordinary `cargo test` remains unaffected. There is no expected-failure scenario result. A known product-gap reproducer still returns `Failed` when run directly.
 
-Suite aggregation consults the coverage table separately. A `Gap(issue)` reproducer runs on its reporting schedule but is excluded from the release gate and listed as a known gap. Adding a gap, removing its reproducer, or increasing the gap count requires review. Covered scenarios retain their ordinary gating behavior.
+The coverage table records a `Gap(issue)` separately from completed tracer coverage. Its executable reproducer still returns `Failed`; this RFD does not add expected-failure results or release-gate policy.
 
-Failures name an owning phase such as `environment.prepare`, `symposium.cli`, `symposium.state`, `agent.start`, `agent.turn`, `fixture.mcp`, `assertion`, or `cleanup`. A Symposium crash, missing prompt, wrong state, or completed agent turn without its required witness is `Failed`.
+Failures name an owning phase such as `environment.prepare`, `symposium.cli`, `symposium.state`, `agent.start`, `agent.query`, `fixture.mcp`, `assertion`, or `cleanup`. A Symposium crash, missing prompt, wrong state, or completed agent query without its required witness is `Failed`.
 
-Exceeding a scenario-owned token or operation limit is `Failed` because the witness did not fit its contract. Harness-controlled context that already exceeds the declared limit, exhaustion of a daily or monthly token ledger, or an operator ceiling stopping the run is `InfrastructureError` owned by `runner.budget`. Missing trustworthy provider accounting makes scheduled paid execution `Unavailable`.
+Exceeding a scenario-owned token or operation limit is `Failed` because the witness did not fit its contract. Harness-controlled context that already exceeds the declared limit or an operator ceiling stopping the run is `InfrastructureError` owned by `runner.budget`. Missing trustworthy provider accounting makes a paid query `Unavailable`.
 
 ## Retries and cleanup
 
-Assertion and Symposium failures are never retried automatically. A recognized transient infrastructure error may retry the complete scenario once with fresh state. Individual steps are never replayed inside an existing container or conversation.
+Assertion and Symposium failures are never retried automatically. An agent-free scenario with a recognized transient infrastructure error may retry once from fresh state. A scenario that contacted a paid provider is never retried automatically; another attempt requires a new explicit invocation. Individual steps are never replayed inside an existing container or query context.
 
 Both attempts are preserved. A recovered run remains `Passed` with the `stability-warning(recovered-infrastructure-error)` modifier and attempt metadata, so infrastructure reliability still counts the transient.
 

@@ -39,21 +39,21 @@ run cargo agents sync under a PTY
 wait for the dependency suggestion
 choose Enable
 assert the visible prompt, structured events, exit status, config, and files
-start a persistent Claude session
+run one bounded query through the Claude adapter
 assert a fixture capability witness
 ```
 
 A separate decline scenario begins from fresh state, selects “No, don't ask again,” restarts the CLI, and proves that the decision persists and the prompt does not return. Ask-later and Escape variants record nothing.
 
-The same typed scenario model runs through deterministic, native process, Linux-container, and selected real-agent layers. Unsupported combinations are reported explicitly rather than silently weakened.
+The same registered scenario runs through in-process, native-process, Linux-container, and selected real-agent layers. Unsupported combinations are reported explicitly rather than silently weakened.
 
 ## Design chapters
 
-- [Scenario model](./scenario-model/README.md) defines the shared engine, typed linear scenarios, production process boundary, PTY scripting, and explicit time-state fixtures.
-- [Agent adapters](./agent-adapters/README.md) defines Claude, ACP, fake adapters, persistent sessions, capability witnesses, permissions, and runtime pinning.
+- [Scenario model](./scenario-model/README.md) defines declarative registration metadata, imperative Rust bodies, the production process boundary, PTY scripting, and explicit time-state fixtures.
+- [Agent adapters](./agent-adapters/README.md) defines Claude, ACP and fake follow-ups, bounded queries, capability witnesses, permissions, and runtime pinning.
 - [Execution environments](./environments/README.md) defines host and container isolation, native OS coverage, binary provenance, initialization, networking, trust, and authentication.
 - [Evidence and results](./evidence/README.md) defines dual observation, canonical events, assertions, results, retries, cleanup, and artifact safety.
-- [Coverage and CI](./coverage-and-ci/README.md) defines the contract table, coverage obligations, tracer journeys, command interface, budgets, reliability policy, and implementation steps.
+- [Coverage and CI](./coverage-and-ci/README.md) defines the contract table, coverage obligations, tracer journeys, command interface, cost controls, and implementation steps.
 - [Proposed guide](./proposed-guide/README.md) shows how developers would list, run, inspect, and author scenarios.
 
 ## Key boundaries
@@ -68,7 +68,7 @@ Every real-agent journey has a bounded capability witness. General prose and cod
 
 ## Scope and milestones
 
-This RFD is implemented when the tracer is proven: the consent journey works through real native processes, a parsed PTY, structured evidence, a fresh Linux container, and a persistent-Claude witness, with useful failure artifacts and measured runtime.
+This RFD is implemented when the tracer is proven: the consent journey works through real native processes, a parsed PTY, structured evidence, a fresh Linux container, and one bounded Claude capability witness, with useful failure artifacts and measured runtime.
 
 Broader catalog automation, consent branches, cross-platform process lanes, fake and ACP conformance, hook and MCP witnesses, and trusted release CI are follow-on direction rather than acceptance criteria for this RFD. They require tracked issues or follow-on RFDs after the tracer informs the interfaces. See [Coverage and CI](./coverage-and-ci/README.md#milestones-and-follow-on-direction).
 
@@ -76,11 +76,11 @@ Broader catalog automation, consent branches, cross-platform process lanes, fake
 
 ### Does this replace the current integration tests?
 
-No. It reuses them and adds missing process, PTY, isolation, observation, and persistent-agent seams. A real-agent call is added only when activation inside the agent is the behavior under test.
+No. It reuses them and adds missing process, PTY, isolation, observation, and agent-delivery seams. A real-agent query is added only when activation inside the agent is the behavior under test.
 
 ### Why not adopt one of the linked CLI testing projects?
 
-`cli-testing-library` provides a useful screen-query and user-event model, which this design borrows. Its Node implementation and platform constraints are not a good foundation for this Rust, cross-platform harness. `cli-testing-specialist` targets generic generated CLI validation and does not provide Symposium-specific state, consent, hooks, MCP, or persistent-agent behavior.
+`cli-testing-library` provides a useful screen-query and user-event model, which this design borrows. Its Node implementation and platform constraints are not a good foundation for this Rust, cross-platform harness. `cli-testing-specialist` targets generic generated CLI validation and does not provide Symposium-specific state, consent, hooks, MCP, or agent-delivery behavior.
 
 ## Implementation status
 

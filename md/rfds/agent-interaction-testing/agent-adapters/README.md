@@ -6,24 +6,23 @@ An `AgentDriver`:
 
 - reports its capabilities and supported witness forms;
 - prepares only agent-specific runtime and authentication state;
-- starts and stops a persistent session;
-- sends turns and waits for protocol completion;
+- runs a bounded query and waits for protocol completion;
 - reports input, cache-read, cache-write, and output usage for every provider request;
 - enforces supported output and operation limits and responds to runner cancellation;
 - applies scenario-declared permission policy; and
 - returns normalized events plus sanitized raw provider artifacts.
 
-The driver interface is capability-based. A scenario requiring an unsupported capability or witness is `Unavailable` for that adapter rather than weakened to a filesystem-only check. An adapter without trustworthy usage accounting cannot run in scheduled paid CI.
+The driver interface is capability-based. A scenario requiring an unsupported capability or witness is `Unavailable` for that adapter rather than weakened to a filesystem-only check. An adapter without trustworthy usage accounting cannot run a paid tracer query.
 
 ## Initial adapters
 
-Claude is the first production adapter because Symposium developers already use it. Main journeys use its structured SDK so completion and tool activity are observable. One narrow PTY smoke test covers the interactive Claude entry point.
+Claude is the first production adapter because Symposium developers already use it. The tracer uses its structured SDK so completion, tool activity, and provider usage are observable without paying for a second interactive-entry-point smoke test.
 
-The existing `AgentSession::ClaudeSdk` path starts a fresh query for each prompt. Its replacement maintains one conversation across turns so that confirmation, restarts, and follow-up behavior are genuine interactions.
+The tracer needs one fresh, bounded Claude query to prove delivery of the fixture capability. The provisional driver therefore does not introduce persistent-conversation machinery. A later scenario that genuinely depends on multiple turns or an agent restart must add that capability deliberately and test it before the driver contract grows to include it.
 
 The tracer implements Claude behind a provisional capability-based interface. It does not claim cross-agent behavioral consistency from one production adapter.
 
-Before the interface is declared stable, a follow-up adds deterministic fake adapters for success, failure, timeout, malformed-event, and missing-capability paths. The existing persistent ACP path then becomes a second adapter and is contract-tested against a fixture ACP agent. Only Claude belongs to this RFD's scheduled real-agent tracer.
+Before the interface is declared stable, a follow-up adds deterministic fake adapters for success, failure, timeout, malformed-event, and missing-capability paths. The existing persistent ACP path can then inform a separately tested session capability and a second adapter. Only the bounded Claude query belongs to this RFD's real-agent tracer.
 
 ## Capability witnesses
 

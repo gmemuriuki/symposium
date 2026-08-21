@@ -6,20 +6,33 @@ Agent interaction tests extend `symposium-testlib`; they do not create a second 
 
 `cargo test` remains the frontend for deterministic and selected host scenarios. Xtask is a thin orchestration frontend for environment selection, credentials, containers, filtering, real-agent execution, and artifact retention.
 
-## Scenario data
+## Scenario registration and body
 
-Scenarios are authored with typed Rust builders. The underlying model contains portable data rather than arbitrary closures, so it can be serialized and may later gain a TOML or YAML frontend.
+Each scenario has declarative registration metadata and an imperative Rust body. The runner can list and preflight the metadata without executing the body. The metadata declares:
 
-A scenario declares:
-
+- a stable name and short description;
 - fixture layers and controlled services;
 - required environment and agent capabilities;
-- ordered CLI, user, agent, mutation, restart, and checkpoint steps;
 - a capability witness for every real-agent interaction;
 - deadlines, resource limits, and scenario-owned agent budgets;
 - a least-privilege permission policy;
 - contract rule identifiers; and
-- assertions and artifact-retention policy.
+- artifact-retention policy.
+
+The body is an ordinary asynchronous Rust function returning `Result`. It receives a constrained `ScenarioContext` for running commands, driving the terminal, querying an agent, mutating controlled fixture state, and making assertions. Using Rust control flow and `?` keeps a failure at the operation that caused it instead of reporting one interpreter failure for the whole journey.
+
+```rust,ignore
+async fn dependency_consent_accept(cx: &mut ScenarioContext) -> Result<()> {
+    cx.run_init().await?;
+    let mut sync = cx.spawn_sync_pty().await?;
+    sync.wait_for("Enable this dependency?").await?;
+    sync.press_enter().await?;
+    cx.assert_skill_installed("fixture-skill")?;
+    Ok(())
+}
+```
+
+The body cannot access undeclared host paths, process-global environment, credentials, or agent-specific APIs. Those remain behind `ScenarioContext`, environment backends, and agent adapters. A paid query, external endpoint, fixture service, or privileged operation must be declared in metadata so preflight cannot be bypassed by imperative code.
 
 Scenarios select capabilities, not agent brands. Agent-specific paths, authentication fields, event types, and witness mechanisms remain in adapters.
 
@@ -27,9 +40,9 @@ Agent token budgets are cumulative across every provider request made for the jo
 
 ## State and branching
 
-Scenarios are linear. Accept, decline, ask-later, and Escape are separate scenarios that may reuse fixture descriptions but never writable state.
+Each scenario follows one expected behavioral path. Accept, decline, ask-later, and Escape are separate scenarios that may reuse fixture descriptions but never writable state.
 
-Every scenario and retry begins with a fresh workspace, user configuration, agent configuration, cache, services, and conversation. Steps within one scenario share state deliberately, including across declared process or agent restarts. Persistence and cache scenarios express repeated commands in that one journey because preserved state is what they test.
+Every scenario and retry begins with a fresh workspace, user configuration, agent configuration, cache, services, and agent query context. Steps within one scenario share state deliberately, including across declared process restarts. Persistence and cache scenarios express repeated commands in that one journey because preserved state is what they test.
 
 Scenario logic does not branch around unexpected output. A missing or different checkpoint fails at that step.
 
@@ -57,6 +70,8 @@ This RFD does not add a production clock seam. Time-dependent tests mutate contr
 
 These mutations test the production comparison against the real wall clock without waiting for time to pass. If a later contract cannot be tested this way, its clock abstraction requires a separate design. Container, agent, TLS, provider, and process deadlines always use real time.
 
-## Why typed Rust instead of a scenario DSL?
+## Why metadata plus an imperative Rust body?
 
-Typed builders provide compiler-assisted refactoring, IDE discovery, and direct reuse of test helpers while the vocabulary is evolving. The tradeoff is recompilation and a higher contribution barrier for non-Rust authors. Keeping the model serializable and closure-free preserves the option to add a data-file frontend after the vocabulary stabilizes.
+Preflight needs declarative metadata before fixtures, containers, credentials, or paid agents are started. Journey execution benefits from ordinary Rust: compiler-assisted refactoring, direct reuse of test helpers, native asynchronous control flow, and line-local errors through `?`.
+
+A fully data-driven scenario would require the harness to grow an interpreter for every new interaction and would concentrate failures at that interpreter boundary. The constrained context preserves backend and adapter neutrality without creating a second programming language. Only registration metadata and the resulting execution plan need to be serializable; scenario bodies do not.
