@@ -10,7 +10,7 @@ The feature is experimental. Real-agent runs consume provider capacity and are o
 cargo xtask agent-test --list
 ```
 
-The scenario list reports required agent, environment, operating-system, and witness capabilities. The RFD's contract table maps the tracer's Symposium promises to executable scenarios and linked product gaps.
+The scenario list reports required agent, environment, operating-system, and witness capabilities. The contract table maps the tracer's Symposium promises to executable scenarios and linked product gaps.
 
 Running `cargo xtask agent-test` without a scenario prints an execution plan and does not start an agent.
 
@@ -66,9 +66,11 @@ Environment:              Linux container
 Agent/runtime:            Claude, pinned
 ```
 
+The [cost and runtime controls](../coverage-and-ci/README.md#cost-and-runtime-controls) are authoritative. The values above are the initial experimental tracer defaults.
+
 Real-agent scenarios enforce cumulative input, cache-read, cache-write, and output tokens as well as provider-request, turn, tool-call, deadline, and run-wide limits. Cached tokens still count even when they cost less. A paid run requires explicit selection, an agent name, and `--confirm-paid-run`.
 
-The initial tracer permits one user turn, at most four provider requests, three tool calls, 25,000 total input-side tokens, and 1,000 output tokens. Its base-token estimate is approximately $0.09 per run, its conservative allowance including cache-price differences is $0.20, and its dedicated provider key has a $5 monthly cap. Initial manual runs record usage so the limits can be reduced. The prompt and fixture are reduced before a limit is raised.
+The initial tracer permits one user turn, at most four provider requests, three tool calls, 25,000 total input-side tokens, and 1,000 output tokens. At the standard post-introductory Sonnet 5 price, its base-token ceiling is approximately $0.09 per run. Its conservative allowance including cache-price differences is $0.20, and its dedicated provider key has a $5 monthly cap. Initial manual runs record usage so the limits can be reduced. The prompt and fixture are reduced before a limit is raised.
 
 ## Read a result
 
@@ -108,6 +110,6 @@ Time-dependent scenarios mutate controlled persisted inputs instead of sleeping 
 
 ## CI operation
 
-Fast ordinary tests block pull requests. Stable agent-free process, PTY, and small Linux-container scenarios may graduate after meeting runtime and reliability criteria. Real-agent tracer journeys are manually selected and non-gating during this RFD.
+Fast ordinary tests block pull requests. Stable agent-free process, PTY, and small Linux-container scenarios may graduate after meeting runtime and reliability criteria. Real-agent tracer journeys are manually selected and non-gating while the command is experimental.
 
-Scheduling, triage ownership, quarantine, pass-rate targets, and release gating require a follow-up informed by measured tracer reliability, runtime, and cost.
+Scheduled execution, triage ownership, quarantine, pass-rate targets, and release gating are not part of the experimental command. They require a separate policy informed by measured reliability, runtime, and cost.

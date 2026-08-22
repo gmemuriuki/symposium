@@ -25,6 +25,25 @@ Each event envelope contains:
 - real monotonic offset; and
 - normalized payload.
 
+A confirmation event has this shape:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "run-fixture-01",
+  "scenario_id": "dependency-consent-accept",
+  "attempt": 1,
+  "source": "symposium",
+  "source_sequence": 4,
+  "operation_id": "sync-01",
+  "kind": "confirmation.answered",
+  "monotonic_offset_ms": 184,
+  "payload": {
+    "decision": "enable"
+  }
+}
+```
+
 Provider-operation events record requested limits and reported input, cache-read, cache-write, and output tokens. Aggregate token counts and derived cost are evidence, not estimates substituted for missing accounting.
 
 Sequence is strict within one source. Receipt order is diagnostic and does not imply causal order across processes. Assertions express partial order within a source or correlated operation, such as discovery before confirmation and confirmation before installation. Unrelated sources remain unordered unless explicitly correlated.
@@ -46,12 +65,14 @@ Model prose is checked only through a narrow fixture-defined nonce or fact when 
 
 ## Results and failure ownership
 
-A run has four results:
+A run has four base results:
 
-- `Passed`: the requested journey and assertions completed.
-- `Failed`: the environment ran, but Symposium or the interaction violated the contract.
-- `InfrastructureError`: credentials, provider, runtime, environment, or harness failed.
-- `Unavailable`: preflight found that the selected adapter or environment lacks a required capability.
+| Result | Meaning |
+|---|---|
+| `Passed` | The requested journey and assertions completed. |
+| `Failed` | The environment ran, but Symposium or the interaction violated the contract. |
+| `InfrastructureError` | Credentials, provider, runtime, environment, runner budget, or harness failed. |
+| `Unavailable` | Preflight found that the selected adapter or environment lacks a required capability. |
 
 A result may also carry modifiers that preserve important qualifications without creating another base result:
 
@@ -62,7 +83,7 @@ Modifiers are recorded in the summary, journal, and aggregate reports. They neve
 
 Explicitly requesting an unavailable combination exits unsuccessfully; ordinary `cargo test` remains unaffected. There is no expected-failure scenario result. A known product-gap reproducer still returns `Failed` when run directly.
 
-The coverage table records a `Gap(issue)` separately from completed tracer coverage. Its executable reproducer still returns `Failed`; this RFD does not add expected-failure results or release-gate policy.
+The [coverage table](../coverage-and-ci/README.md#contract-table) records a `Gap(issue)` separately from completed tracer coverage. Its executable reproducer still returns `Failed`; the result vocabulary has no expected-failure state.
 
 Failures name an owning phase such as `environment.prepare`, `symposium.cli`, `symposium.state`, `agent.start`, `agent.query`, `fixture.mcp`, `assertion`, or `cleanup`. A Symposium crash, missing prompt, wrong state, or completed agent query without its required witness is `Failed`.
 

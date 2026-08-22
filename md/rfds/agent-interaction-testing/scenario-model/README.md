@@ -1,10 +1,10 @@
 # Scenario model
 
-## Shared engine
+## Test frontends and shared engine
 
 Agent interaction tests extend `symposium-testlib`; they do not create a second fixture or assertion system. Ordinary tests and `cargo xtask agent-test` use the same fixture composition, scenario model, event vocabulary, and assertions.
 
-`cargo test` remains the frontend for deterministic and selected host scenarios. Xtask is a thin orchestration frontend for environment selection, credentials, containers, filtering, real-agent execution, and artifact retention.
+`cargo test` remains the frontend for deterministic and selected host scenarios. `cargo xtask agent-test` orchestrates environment selection, credentials, containers, filtering, real-agent execution, and artifact retention. A scenario does not change meaning when selected through a different frontend.
 
 ## Scenario registration and body
 
@@ -32,7 +32,7 @@ async fn dependency_consent_accept(cx: &mut ScenarioContext) -> Result<()> {
 }
 ```
 
-The body cannot access undeclared host paths, process-global environment, credentials, or agent-specific APIs. Those remain behind `ScenarioContext`, environment backends, and agent adapters. A paid query, external endpoint, fixture service, or privileged operation must be declared in metadata so preflight cannot be bypassed by imperative code.
+The body cannot access undeclared host paths, process-global environment, credentials, or agent-specific APIs. Those remain behind `ScenarioContext`, environment backends, and agent adapters. A paid query, external endpoint, fixture service, or privileged operation must be declared in metadata. The context rejects an operation that was not authorized by the registration metadata.
 
 Scenarios select capabilities, not agent brands. Agent-specific paths, authentication fields, event types, and witness mechanisms remain in adapters.
 
@@ -60,8 +60,6 @@ Ordinary scenarios use a fixed terminal size, UTF-8 locale, declared TERM and co
 
 Screen normalization handles cursor movement, redraws, color, and newline differences. Raw sanitized bytes remain diagnostic evidence. A small rendering suite separately tests color and resizing; ordinary journeys do not snapshot the complete screen.
 
-This adopts the useful interaction model from `cli-testing-library`: wait for what a user can see, then send user input, without adopting its Node implementation.
-
 ## Time-dependent scenarios
 
 Tests never synchronize with fixed sleeps. Every wait targets an observable condition and has a real monotonic deadline.
@@ -70,8 +68,8 @@ This RFD does not add a production clock seam. Time-dependent tests mutate contr
 
 These mutations test the production comparison against the real wall clock without waiting for time to pass. If a later contract cannot be tested this way, its clock abstraction requires a separate design. Container, agent, TLS, provider, and process deadlines always use real time.
 
-## Why metadata plus an imperative Rust body?
+## Metadata and body boundary
 
 Preflight needs declarative metadata before fixtures, containers, credentials, or paid agents are started. Journey execution benefits from ordinary Rust: compiler-assisted refactoring, direct reuse of test helpers, native asynchronous control flow, and line-local errors through `?`.
 
-A fully data-driven scenario would require the harness to grow an interpreter for every new interaction and would concentrate failures at that interpreter boundary. The constrained context preserves backend and adapter neutrality without creating a second programming language. Only registration metadata and the resulting execution plan need to be serializable; scenario bodies do not.
+Only registration metadata and the resulting execution plan are serializable. Scenario bodies are compiled Rust and are not loaded from TOML, YAML, or another scenario language. The constrained context preserves backend and adapter neutrality without exposing backend objects to the body. The [root rationale](../README.md#describe-complete-journeys-as-data) records why the design does not use a fully data-driven scenario format.

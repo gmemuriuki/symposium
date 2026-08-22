@@ -2,11 +2,16 @@
 
 ## Environment backends
 
-The host backend is for fast local iteration. It creates fresh project, home, configuration, cache, and temporary directories and passes an explicit filtered environment to every child process. Host results remain non-authoritative because installed tools and the operating system can influence them.
+| Backend | Purpose | Isolation claim |
+|---|---|---|
+| Host | Fast local iteration and native process behavior | Fresh test state, but installed tools and the host operating system remain observable |
+| Linux container | Reproducible Linux conformance | Fresh restricted container with controlled tools, filesystem, and networking |
+
+The host backend creates fresh project, home, configuration, cache, and temporary directories and passes an explicit filtered environment to every child process. Host results remain non-authoritative because installed tools and the operating system can influence them.
 
 The Linux container backend is the isolated conformance environment. The tracer uses Docker behind an interface that can later support another container runtime, a VM, or a remote worker. Linux-container results are authoritative only for Linux.
 
-Windows and macOS use native deterministic and real-process/PTY CI lanes with fresh test directories. These lanes cover platform-specific paths, command dispatch, shell behavior, PTYs, permissions, and process handling without claiming container-strength isolation. Native real-agent smokes may be added when trusted runners and credentials are available.
+Windows and macOS coverage is follow-up work. Native deterministic and real-process/PTY lanes use fresh test directories and cover platform-specific paths, command dispatch, shell behavior, PTYs, permissions, and process handling without claiming container-strength isolation. Native real-agent smokes require trusted runners and credentials.
 
 ## Scenario isolation
 
@@ -59,4 +64,4 @@ Container conformance uses a restricted API key available only to trusted jobs a
 
 Host authentication is explicit: `--auth api-key` or `--auth local`. API-key mode uses a fresh agent home. Local mode bridges only the minimum adapter-supported credential material, read-only, while agent settings, Symposium configuration, skills, hooks, MCP configuration, caches, and query history remain fresh.
 
-If an agent cannot separate credentials from user configuration, the base result carries the `non-authoritative(contaminated-auth-context)` modifier. The manifest records the mode and inherited credential paths without their contents.
+If an agent cannot separate credentials from user configuration, the base result carries the [`non-authoritative(contaminated-auth-context)` modifier](../evidence/README.md#results-and-failure-ownership). The manifest records the mode and inherited credential paths without their contents.

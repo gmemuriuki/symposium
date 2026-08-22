@@ -2,14 +2,14 @@
 
 ## Contract table
 
-The tracer begins with a reviewed Markdown table of the Symposium promises it exercises. Each row has a stable rule identifier, a behavioral statement, a link to the accepted specification, its required test layers, and one state:
+The tracer begins with a reviewed Markdown table of the Symposium promises it exercises. Each row has a stable rule identifier, a behavioral statement, its required test layers, and one state:
 
 - `Committed(step)`: this RFD commits to implementing the row in the named tracer step. It becomes `Covered` after the required scenarios pass.
 - `Covered`: every required tracer scenario exists and passes.
 - `Gap(issue)`: the implementation is known to violate the specification, a linked issue owns the discrepancy, and an executable reproducer returns `Failed` when run directly.
 - `Direction(follow-up)`: the rule is outside this RFD's tracer commitment and must be carried into a closing follow-up issue or RFD. It is not counted as tracer coverage.
 
-Accepted RFDs and current reference documentation remain authoritative. The table must not copy an implementation bug into the expected result.
+Accepted RFDs and current reference documentation remain authoritative; this table is a coverage index rather than a replacement specification. It must not copy an implementation bug into the expected result.
 
 Typed Rust scenarios name the rules they prove. After enough journeys exist to expose stable catalog requirements, a follow-up may make the table machine-readable, validate layer and operating-system obligations, and generate a coverage report. This RFD does not build that meta-tool before the first journey.
 
@@ -21,14 +21,14 @@ The matrix records intended obligations, including follow-on direction; it does 
 
 | Rule ID | Contract | State | In-process | Real process | Real agent |
 |---|---|---|---:|---:|---:|
-| `consent.accept` | Undecided candidate is accepted | `Committed(steps 1, 3)` | required | required, PTY | not required |
-| `consent.decline` | Undecided candidate is declined | `Committed(steps 1, 3)` | required | required, PTY | not required |
+| `consent.accept` | Undecided candidate is accepted | `Committed(steps 2, 3)` | required | required, PTY | not required |
+| `consent.decline` | Undecided candidate is declined | `Committed(steps 2, 3)` | required | required, PTY | not required |
 | `consent.defer` | Ask later records nothing | `Direction(follow-up)` | required | required, PTY | not required |
 | `cli.noninteractive` | Noninteractive execution never prompts | `Direction(follow-up)` | required | required, pipes | not required |
 | `enablement.disable-precedence` | Disable overrides other enablement | `Direction(follow-up)` | required | representative, pipes | not required |
 | `cache.expiration` | Cache expiration reevaluates its input | `Direction(follow-up)` | required | required, pipes | not required |
 | `hook.stdout-protocol` | Hook stdout contains only protocol output | `Committed(step 1)` | not sufficient | required, pipes | not required |
-| `isolation.skill-inventory` | Isolated custom-skill inventory exactly matches the fixture | `Committed(steps 1, 3, 4)` | not required | required, pipes | required |
+| `isolation.skill-inventory` | Isolated custom-skill inventory exactly matches the fixture | `Committed(steps 2, 3, 4)` | not required | required, pipes | required |
 | `delivery.skill` | An enabled fixture skill reaches the selected agent | `Committed(step 4)` | not sufficient | required, pipes | one delivery smoke |
 | `use.search-endpoint` | Non-workspace `use` search uses only its declared fixture endpoint | `Direction(follow-up)` | required | required, pipes | not required |
 | `delivery.hook` | Hook delivery reaches an agent | `Direction(follow-up)` | required | representative, pipes | required |
@@ -72,7 +72,7 @@ Initial options are:
 --keep-artifacts
 ```
 
-`--scenario` is repeatable. No scenario means “print the execution plan,” not “start an agent.” A selection containing a real-agent journey requires an explicit agent and `--confirm-paid-run`. Missing runtime, credentials, or capability yields `Unavailable`; a requested container never silently falls back to the host.
+`--scenario` is repeatable. No scenario means "print the execution plan," not "start an agent." A selection containing a real-agent journey requires an explicit agent and `--confirm-paid-run`. Missing runtime, credentials, or capability yields `Unavailable`; a requested container never silently falls back to the host.
 
 The plan reports CLI-only and real-agent scenarios, scenario and operator token limits, maximum turns, provider requests, and tool calls, the provider-side spending cap, environment, binary provenance, and pinned runtime before execution.
 
@@ -90,61 +90,21 @@ Runtime reporting separates checkout build or image preparation, warm environmen
 
 The tracer's provisional guard permits one user turn, at most four provider requests, three tool calls, 25,000 total input-side tokens across base input, cache reads, and cache writes, and 1,000 cumulative output tokens. Initial manual runs record actual usage so these limits can be reduced. If the pinned runtime cannot produce the nonce witness within the guard, the prompt, tools, fixture, and context are reduced before any limit is raised.
 
-At the standard Sonnet base price of $3 per million input tokens and $15 per million output tokens, the provisional base-token estimate is approximately $0.09 per run. The runner reports a conservative allowance of $0.20 per run for cache-price differences while the provider key caps the month at $5. The estimate is recalculated when the model pin or [provider pricing](https://www.anthropic.com/news/claude-sonnet-5) changes; tokens remain the primary limit and dollars are derived reporting.
+At Sonnet 5's standard price after its introductory period, $3 per million input tokens and $15 per million output tokens, the provisional base-token ceiling is approximately $0.09 per run. The runner reports a conservative allowance of $0.20 per run for cache-price differences while the provider key caps the month at $5. The estimate is recalculated when the model pin or [provider pricing](https://www.anthropic.com/research/claude-sonnet-5) changes; tokens remain the primary limit and dollars are derived reporting.
 
-## CI lanes in this RFD
+## Tracer CI boundary
 
 - Fast deterministic tests block every pull request.
 - Stable native agent-free process and PTY scenarios may become PR-blocking.
 - A small agent-free Linux-container suite may graduate if its measured runtime is acceptable.
-- Real-agent tracer journeys are explicitly selected, manually run, and non-gating during this RFD.
+- Real-agent tracer journeys are explicitly selected, manually run, and non-gating while the runner is experimental.
 
 Agent-free tests graduate after an observation period with no unexplained flakes, acceptable runtime, actionable failure artifacts, reliable cleanup, and consistently successful secret-canary validation. Provider credentials are never exposed to fork pull requests.
 
-This RFD does not define scheduled ownership, quarantine, pass-rate, or release-gating policy for real-agent tests. A follow-up may propose those mechanisms using measured tracer reliability, runtime, and cost rather than assumptions.
+Scheduled ownership, quarantine, pass-rate, and release-gating policy for real-agent tests are outside the tracer contract. A follow-up may propose those mechanisms using measured reliability, runtime, and cost rather than assumptions.
 
-## Milestones and follow-on direction
-
-### Tracer proven
-
-The dependency-consent journey reuses the current fixture infrastructure and runs real `init` and `sync` processes. Accept and decline work through a parsed PTY, structured events agree with final state, the scenario runs in a fresh Linux container, and the accepted branch produces a bounded Claude capability witness. Failure artifacts, cleanup, cost, and phase timing are demonstrated.
-
-This validates the architecture and completes this RFD.
-
-### Post-tracer direction
+## Post-tracer direction
 
 After the tracer, tracked follow-ups can expand the contract table across registry, discovery, predicate, cache, and delivery behavior. They can add every consent branch, representative Linux-container and native Windows/macOS lanes, fake and fixture-ACP adapter contracts, and selected hook and MCP witnesses.
 
 Catalog automation, full release reporting, a latest-agent canary, and broader CI graduation are separate commitments informed by tracer evidence. They are not acceptance criteria for this RFD.
-
-## Implementation plan
-
-### Step 1: Run the first black-box host journey
-
-From an empty user configuration, run compiled `cargo agents init --add-agent <agent>` and `cargo agents sync` processes under a PTY for one dependency candidate. Add only the scenario steps, side-channel events, terminal anchors, assertions, and artifacts required for initialization plus accept and decline.
-
-Verify both branches against terminal output, structured events, exit status, configuration, filesystem state, the host-state canary, and the exact fixture-controlled custom-skill inventory. Fix the hook stdout contamination bug and add a black-box regression that invokes the compiled hook through pipes and proves stdout is valid protocol output only.
-
-### Step 2: Record the tracer contracts
-
-Write the initial Markdown contract table from the behavior exercised by step 1. A discrepancy becomes `Gap(issue)` only when it has a product issue and executable reproducer; otherwise it remains follow-on direction. Do not add catalog code generation or validation.
-
-Verify manually that every `Covered` row names an executable scenario and every `Gap(issue)` row names both an issue and a reproducer.
-
-### Step 3: Isolate the journey in Linux
-
-Add Docker execution, the content-addressed Symposium binary, least-privilege rules, networking disabled, and infrastructure diagnostics. Run the existing consent scenario unchanged. Do not add provider egress or general fixture-service infrastructure in this step.
-
-Verify cold preparation, warm startup, the same host-state canary and custom-skill inventory assertions used by the host backend, and parity with the remaining host assertions.
-
-### Step 4: Add the first real-agent witness
-
-Add the bounded Claude adapter and extend the container-backed accepted branch with one fixture-skill query. Pin its runtime and add only the allowlisted provider egress and restricted API-key handling this query requires.
-
-Verify the capability nonce, exact pre-query custom-skill inventory, installation and hook-registration evidence, usage limits, redaction, and error classification.
-
-Record the manually invoked result without automatic paid retries. The tracer remains non-gating.
-
-Before closing the RFD, correct `md/design/running-tests.md` so it documents the `SYMPOSIUM_ENABLE_AGENT_TESTING` gate. Keep `TestMode::AgentOnly`, `test-agents.toml`, and `tests/agent_harness/run_scenario.py` temporarily for existing Claude and ACP coverage, but mark that path as superseded and add no new scenarios to it. File its removal with the ACP follow-up, after remaining scenarios migrate.
-
-Also file follow-up issues or RFDs for catalog automation, fake and ACP conformance, remaining scenario families, native operating-system expansion, and release CI graduation.
