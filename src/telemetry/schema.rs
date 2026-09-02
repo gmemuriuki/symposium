@@ -3,6 +3,8 @@
     not(test),
     expect(dead_code, reason = "the new schema is built before storage uses it.")
 )]
+use std::num::NonZeroU64;
+
 use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -18,6 +20,61 @@ impl EventId {
     pub(super) fn new() -> Self {
         Self(Uuid::new_v4())
     }
+}
+
+/// Positive schema version carried by a telemetry row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(super) struct SchemaVersion(NonZeroU64);
+
+impl SchemaVersion {
+    /// Initial version of every telemetry row kind.
+    pub(super) const V1: Self = Self(NonZeroU64::MIN);
+}
+
+/// Kind of row stored in the telemetry data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RowKind {
+    SessionStart,
+    AgentConfiguration,
+    ResolutionSummary,
+    PackageResolution,
+    ExtensionResolution,
+    HookMetrics,
+    PluginHookMetrics,
+    Command,
+    StorageLimit,
+    ExtensionInvocationMetrics,
+}
+
+fn deserialize_version_one<'de, D>(deserializer: D) -> Result<SchemaVersion, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = SchemaVersion::deserialize(deserializer)?;
+
+    if version != SchemaVersion::V1 {
+        return Err(D::Error::custom(format_args!(
+            "expected schema version 1, found {}",
+            version.0
+        )));
+    }
+
+    Ok(version)
+}
+
+fn deserialize_storage_limit_kind<'de, D>(deserializer: D) -> Result<RowKind, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let kind = RowKind::deserialize(deserializer)?;
+
+    if kind != RowKind::StorageLimit {
+        return Err(D::Error::custom("expected storage_limit row kind"));
+    }
+
+    Ok(kind)
 }
 
 /// UTC calendar day used to partition telemetry rows.
@@ -135,9 +192,59 @@ impl<'de> Deserialize<'de> for SymposiumVersion {
     }
 }
 
+/// Version 1 marker recording that the daily storage limit rejected an operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StorageLimitV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    #[serde(deserialize_with = "deserialize_storage_limit_kind")]
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    symposium: SymposiumVersion,
+    dropped_operation: DroppedOperation,
+}
+
+impl StorageLimitV1 {
+    /// Create a marker for an operation rejected by the daily storage limit.
+    pub(super) fn new(day: UtcDay, dropped_operation: DroppedOperation) -> Self {
+        Self {
+            version: SchemaVersion::V1,
+            kind: RowKind::StorageLimit,
+            event_id: EventId::new(),
+            day,
+            symposium: SymposiumVersion::current(),
+            dropped_operation,
+        }
+    }
+}
+
+/// Operation whose telemetry did not fit in the daily storage allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DroppedOperation {
+    SessionStart,
+    ManualSync,
+    Use,
+    Remove,
+    Init,
+    Configuration,
+    Command,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STORAGE_LIMIT_EXAMPLE: &str = r#"{
+        "v": 1,
+        "kind": "storage_limit",
+        "event_id": "8430f7f3-7ec5-4ca5-9c65-8f6e83eaa3de",
+        "day": "2026-08-03",
+        "symposium": "0.4.0",
+        "dropped_operation": "manual_sync"
+    }"#;
 
     #[test]
     fn new_event_id_is_uuid_v4() {
@@ -169,6 +276,64 @@ mod tests {
     #[test]
     fn event_id_rejects_invalid_uuid() {
         let result = serde_json::from_str::<EventId>(r#""not-a-uuid""#);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_version_one_serializes_as_number() {
+        let json = serde_json::to_string(&SchemaVersion::V1).unwrap();
+
+        assert_eq!(json, "1");
+    }
+
+    #[test]
+    fn schema_version_accepts_future_positive_value() {
+        let version = serde_json::from_str::<SchemaVersion>("2").unwrap();
+
+        assert_eq!(version.0.get(), 2);
+    }
+
+    #[test]
+    fn schema_version_rejects_invalid_values() {
+        for invalid in ["0", "-1", "1.5", r#""1""#] {
+            assert!(
+                serde_json::from_str::<SchemaVersion>(invalid).is_err(),
+                "accepted invalid schema version {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_kinds_round_trip_with_contract_names() {
+        let cases = [
+            (RowKind::SessionStart, "session_start"),
+            (RowKind::AgentConfiguration, "agent_configuration"),
+            (RowKind::ResolutionSummary, "resolution_summary"),
+            (RowKind::PackageResolution, "package_resolution"),
+            (RowKind::ExtensionResolution, "extension_resolution"),
+            (RowKind::HookMetrics, "hook_metrics"),
+            (RowKind::PluginHookMetrics, "plugin_hook_metrics"),
+            (RowKind::Command, "command"),
+            (RowKind::StorageLimit, "storage_limit"),
+            (
+                RowKind::ExtensionInvocationMetrics,
+                "extension_invocation_metrics",
+            ),
+        ];
+
+        for (kind, name) in cases {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded = serde_json::from_str::<RowKind>(&json).unwrap();
+
+            assert_eq!(json, format!(r#""{name}""#));
+            assert_eq!(decoded, kind);
+        }
+    }
+
+    #[test]
+    fn row_kind_rejects_unknown_name() {
+        let result = serde_json::from_str::<RowKind>(r#""future_kind""#);
 
         assert!(result.is_err());
     }
@@ -292,6 +457,83 @@ mod tests {
     #[test]
     fn symposium_version_rejects_invalid_semver() {
         let result = serde_json::from_str::<SymposiumVersion>(r#""not-a-version""#);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn storage_limit_example_round_trips() {
+        let row = serde_json::from_str::<StorageLimitV1>(STORAGE_LIMIT_EXAMPLE).unwrap();
+
+        let actual = serde_json::to_value(row).unwrap();
+        let expected = serde_json::from_str::<serde_json::Value>(STORAGE_LIMIT_EXAMPLE).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn new_storage_limit_uses_fixed_common_fields() {
+        let day = UtcDay(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+
+        let row = StorageLimitV1::new(day, DroppedOperation::ManualSync);
+
+        assert_eq!(row.version, SchemaVersion::V1);
+        assert_eq!(row.kind, RowKind::StorageLimit);
+        assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
+        assert_eq!(row.day, day);
+        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.dropped_operation, DroppedOperation::ManualSync);
+    }
+
+    #[test]
+    fn dropped_operations_round_trip_with_contract_names() {
+        let cases = [
+            (DroppedOperation::SessionStart, "session_start"),
+            (DroppedOperation::ManualSync, "manual_sync"),
+            (DroppedOperation::Use, "use"),
+            (DroppedOperation::Remove, "remove"),
+            (DroppedOperation::Init, "init"),
+            (DroppedOperation::Configuration, "configuration"),
+            (DroppedOperation::Command, "command"),
+        ];
+
+        for (operation, name) in cases {
+            let json = serde_json::to_string(&operation).unwrap();
+            let decoded = serde_json::from_str::<DroppedOperation>(&json).unwrap();
+
+            assert_eq!(json, format!(r#""{name}""#));
+            assert_eq!(decoded, operation);
+        }
+    }
+
+    #[test]
+    fn storage_limit_rejects_wrong_version() {
+        let json = STORAGE_LIMIT_EXAMPLE.replacen(r#""v": 1"#, r#""v": 2"#, 1);
+
+        let result = serde_json::from_str::<StorageLimitV1>(&json);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn storage_limit_rejects_wrong_kind() {
+        let json =
+            STORAGE_LIMIT_EXAMPLE.replacen(r#""kind": "storage_limit""#, r#""kind": "command""#, 1);
+
+        let result = serde_json::from_str::<StorageLimitV1>(&json);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn storage_limit_rejects_unknown_field() {
+        let json = STORAGE_LIMIT_EXAMPLE.replacen(
+            r#""dropped_operation""#,
+            r#""at": "2026-08-03T10:02:11Z", "dropped_operation""#,
+            1,
+        );
+
+        let result = serde_json::from_str::<StorageLimitV1>(&json);
 
         assert!(result.is_err());
     }
