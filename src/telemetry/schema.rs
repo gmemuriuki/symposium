@@ -3,7 +3,7 @@
     not(test),
     expect(dead_code, reason = "the new schema is built before storage uses it.")
 )]
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::LazyLock};
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
 use semver::Version;
@@ -43,9 +43,43 @@ pub(super) enum RowKind {
     ExtensionResolution,
     HookMetrics,
     PluginHookMetrics,
+    ExtensionInvocationMetrics,
     Command,
     StorageLimit,
-    ExtensionInvocationMetrics,
+}
+
+/// Result of interpreting one physical telemetry line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RowClassification {
+    Supported(TelemetryRow),
+    UnknownSchema,
+    Invalid,
+    Malformed,
+}
+
+/// Telemetry row understood by this version of Symposium.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TelemetryRow {
+    StorageLimit(StorageLimitV1),
+}
+
+impl Serialize for TelemetryRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::StorageLimit(row) => row.serialize(serializer),
+        }
+    }
+}
+
+/// Lenient header used to select a complete versioned row schema.
+#[derive(Debug, Deserialize)]
+struct RowEnvelope {
+    #[serde(rename = "v")]
+    version: u64,
+    kind: String,
 }
 
 fn deserialize_version_one<'de, D>(deserializer: D) -> Result<SchemaVersion, D::Error>
@@ -62,19 +96,6 @@ where
     }
 
     Ok(version)
-}
-
-fn deserialize_storage_limit_kind<'de, D>(deserializer: D) -> Result<RowKind, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let kind = RowKind::deserialize(deserializer)?;
-
-    if kind != RowKind::StorageLimit {
-        return Err(D::Error::custom("expected storage_limit row kind"));
-    }
-
-    Ok(kind)
 }
 
 /// UTC calendar day used to partition telemetry rows.
@@ -96,13 +117,25 @@ impl<'de> Deserialize<'de> for UtcDay {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(D::Error::custom)?;
 
-        if date.format("%Y-%m-%d").to_string() != value {
+        if !has_utc_day_shape(&value) {
             return Err(D::Error::custom("expected a UTC day in YYYY-MM-DD form"));
         }
+
+        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(D::Error::custom)?;
         Ok(Self(date))
     }
+}
+
+fn has_utc_day_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit)
 }
 
 /// RFC 3339 UTC timestamp with no subsecond precision.
@@ -163,13 +196,15 @@ impl<'de> Deserialize<'de> for UtcSecond {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct SymposiumVersion(Version);
 
+static CURRENT_SYMPOSIUM_VERSION: LazyLock<Version> = LazyLock::new(|| {
+    Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("BUG: Cargo package version must be valid semantic versioning")
+});
+
 impl SymposiumVersion {
     /// Return the version of the running Symposium binary.
     pub(super) fn current() -> Self {
-        Self(
-            Version::parse(env!("CARGO_PKG_VERSION"))
-                .expect("BUG: Cargo package version must be valid semantic versioning"),
-        )
+        Self(CURRENT_SYMPOSIUM_VERSION.clone())
     }
 }
 
@@ -192,13 +227,15 @@ impl<'de> Deserialize<'de> for SymposiumVersion {
     }
 }
 
+// Versioned rows repeat their common fields deliberately. Serde does not support
+// combining flattened structs with strict unknown-field rejection.
+
 /// Version 1 marker recording that the daily storage limit rejected an operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StorageLimitV1 {
     #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
     version: SchemaVersion,
-    #[serde(deserialize_with = "deserialize_storage_limit_kind")]
     kind: RowKind,
     event_id: EventId,
     day: UtcDay,
@@ -208,6 +245,7 @@ pub(super) struct StorageLimitV1 {
 
 impl StorageLimitV1 {
     /// Create a marker for an operation rejected by the daily storage limit.
+    #[must_use]
     pub(super) fn new(day: UtcDay, dropped_operation: DroppedOperation) -> Self {
         Self {
             version: SchemaVersion::V1,
@@ -233,18 +271,46 @@ pub(super) enum DroppedOperation {
     Command,
 }
 
+/// Classify a physical JSONL line and return typed data only for a known schema.
+pub(super) fn classify_row(line: &str) -> RowClassification {
+    let Ok(envelope) = serde_json::from_str::<RowEnvelope>(line) else {
+        return RowClassification::Malformed;
+    };
+
+    match (envelope.kind.as_str(), envelope.version) {
+        ("storage_limit", 1) => match serde_json::from_str(line) {
+            Ok(row) => RowClassification::Supported(TelemetryRow::StorageLimit(row)),
+            Err(_) => RowClassification::Invalid,
+        },
+        _ => RowClassification::UnknownSchema,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const STORAGE_LIMIT_EXAMPLE: &str = r#"{
-        "v": 1,
-        "kind": "storage_limit",
-        "event_id": "8430f7f3-7ec5-4ca5-9c65-8f6e83eaa3de",
-        "day": "2026-08-03",
-        "symposium": "0.4.0",
-        "dropped_operation": "manual_sync"
-    }"#;
+    const RECORDED_DATA: &str =
+        include_str!("../../md/rfds/telemetry-recording/contract/recorded-data.md");
+
+    fn example_row(requested_kind: &str) -> &'static str {
+        let (_, after_fence) = RECORDED_DATA
+            .split_once("```jsonl")
+            .expect("recorded-data contract must contain a JSONL example block");
+        let (example_block, _) = after_fence
+            .split_once("```")
+            .expect("recorded-data JSONL example block must have a closing fence");
+
+        example_block
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<RowEnvelope>(line)
+                    .ok()
+                    .map(|envelope| (line, envelope))
+            })
+            .find_map(|(line, envelope)| (envelope.kind == requested_kind).then_some(line))
+            .unwrap_or_else(|| panic!("missing {requested_kind} example in recorded-data contract"))
+    }
 
     #[test]
     fn new_event_id_is_uuid_v4() {
@@ -314,12 +380,12 @@ mod tests {
             (RowKind::ExtensionResolution, "extension_resolution"),
             (RowKind::HookMetrics, "hook_metrics"),
             (RowKind::PluginHookMetrics, "plugin_hook_metrics"),
-            (RowKind::Command, "command"),
-            (RowKind::StorageLimit, "storage_limit"),
             (
                 RowKind::ExtensionInvocationMetrics,
                 "extension_invocation_metrics",
             ),
+            (RowKind::Command, "command"),
+            (RowKind::StorageLimit, "storage_limit"),
         ];
 
         for (kind, name) in cases {
@@ -362,6 +428,18 @@ mod tests {
         let result = serde_json::from_str::<UtcDay>(r#""2026-02-30""#);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn utc_day_rejects_noncanonical_shapes() {
+        for value in ["2026-8-03", "2026-08-3", "+2026-08-03", "2026/08/03"] {
+            let json = format!(r#""{value}""#);
+
+            assert!(
+                serde_json::from_str::<UtcDay>(&json).is_err(),
+                "accepted noncanonical UTC day {value}"
+            );
+        }
     }
 
     #[test]
@@ -463,10 +541,14 @@ mod tests {
 
     #[test]
     fn storage_limit_example_round_trips() {
-        let row = serde_json::from_str::<StorageLimitV1>(STORAGE_LIMIT_EXAMPLE).unwrap();
+        let example = example_row("storage_limit");
+
+        let RowClassification::Supported(row) = classify_row(example) else {
+            panic!("storage_limit contract example was not classified as supported");
+        };
 
         let actual = serde_json::to_value(row).unwrap();
-        let expected = serde_json::from_str::<serde_json::Value>(STORAGE_LIMIT_EXAMPLE).unwrap();
+        let expected = serde_json::from_str::<serde_json::Value>(example).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -507,34 +589,56 @@ mod tests {
     }
 
     #[test]
-    fn storage_limit_rejects_wrong_version() {
-        let json = STORAGE_LIMIT_EXAMPLE.replacen(r#""v": 1"#, r#""v": 2"#, 1);
+    fn unsupported_storage_limit_versions_are_unknown_schema() {
+        let example = example_row("storage_limit");
 
-        let result = serde_json::from_str::<StorageLimitV1>(&json);
+        for version in [0, 2] {
+            let json = example.replacen(r#""v":1"#, &format!(r#""v":{version}"#), 1);
 
-        assert!(result.is_err());
+            assert_eq!(classify_row(&json), RowClassification::UnknownSchema);
+        }
     }
 
     #[test]
-    fn storage_limit_rejects_wrong_kind() {
-        let json =
-            STORAGE_LIMIT_EXAMPLE.replacen(r#""kind": "storage_limit""#, r#""kind": "command""#, 1);
+    fn unknown_row_kind_is_unknown_schema() {
+        let json = r#"{"v":1,"kind":"future_kind","future_field":true}"#;
 
-        let result = serde_json::from_str::<StorageLimitV1>(&json);
+        let classification = classify_row(json);
 
-        assert!(result.is_err());
+        assert_eq!(classification, RowClassification::UnknownSchema);
     }
 
     #[test]
-    fn storage_limit_rejects_unknown_field() {
-        let json = STORAGE_LIMIT_EXAMPLE.replacen(
+    fn recognized_schema_with_unknown_field_is_invalid() {
+        let example = example_row("storage_limit");
+        let json = example.replacen(
             r#""dropped_operation""#,
-            r#""at": "2026-08-03T10:02:11Z", "dropped_operation""#,
+            r#""at":"2026-08-03T10:02:11Z","dropped_operation""#,
             1,
         );
 
-        let result = serde_json::from_str::<StorageLimitV1>(&json);
+        let classification = classify_row(&json);
 
-        assert!(result.is_err());
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn unusable_row_envelopes_are_malformed() {
+        let cases = [
+            "not JSON",
+            "[]",
+            "{}",
+            r#"{"v":"1","kind":"storage_limit"}"#,
+            r#"{"v":1}"#,
+            r#"{"v":1,"v":2,"kind":"storage_limit"}"#,
+        ];
+
+        for line in cases {
+            assert_eq!(
+                classify_row(line),
+                RowClassification::Malformed,
+                "accepted unusable envelope {line}"
+            );
+        }
     }
 }
