@@ -48,11 +48,43 @@ impl<'de> Deserialize<'de> for StateVersion {
 }
 
 /// Version 1 of the complete private telemetry state file.
+///
+/// A field may be absent only when absence represents a real lifecycle state,
+/// in which case its type records that explicitly. Once this version ships,
+/// adding a required field needs a migration or a new state version; a default
+/// must not silently turn malformed state into valid state.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct TelemetryStateV1 {
     version: StateVersion,
     identity: IdentityState,
+}
+
+impl TelemetryStateV1 {
+    /// Create private state anchored to the day recording first needs identity.
+    ///
+    /// The return cohort remains absent until a session is observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operating system cannot generate a secret key.
+    fn new(identifier_window_anchor: UtcDay) -> Result<Self, getrandom::Error> {
+        let key = IdentityKey::generate()?;
+        Ok(Self::with_key(identifier_window_anchor, key))
+    }
+
+    /// Construct state from identity material that has already been generated.
+    #[must_use]
+    fn with_key(identifier_window_anchor: UtcDay, key: IdentityKey) -> Self {
+        Self {
+            version: StateVersion,
+            identity: IdentityState {
+                key,
+                identifier_window_anchor,
+                return_cohort_anchor: None,
+            },
+        }
+    }
 }
 
 /// Stable identity material and the dates that define its rotation windows.
@@ -62,18 +94,36 @@ struct IdentityState {
     #[serde(with = "state_key_hex")]
     key: IdentityKey,
     identifier_window_anchor: UtcDay,
-    return_cohort_anchor: UtcDay,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    return_cohort_anchor: Option<UtcDay>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TelemetryStateV1;
+    use std::convert::Infallible;
+
+    use chrono::NaiveDate;
+
+    use super::{IdentityKey, TelemetryStateV1, UtcDay};
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const GENERATED_KEY_BYTE: u8 = 0x42;
+    /// Lowercase hexadecimal encoding of 32 [`GENERATED_KEY_BYTE`] bytes.
+    const GENERATED_KEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
-    fn state_with_key(key: &str) -> String {
+    fn day() -> UtcDay {
+        UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())
+    }
+
+    fn state_with_return_cohort(key: &str) -> String {
         format!(
             "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\nreturn-cohort-anchor = \"2026-08-11\"\n"
+        )
+    }
+
+    fn state_without_return_cohort(key: &str) -> String {
+        format!(
+            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\n"
         )
     }
 
@@ -91,7 +141,7 @@ mod tests {
 
     #[test]
     fn version_one_state_round_trips_in_canonical_form() {
-        let source = state_with_key(KEY);
+        let source = state_with_return_cohort(KEY);
 
         let state: TelemetryStateV1 = toml::from_str(&source).unwrap();
         let serialized = toml::to_string_pretty(&state).unwrap();
@@ -100,8 +150,44 @@ mod tests {
     }
 
     #[test]
+    fn new_state_starts_an_identity_window_without_a_return_cohort() {
+        let day = day();
+
+        let state = TelemetryStateV1::new(day).unwrap();
+
+        assert_eq!(state.identity.identifier_window_anchor, day);
+        assert!(state.identity.return_cohort_anchor.is_none());
+    }
+
+    #[test]
+    fn generated_state_has_the_canonical_initial_file_shape() {
+        let key = IdentityKey::generate_with::<Infallible>(|bytes| {
+            bytes.fill(GENERATED_KEY_BYTE);
+            Ok(())
+        })
+        .unwrap();
+
+        let state = TelemetryStateV1::with_key(day(), key);
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        let expected = state_without_return_cohort(GENERATED_KEY);
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn state_without_an_observed_session_has_no_return_cohort() {
+        let source = state_without_return_cohort(KEY);
+
+        let state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        assert!(state.identity.return_cohort_anchor.is_none());
+        assert_eq!(serialized, source);
+    }
+
+    #[test]
     fn future_state_version_is_rejected() {
-        let source = state_with_key(KEY).replacen("version = 1", "version = 2", 1);
+        let source = state_with_return_cohort(KEY).replacen("version = 1", "version = 2", 1);
 
         let message = rejection_message(&source);
 
@@ -113,8 +199,11 @@ mod tests {
 
     #[test]
     fn unknown_top_level_field_is_rejected() {
-        let source =
-            state_with_key(KEY).replacen("\n[identity]", "\nunexpected = true\n\n[identity]", 1);
+        let source = state_with_return_cohort(KEY).replacen(
+            "\n[identity]",
+            "\nunexpected = true\n\n[identity]",
+            1,
+        );
 
         let message = rejection_message(&source);
 
@@ -126,7 +215,7 @@ mod tests {
 
     #[test]
     fn unknown_identity_field_is_rejected() {
-        let mut source = state_with_key(KEY);
+        let mut source = state_with_return_cohort(KEY);
         source.push_str("unexpected = true\n");
 
         let message = rejection_message(&source);
@@ -143,7 +232,7 @@ mod tests {
         let one_long = format!("{KEY}0");
 
         for key in ["", one_short, &one_long] {
-            let message = rejection_message(&state_with_key(key));
+            let message = rejection_message(&state_with_return_cohort(key));
 
             assert!(
                 message.contains("exactly 64 hexadecimal digits"),
@@ -156,7 +245,7 @@ mod tests {
     #[test]
     fn identity_key_must_use_lowercase_hexadecimal() {
         for key in [KEY.to_uppercase(), KEY.replacen('f', "g", 1)] {
-            let message = rejection_message(&state_with_key(&key));
+            let message = rejection_message(&state_with_return_cohort(&key));
 
             assert!(
                 message.contains("lowercase hexadecimal digits"),
@@ -167,7 +256,7 @@ mod tests {
 
     #[test]
     fn identity_anchor_must_be_a_canonical_utc_day() {
-        let source = state_with_key(KEY).replacen("2026-09-10", "2026-9-10", 1);
+        let source = state_with_return_cohort(KEY).replacen("2026-09-10", "2026-9-10", 1);
 
         let message = rejection_message(&source);
 

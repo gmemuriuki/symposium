@@ -179,9 +179,11 @@ Identifiers use the first 128 bits of HMAC-SHA-256 over a frozen domain, locally
 
 The dimension limits what an identifier can link. Identity code constructs it from typed coordinates; producers do not concatenate strings. It represents one installation for one package, agent, or command dimension, never the installation globally.
 
-Private state keeps the identity key and the current identifier-window and return-cohort anchors. Every recorder reads that state under the telemetry lock, so the same domain, window, and dimension produce the same subject across processes and restarts.
+Private state keeps the identity key and the current identifier-window anchor. It adds a return-cohort anchor when the first session is observed. Every recorder reads that state under the telemetry lock, so the same domain, window, and dimension produce the same subject across processes and restarts.
 
-Normal 30-day rollover changes the window input rather than replacing the key. `disable` and `clear` preserve the key and anchors. Renewed consent and `reset-identifiers` replace the key and start a new cohort.
+Normal 30-day rollover changes the window input rather than replacing the key. `disable` and `clear` preserve the key and anchors. Renewed consent and `reset-identifiers` replace the key, set the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, and clear the return-cohort anchor. The next observed session starts a new cohort at D0.
+
+Identifier-window age uses that same later day. An anchor later than the wall-clock day is valid after clock rollback and does not by itself make state malformed.
 
 The key is private state, not anonymized telemetry. Someone who has it can recompute candidate identifiers. Telemetry commands therefore never print it, and it remains outside the inspectable telemetry data directory.
 
@@ -197,7 +199,7 @@ The key is private state, not anonymized telemetry. Someone who has it can recom
 | `plugin_subject`    | One safe public plugin + 30-day window.                                                          |
 | `command_subject`   | One safe command coordinate + 30-day window.                                                     |
 
-The return subject is the sole cross-agent exception: it deduplicates Q1 but cannot link to other event kinds. A cohort remains stable through D30; the next observed session starts a new cohort. Accepting new consent or resetting identifiers rotates the key and starts another cohort.
+The return subject is the sole cross-agent exception: it deduplicates Q1 but cannot link to other event kinds. A cohort remains stable through D30; the next observed session starts a new cohort. Accepting new consent or resetting identifiers rotates the key, resets the identifier-window anchor without moving it behind the latest-opened-day high-water mark, and clears the return-cohort anchor. The next observed session becomes D0 of another cohort.
 
 `session_id` is absent when the agent supplies none, including Copilot. Raw vendor ids never enter events or an unkeyed hash. There is no global installation/workspace id, and future analysis or upload must not reconstruct one. Missing identity state is created only when enabled; malformed existing state stops recording until explicit identifier reset.
 

@@ -102,6 +102,14 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct UtcDay(NaiveDate);
 
+impl UtcDay {
+    /// Wrap a calendar date known to be in UTC.
+    #[must_use]
+    pub(super) const fn from_date(date: NaiveDate) -> Self {
+        Self(date)
+    }
+}
+
 impl Serialize for UtcDay {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -154,7 +162,7 @@ impl UtcSecond {
 
     /// Return the UTC calendar day containing this timestamp.
     pub(super) fn day(&self) -> UtcDay {
-        UtcDay(self.0.date_naive())
+        UtcDay::from_date(self.0.date_naive())
     }
 }
 

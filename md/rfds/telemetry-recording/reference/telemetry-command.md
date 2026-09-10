@@ -110,7 +110,7 @@ Enable telemetry under consent version 1? [y/N]
 
 In a non-interactive environment, `enable` does not change config unless `--acknowledge` is supplied explicitly. This prevents scripts or a manually retained unversioned boolean from upgrading consent silently.
 
-Enabling telemetry does not rewrite or assign new identifiers to old stored lines. Accepting a new consent version rotates the secret identity key and starts a new retention cohort, severing old and new scoped identifiers.
+Enabling telemetry does not rewrite or assign new identifiers to old stored lines. Accepting a new consent version rotates the secret identity key, sets the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, and clears the return-cohort anchor, severing old and new scoped identifiers. The next observed session starts a new retention cohort at D0.
 
 ## `disable`
 
@@ -157,7 +157,7 @@ Deleted 12 telemetry data file(s) from ~/.symposium/telemetry/.
 
 ## `reset-identifiers`
 
-`reset-identifiers` severs identifier linkage between future and existing rows. It acquires the telemetry lock, replaces the secret identity key, discards pending aggregate session-count sets, and starts a new retention cohort:
+`reset-identifiers` severs identifier linkage between future and existing rows. It acquires the telemetry lock, replaces the secret identity key, sets the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, clears the return-cohort anchor, and discards pending aggregate session-count sets. The next observed session starts a new retention cohort at D0:
 
 ```console
 $ cargo agents telemetry reset-identifiers
@@ -181,9 +181,9 @@ If no identity state exists, the command reports that there is nothing to reset 
 
 Each project skills parent may also contain a generated `.symposium/index-v1.json` installation index. It maps agent-facing skill identifiers to Symposium-managed installations so a later hook can attribute a skill activation. The index is gitignored installation state, not telemetry: `show`, `clear`, retention, and identifier reset do not read or delete it, and this RFD does not upload it.
 
-`telemetry-state.toml` is private Symposium state outside the inspectable telemetry data directory. It contains the secret identity key, current identifier-window and return-cohort anchors, the latest opened UTC day, cleanup and marker metadata, and bounded keyed session sets plus contribution counts used for complete aggregate session counts. All recorders read this state under the telemetry lock.
+`telemetry-state.toml` is private Symposium state outside the inspectable telemetry data directory. It contains the secret identity key, current identifier-window anchor, optional return-cohort anchor, the latest opened UTC day, cleanup and marker metadata, and bounded keyed session sets plus contribution counts used for complete aggregate session counts. All recorders read this state under the telemetry lock.
 
-Normal 30-day rollover changes the window anchor without replacing the key. Renewed consent or `reset-identifiers` replaces the key; `disable` and `clear` preserve it. None of these operations moves the latest-opened-day high-water mark backward.
+Normal 30-day rollover changes the window anchor without replacing the key. Renewed consent or `reset-identifiers` replaces the key, resets the identifier-window anchor, and clears the return-cohort anchor; `disable` and `clear` preserve them. None of these operations moves the latest-opened-day high-water mark backward.
 
 Symposium atomically creates and replaces the file with owner-only permissions where supported. Replacement uses a same-directory temporary file beside `config.toml`; abandoned state temporaries are ignored and cleaned lazily under the telemetry lock.
 

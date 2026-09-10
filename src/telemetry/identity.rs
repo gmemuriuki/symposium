@@ -43,11 +43,13 @@ impl IdentityKey {
     /// # Errors
     ///
     /// Returns an error when the operating system cannot provide random bytes.
-    fn generate() -> Result<Self, getrandom::Error> {
+    pub(super) fn generate() -> Result<Self, getrandom::Error> {
         Self::generate_with(getrandom::fill)
     }
 
-    fn generate_with<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Self, E> {
+    pub(super) fn generate_with<E>(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<Self, E> {
         let mut bytes = [0; IDENTITY_KEY_BYTES];
         fill(&mut bytes)?;
         Ok(Self::from_bytes(bytes))

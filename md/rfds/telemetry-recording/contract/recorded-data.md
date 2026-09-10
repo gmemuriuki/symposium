@@ -43,9 +43,11 @@ These are independent row-shape examples, not one coherent operation or batch. T
 
 ### Key and rotation
 
-When an enabled recorder first needs identity state, Symposium stores a random secret key in private `<config-dir>/telemetry-state.toml` (default `~/.symposium/telemetry-state.toml`). The same state holds the current identifier-window and return-cohort anchors. Every recorder reads it under the telemetry lock, so identical domain, window, and dimension inputs produce the same subject across processes and restarts.
+When an enabled recorder first needs identity state, Symposium stores a random secret key in private `<config-dir>/telemetry-state.toml` (default `~/.symposium/telemetry-state.toml`). The same state holds the current identifier-window anchor and, after the first observed session, the return-cohort anchor. Every recorder reads it under the telemetry lock, so identical domain, window, and dimension inputs produce the same subject across processes and restarts.
 
-Normal 30-day rollover changes the window input without replacing the key. Renewed consent or `telemetry reset-identifiers` replaces it. `telemetry disable` and `telemetry clear` preserve the key and anchors.
+Normal 30-day rollover changes the window input without replacing the key. Renewed consent or `telemetry reset-identifiers` replaces the key, sets the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, and clears the return-cohort anchor. The next observed session starts a new cohort at D0. `telemetry disable` and `telemetry clear` preserve the key and whichever anchors exist.
+
+Identifier-window age uses that same later day. An anchor later than the wall-clock day is valid after clock rollback and is not malformed for that reason alone.
 
 This file is separate from the inspectable `<config-dir>/telemetry/` data directory and has owner-only permissions where the platform supports them. The key is private state, not anonymized telemetry. It is not written into events, printed by telemetry commands, or derived from your machine. Someone who has the key can recompute candidate identifiers.
 
@@ -416,13 +418,13 @@ A file is eligible for deletion only when `current_utc_day - file_utc_day > 30`.
 
 ### Private state
 
-The sibling private `<config-dir>/telemetry-state.toml` holds the identity key, current identifier-window and return-cohort anchors, the latest opened UTC day, cleanup and marker metadata, bounded keyed session sets, and snapshot contribution counts used to calculate complete distinct-session counts.
+The sibling private `<config-dir>/telemetry-state.toml` holds the identity key, current identifier-window anchor, optional return-cohort anchor, the latest opened UTC day, cleanup and marker metadata, bounded keyed session sets, and snapshot contribution counts used to calculate complete distinct-session counts.
 
 Symposium creates and replaces it atomically with owner-only permissions where supported. Replacement uses a same-directory temporary file beside `config.toml`; abandoned state temporaries are ignored and cleaned lazily under the telemetry lock.
 
 The session sets are not printed or copied into metric rows. Symposium discards them at UTC-day rollover and removes them when `telemetry clear` or `telemetry reset-identifiers` runs. State is replaced before the corresponding metric snapshot. If a later snapshot write fails, a contribution-count mismatch on the next update discards the sets and permanently marks the row's session counts incomplete for that day.
 
-`telemetry clear` deletes event and aggregate-metric files and rewrites private state to remove pending sets while preserving the identity key, current anchors, and latest-opened-day high-water mark. `telemetry reset-identifiers` rotates future identifiers and starts a new retention cohort without moving the high-water mark backward. `telemetry disable` stops recording; existing files remain unless the user accepts its interactive clear offer or runs `telemetry clear` later.
+`telemetry clear` deletes event and aggregate-metric files and rewrites private state to remove pending sets while preserving the identity key, current anchors, and latest-opened-day high-water mark. `telemetry reset-identifiers` rotates future identifiers, sets the identifier-window anchor to the later of the current UTC day and that high-water mark, and clears the return-cohort anchor without moving the high-water mark backward. The next observed session starts a new retention cohort at D0. `telemetry disable` stops recording; existing files remain unless the user accepts its interactive clear offer or runs `telemetry clear` later.
 
 ### Installation index
 
