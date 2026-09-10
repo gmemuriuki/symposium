@@ -183,7 +183,9 @@ Each project skills parent may also contain a generated `.symposium/index-v1.jso
 
 `telemetry-state.toml` is private Symposium state outside the inspectable telemetry data directory. It contains the secret identity key, current identifier-window anchor, optional return-cohort anchor, the latest opened UTC day, cleanup and marker metadata, and bounded keyed session sets plus contribution counts used for complete aggregate session counts. All recorders read this state under the telemetry lock.
 
-Normal 30-day rollover changes the window anchor without replacing the key. Renewed consent or `reset-identifiers` replaces the key, resets the identifier-window anchor, and clears the return-cohort anchor; `disable` and `clear` preserve them. None of these operations moves the latest-opened-day high-water mark backward.
+An identifier window includes its anchor day as day 0 and remains active through day 29. The first recording-capable observation on day 30 or later starts a new window anchored to that observation without replacing the key. Renewed consent or `reset-identifiers` replaces the key, resets the identifier-window anchor, and clears the return-cohort anchor; `disable` and `clear` preserve them. None of these operations moves the latest-opened-day high-water mark backward.
+
+For a session, high-water advancement, identifier-window rollover, and return-cohort transition form one state transition under the telemetry lock. Symposium writes them with one atomic private-state replacement before deriving identifiers or appending the `session_start` row.
 
 Symposium atomically creates and replaces the file with owner-only permissions where supported. Replacement uses a same-directory temporary file beside `config.toml`; abandoned state temporaries are ignored and cleaned lazily under the telemetry lock.
 

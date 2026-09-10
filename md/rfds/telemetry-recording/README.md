@@ -181,7 +181,7 @@ The dimension limits what an identifier can link. Identity code constructs it fr
 
 Private state keeps the identity key and the current identifier-window anchor. It adds a return-cohort anchor when the first session is observed. Every recorder reads that state under the telemetry lock, so the same domain, window, and dimension produce the same subject across processes and restarts.
 
-Normal 30-day rollover changes the window input rather than replacing the key. `disable` and `clear` preserve the key and anchors. Renewed consent and `reset-identifiers` replace the key, set the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, and clear the return-cohort anchor. The next observed session starts a new cohort at D0.
+An identifier window includes its anchor day as day 0 and remains active through day 29. The first recording-capable observation on day 30 or later starts a new window anchored to that observation. This normal rollover changes the window input without replacing the key. `disable` and `clear` preserve the key and anchors. Renewed consent and `reset-identifiers` replace the key, set the identifier-window anchor to the later of the current UTC day and the latest-opened-day high-water mark, and clear the return-cohort anchor. The next observed session starts a new cohort at D0.
 
 Identifier-window age uses that same later day. An anchor later than the wall-clock day is valid after clock rollback and does not by itself make state malformed.
 
@@ -329,7 +329,7 @@ Raw inspection remains byte-preserving. A separate typed reader returns only rec
 
 Recorders make one non-waiting exclusive-lock attempt. Contention drops the entire buffered batch or aggregate observation. Event batches serialize before one append so concurrent lines cannot interleave. Snapshot updates use same-directory temporary replacement.
 
-While holding that lock, session recording rejects a day before the latest-opened-day high-water mark. It applies any day advancement and cohort transition to the same in-memory state, atomically replaces private state, and only then appends the `session_start` row. If the append fails after a new cohort is stored, later rows for that cohort are ignored by Q1 unless a D0 row was stored. The partial failure therefore causes undercounting rather than an unstable cohort identity.
+While holding that lock, session recording rejects a day before the latest-opened-day high-water mark. It calculates the identifier-window and return-cohort transitions before mutating either anchor. It then applies both transitions and any high-water advancement to one in-memory state, atomically replaces private state once, and only then derives the row identifiers and appends the `session_start` row. If the append fails after a new cohort is stored, later rows for that cohort are ignored by Q1 unless a D0 row was stored. The partial failure therefore causes undercounting rather than unstable identity.
 
 Private-state replacement uses a temporary file beside `telemetry-state.toml` in the config directory. Abandoned state and snapshot temporaries are ignored and cleaned lazily under the telemetry lock. No `fsync` is promised, so a crash can still lose the latest update. Contribution counts detect state and snapshot divergence and permanently mark affected daily session counts incomplete.
 
@@ -509,7 +509,7 @@ Verify:
 
 - Concurrent complete lines, old-or-new snapshots, whole-operation drops, and cap/marker accounting.
 - D30/D31 cleanup, raw inspection, validated reads, and abandoned state/snapshot temporary cleanup.
-- Day advancement and cohort transition share one locked state replacement before a session append. A failed D0 append cannot admit later rows as a return cohort.
+- Day advancement, identifier-window rollover, and return-cohort transition share one locked state replacement before a session append. A failed D0 append cannot admit later rows as a return cohort.
 - Observations before the high-water mark are dropped before cohort mutation; clock rollback cannot reopen earlier files, and forward-correction drops are non-disruptive.
 - Malformed, invalid, and unknown-version lines remain inspectable, are reported separately, and cannot enter validated output.
 - Validated output contains no lock, temporary, or private-state file; an oversized or incompletely read day is rejected as a whole.

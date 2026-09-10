@@ -16,6 +16,12 @@ use super::{
     schema::{CohortDay, UtcDay},
 };
 
+/// Exclusive length of an identifier window in UTC-day positions.
+///
+/// Offsets 0 through 29 remain in the window; unlike the cohort's inclusive
+/// [`CohortDay::D30`] bound, offset 30 starts a new window.
+const IDENTIFIER_WINDOW_DAYS: i64 = 30;
+
 /// The initial schema version of `telemetry-state.toml`.
 ///
 /// Exact rather than permissive, unlike a row's `SchemaVersion`: a row written by
@@ -90,65 +96,187 @@ impl TelemetryStateV1 {
 
     /// Observe a session on a day accepted by the monotonic clock policy.
     ///
-    /// The first observed session establishes D0. An existing cohort keeps its
-    /// anchor through D30; the first later observation starts another D0.
+    /// This selects the identifier window and return cohort before mutating
+    /// either anchor. The first observed session establishes cohort D0. An
+    /// existing cohort keeps its anchor through D30; the first later
+    /// observation starts another D0.
     ///
     /// Storage must call this while holding the telemetry lock, after rejecting
     /// a day before the latest-opened-day high-water mark. Any high-water
-    /// advancement and this cohort transition belong to the same private-state
-    /// replacement, which must complete before the `session_start` row is
-    /// appended.
+    /// advancement and this complete session transition belong to one
+    /// private-state replacement. That replacement must complete before the
+    /// `session_start` row is appended or either returned anchor is used to
+    /// derive an identifier.
     ///
     /// # Errors
     ///
-    /// Returns an error if `effective_day` precedes the stored cohort anchor.
-    /// A conforming storage caller filters this case first; this check protects
-    /// the state invariant against an incorrect caller or inconsistent state.
+    /// Returns an error if `effective_day` precedes either stored anchor. A
+    /// conforming storage caller filters this case through its durable day
+    /// policy; these checks protect against an incorrect caller or inconsistent
+    /// state. Neither anchor changes when validation fails.
     fn observe_session(
         &mut self,
         effective_day: UtcDay,
-    ) -> Result<CohortDay, SessionDayBeforeCohortAnchor> {
+    ) -> Result<SessionObservation, SessionObservationError> {
+        let identifier_window = self.select_identifier_window(effective_day)?;
+        let return_cohort = self.select_return_cohort(effective_day)?;
+
+        self.identity.identifier_window_anchor = identifier_window.anchor();
+        self.identity.return_cohort_anchor = Some(return_cohort.anchor());
+
+        Ok(SessionObservation {
+            identifier_window,
+            return_cohort,
+        })
+    }
+
+    /// Select the identifier window without mutating private state.
+    fn select_identifier_window(
+        &self,
+        effective_day: UtcDay,
+    ) -> Result<IdentifierWindowUpdate, SessionObservationError> {
+        let anchor = self.identity.identifier_window_anchor;
+        let elapsed_days = effective_day.days_since(anchor);
+
+        if elapsed_days < 0 {
+            return Err(SessionObservationError::BeforeIdentifierWindow {
+                observed_day: effective_day,
+                window_anchor: anchor,
+            });
+        }
+
+        if elapsed_days < IDENTIFIER_WINDOW_DAYS {
+            return Ok(IdentifierWindowUpdate::Current { anchor });
+        }
+
+        Ok(IdentifierWindowUpdate::Advanced {
+            anchor: effective_day,
+        })
+    }
+
+    /// Select the return cohort without mutating private state.
+    fn select_return_cohort(
+        &self,
+        effective_day: UtcDay,
+    ) -> Result<ReturnCohortUpdate, SessionObservationError> {
         let Some(anchor) = self.identity.return_cohort_anchor else {
-            self.identity.return_cohort_anchor = Some(effective_day);
-            return Ok(CohortDay::D0);
+            return Ok(ReturnCohortUpdate::Started {
+                anchor: effective_day,
+            });
         };
 
         let elapsed_days = effective_day.days_since(anchor);
         if elapsed_days < 0 {
-            return Err(SessionDayBeforeCohortAnchor {
+            return Err(SessionObservationError::BeforeReturnCohort {
                 observed_day: effective_day,
                 cohort_anchor: anchor,
             });
         }
 
         if elapsed_days > i64::from(CohortDay::D30.get()) {
-            self.identity.return_cohort_anchor = Some(effective_day);
-            return Ok(CohortDay::D0);
+            return Ok(ReturnCohortUpdate::Started {
+                anchor: effective_day,
+            });
         }
 
-        Ok(CohortDay::try_from(elapsed_days)
-            .expect("BUG: a session between D0 and D30 must have a valid cohort day"))
+        let day = CohortDay::try_from(elapsed_days)
+            .expect("BUG: a session between D0 and D30 must have a valid cohort day");
+        Ok(ReturnCohortUpdate::Current { anchor, day })
     }
 }
 
-/// An observed session day earlier than its stored return-cohort anchor.
+/// Identity and return-cohort selections for one observed session.
+#[must_use = "session identity state must be persisted before identifiers are emitted"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SessionDayBeforeCohortAnchor {
-    observed_day: UtcDay,
-    cohort_anchor: UtcDay,
+struct SessionObservation {
+    identifier_window: IdentifierWindowUpdate,
+    return_cohort: ReturnCohortUpdate,
 }
 
-impl fmt::Display for SessionDayBeforeCohortAnchor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "observed session day {} precedes the return-cohort anchor {}",
-            self.observed_day, self.cohort_anchor
-        )
+/// Whether selecting an identifier window changed private state.
+#[must_use = "an advanced identifier window must be persisted before use"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentifierWindowUpdate {
+    /// The existing window remains active.
+    Current { anchor: UtcDay },
+    /// A new observation-anchored window was started.
+    Advanced { anchor: UtcDay },
+}
+
+impl IdentifierWindowUpdate {
+    /// Return the anchor selected for identifier derivation.
+    #[must_use]
+    fn anchor(self) -> UtcDay {
+        match self {
+            Self::Current { anchor } | Self::Advanced { anchor } => anchor,
+        }
     }
 }
 
-impl std::error::Error for SessionDayBeforeCohortAnchor {}
+/// Whether selecting a return cohort changed private state.
+#[must_use = "a started return cohort must be persisted before use"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnCohortUpdate {
+    /// The existing cohort remains active at `day`.
+    Current { anchor: UtcDay, day: CohortDay },
+    /// A new cohort was started at D0.
+    Started { anchor: UtcDay },
+}
+
+impl ReturnCohortUpdate {
+    /// Return the anchor selected for retention-subject derivation.
+    #[must_use]
+    fn anchor(self) -> UtcDay {
+        match self {
+            Self::Current { anchor, .. } | Self::Started { anchor } => anchor,
+        }
+    }
+
+    /// Return the observed day within the selected cohort.
+    #[must_use]
+    fn day(self) -> CohortDay {
+        match self {
+            Self::Current { day, .. } => day,
+            Self::Started { .. } => CohortDay::D0,
+        }
+    }
+}
+
+/// An observed session earlier than one of its stored identity anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionObservationError {
+    BeforeIdentifierWindow {
+        observed_day: UtcDay,
+        window_anchor: UtcDay,
+    },
+    BeforeReturnCohort {
+        observed_day: UtcDay,
+        cohort_anchor: UtcDay,
+    },
+}
+
+impl fmt::Display for SessionObservationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeIdentifierWindow {
+                observed_day,
+                window_anchor,
+            } => write!(
+                formatter,
+                "observed day {observed_day} precedes the identifier-window anchor {window_anchor}"
+            ),
+            Self::BeforeReturnCohort {
+                observed_day,
+                cohort_anchor,
+            } => write!(
+                formatter,
+                "observed session day {observed_day} precedes the return-cohort anchor {cohort_anchor}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionObservationError {}
 
 /// Stable identity material and the dates that define its rotation windows.
 #[derive(Serialize, Deserialize)]
@@ -167,7 +295,10 @@ mod tests {
 
     use chrono::NaiveDate;
 
-    use super::{CohortDay, IdentityKey, TelemetryStateV1, UtcDay};
+    use super::{
+        CohortDay, IdentifierWindowUpdate, IdentityKey, ReturnCohortUpdate, TelemetryStateV1,
+        UtcDay,
+    };
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const GENERATED_KEY_BYTE: u8 = 0x42;
@@ -179,8 +310,16 @@ mod tests {
     }
 
     fn state_with_return_cohort(key: &str) -> String {
+        state_with_anchors(key, "2026-09-10", "2026-08-11")
+    }
+
+    fn state_with_anchors(
+        key: &str,
+        identifier_window_anchor: &str,
+        return_cohort_anchor: &str,
+    ) -> String {
         format!(
-            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\nreturn-cohort-anchor = \"2026-08-11\"\n"
+            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"{identifier_window_anchor}\"\nreturn-cohort-anchor = \"{return_cohort_anchor}\"\n"
         )
     }
 
@@ -249,60 +388,217 @@ mod tests {
     }
 
     #[test]
+    fn observations_on_days_zero_through_twenty_nine_keep_the_window() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let anchor = day(2026, 9, 10);
+
+        for observed_day in [anchor, day(2026, 10, 9)] {
+            let observation = state.observe_session(observed_day).unwrap();
+
+            assert_eq!(
+                observation.identifier_window,
+                IdentifierWindowUpdate::Current { anchor }
+            );
+            assert_eq!(observation.identifier_window.anchor(), anchor);
+            assert_eq!(state.identity.identifier_window_anchor, anchor);
+        }
+    }
+
+    #[test]
+    fn observation_on_day_thirty_advances_the_window() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observed_day = day(2026, 10, 10);
+
+        let observation = state.observe_session(observed_day).unwrap();
+
+        assert_eq!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(observation.return_cohort.day(), CohortDay::D30);
+        assert_eq!(state.identity.identifier_window_anchor, observed_day);
+    }
+
+    #[test]
+    fn observation_after_inactivity_anchors_both_lifecycles_to_the_observation() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observed_day = day(2026, 10, 25);
+
+        let observation = state.observe_session(observed_day).unwrap();
+
+        assert_eq!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(
+            observation.return_cohort,
+            ReturnCohortUpdate::Started {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(state.identity.identifier_window_anchor, observed_day);
+        assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
+    }
+
+    #[test]
+    fn window_rollover_preserves_the_key_and_return_cohort() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+
+        let observation = state.observe_session(day(2026, 10, 10)).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        let expected = state_with_anchors(KEY, "2026-10-10", "2026-09-10");
+        assert!(matches!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced { .. }
+        ));
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn observation_before_the_window_anchor_is_rejected_without_mutation() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+
+        let error = state.observe_session(day(2026, 9, 9)).unwrap_err();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "observed day 2026-09-09 precedes the identifier-window anchor 2026-09-10"
+        );
+        assert_eq!(serialized, source);
+    }
+
+    #[test]
     fn first_observed_session_starts_d0() {
         let source = state_without_return_cohort(KEY);
         let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
         let observed_day = day(2026, 9, 10);
 
-        let cohort_day = state.observe_session(observed_day).unwrap();
+        let observation = state.observe_session(observed_day).unwrap();
 
-        assert_eq!(cohort_day, CohortDay::D0);
+        assert_eq!(observation.return_cohort.day(), CohortDay::D0);
         assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
     }
 
     #[test]
-    fn observations_through_d30_keep_the_existing_cohort() {
-        let source = state_with_return_cohort(KEY);
+    fn first_session_after_window_expiry_starts_d0_and_advances_the_window() {
+        let source = state_without_return_cohort(KEY);
         let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observed_day = day(2026, 10, 25);
+
+        let observation = state.observe_session(observed_day).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        let expected = state_with_anchors(KEY, "2026-10-25", "2026-10-25");
+        assert_eq!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(
+            observation.return_cohort,
+            ReturnCohortUpdate::Started {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn observations_through_d30_keep_the_existing_cohort() {
         let anchor = day(2026, 8, 11);
 
-        for (observed_day, expected_day) in [
-            (day(2026, 8, 11), 0_i64),
-            (day(2026, 8, 12), 1),
-            (day(2026, 9, 10), 30),
+        for (window_anchor, observed_day, expected_day) in [
+            ("2026-08-11", day(2026, 8, 11), 0_i64),
+            ("2026-08-11", day(2026, 8, 12), 1),
+            ("2026-09-01", day(2026, 9, 10), 30),
         ] {
-            let cohort_day = state.observe_session(observed_day).unwrap();
+            let source = state_with_anchors(KEY, window_anchor, "2026-08-11");
+            let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
 
-            assert_eq!(cohort_day, CohortDay::try_from(expected_day).unwrap());
+            let observation = state.observe_session(observed_day).unwrap();
+
+            assert_eq!(
+                observation.return_cohort.day(),
+                CohortDay::try_from(expected_day).unwrap()
+            );
+            assert!(matches!(
+                observation.identifier_window,
+                IdentifierWindowUpdate::Current { .. }
+            ));
             assert_eq!(state.identity.return_cohort_anchor, Some(anchor));
         }
     }
 
     #[test]
-    fn first_observation_after_d30_starts_a_new_cohort() {
-        let source = state_with_return_cohort(KEY);
+    fn cohort_rollover_preserves_the_identifier_window_and_key() {
+        let source = state_with_anchors(KEY, "2026-09-01", "2026-08-11");
         let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
         let observed_day = day(2026, 9, 11);
 
-        let cohort_day = state.observe_session(observed_day).unwrap();
+        let observation = state.observe_session(observed_day).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
 
-        assert_eq!(cohort_day, CohortDay::D0);
-        assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
+        let expected = state_with_anchors(KEY, "2026-09-01", "2026-09-11");
+        assert_eq!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Current {
+                anchor: day(2026, 9, 1)
+            }
+        );
+        assert_eq!(observation.return_cohort.day(), CohortDay::D0);
+        assert_eq!(serialized, expected);
     }
 
     #[test]
-    fn observation_before_the_cohort_anchor_is_rejected_without_mutation() {
-        let source = state_with_return_cohort(KEY);
+    fn both_session_lifecycles_roll_over_in_one_transition() {
+        let source = state_with_anchors(KEY, "2026-08-12", "2026-08-11");
         let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
-        let original_anchor = state.identity.return_cohort_anchor;
+        let observed_day = day(2026, 9, 11);
 
-        let error = state.observe_session(day(2026, 8, 10)).unwrap_err();
+        let observation = state.observe_session(observed_day).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        let expected = state_with_anchors(KEY, "2026-09-11", "2026-09-11");
+        assert_eq!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(
+            observation.return_cohort,
+            ReturnCohortUpdate::Started {
+                anchor: observed_day
+            }
+        );
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn invalid_cohort_day_does_not_partially_advance_the_window() {
+        let source = state_with_anchors(KEY, "2026-08-01", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+
+        let error = state.observe_session(day(2026, 9, 9)).unwrap_err();
+        let serialized = toml::to_string_pretty(&state).unwrap();
 
         assert_eq!(
             error.to_string(),
-            "observed session day 2026-08-10 precedes the return-cohort anchor 2026-08-11"
+            "observed session day 2026-09-09 precedes the return-cohort anchor 2026-09-10"
         );
-        assert_eq!(state.identity.return_cohort_anchor, original_anchor);
+        assert_eq!(serialized, source);
     }
 
     #[test]
