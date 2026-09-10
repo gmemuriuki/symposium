@@ -37,6 +37,21 @@ impl IdentityKey {
     const fn from_bytes(bytes: [u8; IDENTITY_KEY_BYTES]) -> Self {
         Self(bytes)
     }
+
+    /// Generate a key from the operating system's preferred random source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operating system cannot provide random bytes.
+    fn generate() -> Result<Self, getrandom::Error> {
+        Self::generate_with(getrandom::fill)
+    }
+
+    fn generate_with<E>(fill: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Result<Self, E> {
+        let mut bytes = [0; IDENTITY_KEY_BYTES];
+        fill(&mut bytes)?;
+        Ok(Self::from_bytes(bytes))
+    }
 }
 
 /// Canonical bytes for an identifier-window or return-cohort anchor.
@@ -370,7 +385,11 @@ scoped_id_domains! {
 
 #[cfg(test)]
 mod tests {
-    use std::{any::TypeId, collections::HashSet, mem::size_of};
+    use std::{
+        any::TypeId,
+        collections::HashSet,
+        mem::{size_of, size_of_val},
+    };
 
     use super::*;
 
@@ -413,6 +432,36 @@ mod tests {
 
         assert_eq!(key.0, bytes);
         assert_eq!(size_of::<IdentityKey>(), IDENTITY_KEY_BYTES);
+    }
+
+    #[test]
+    fn identity_key_generation_fills_the_complete_key() {
+        let expected = [0x5a; IDENTITY_KEY_BYTES];
+
+        let key = IdentityKey::generate_with(|bytes| {
+            bytes.copy_from_slice(&expected);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .expect("infallible test source must generate a key");
+
+        assert_eq!(key.0, expected);
+    }
+
+    #[test]
+    fn identity_key_generation_propagates_source_failure() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct TestError;
+
+        let result = IdentityKey::generate_with(|_| Err(TestError));
+
+        assert!(matches!(result, Err(TestError)));
+    }
+
+    #[test]
+    fn identity_key_can_be_generated_from_the_operating_system() {
+        let key = IdentityKey::generate().expect("operating system must provide random bytes");
+
+        assert_eq!(size_of_val(&key), IDENTITY_KEY_BYTES);
     }
 
     #[test]
