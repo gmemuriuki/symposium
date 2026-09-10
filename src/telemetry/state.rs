@@ -94,6 +94,55 @@ impl TelemetryStateV1 {
         }
     }
 
+    /// Rotate future identifiers and begin a new identifier window.
+    ///
+    /// `identifier_window_anchor` must be the later of the current UTC day and
+    /// the durable latest-opened-day high-water mark. Unlike a stale session
+    /// observation, an explicit reset is clamped to that high-water mark rather
+    /// than dropped. The next observed session starts a new return cohort at
+    /// D0.
+    ///
+    /// The selected anchor may precede the stored window anchor after a clock
+    /// rollback. That is intentional: rotating the key severs the previous
+    /// identity scope, so reset does not compare the new anchor with the old
+    /// one.
+    ///
+    /// The storage-level reset must preserve the durable high-water mark and
+    /// clear pending keyed session-count sets once those sibling state sections
+    /// are added.
+    ///
+    /// Key generation completes before any state changes, so a failure leaves
+    /// the existing key and anchors intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operating system cannot generate a secret key.
+    fn reset_identifiers(
+        &mut self,
+        identifier_window_anchor: UtcDay,
+    ) -> Result<(), getrandom::Error> {
+        self.reset_identifiers_with(identifier_window_anchor, getrandom::fill)
+    }
+
+    /// Reset identifiers using a caller-provided source of key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source error without changing state if key generation fails.
+    fn reset_identifiers_with<E>(
+        &mut self,
+        identifier_window_anchor: UtcDay,
+        fill_key: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let key = IdentityKey::generate_with(fill_key)?;
+        self.identity = IdentityState {
+            key,
+            identifier_window_anchor,
+            return_cohort_anchor: None,
+        };
+        Ok(())
+    }
+
     /// Observe a session on a day accepted by the monotonic clock policy.
     ///
     /// This selects the identifier window and return cohort before mutating
@@ -305,6 +354,9 @@ mod tests {
     /// Lowercase hexadecimal encoding of 32 [`GENERATED_KEY_BYTE`] bytes.
     const GENERATED_KEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestKeySourceError;
+
     fn day(year: i32, month: u32, day: u32) -> UtcDay {
         UtcDay::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
     }
@@ -324,8 +376,12 @@ mod tests {
     }
 
     fn state_without_return_cohort(key: &str) -> String {
+        state_without_return_cohort_at(key, "2026-09-10")
+    }
+
+    fn state_without_return_cohort_at(key: &str, identifier_window_anchor: &str) -> String {
         format!(
-            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\n"
+            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"{identifier_window_anchor}\"\n"
         )
     }
 
@@ -374,6 +430,53 @@ mod tests {
 
         let expected = state_without_return_cohort(GENERATED_KEY);
         assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn identifier_reset_rotates_the_key_resets_the_window_and_clears_the_cohort() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let reset_day = day(2026, 10, 15);
+
+        state
+            .reset_identifiers_with::<Infallible>(reset_day, |bytes| {
+                bytes.fill(GENERATED_KEY_BYTE);
+                Ok(())
+            })
+            .unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        let expected = state_without_return_cohort_at(GENERATED_KEY, "2026-10-15");
+        assert_eq!(serialized, expected);
+    }
+
+    #[test]
+    fn failed_identifier_reset_preserves_the_complete_state() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+
+        let result = state.reset_identifiers_with(day(2026, 10, 15), |bytes| {
+            bytes.fill(GENERATED_KEY_BYTE);
+            Err(TestKeySourceError)
+        });
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        assert_eq!(result, Err(TestKeySourceError));
+        assert_eq!(serialized, source);
+    }
+
+    #[test]
+    fn identifier_reset_can_use_operating_system_randomness() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let reset_day = day(2026, 10, 15);
+
+        state.reset_identifiers(reset_day).unwrap();
+        let serialized = toml::to_string_pretty(&state).unwrap();
+
+        assert!(!serialized.contains(KEY));
+        assert_eq!(state.identity.identifier_window_anchor, reset_day);
+        assert!(state.identity.return_cohort_anchor.is_none());
     }
 
     #[test]
