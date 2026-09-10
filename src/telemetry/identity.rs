@@ -15,10 +15,68 @@ use std::{
     str::FromStr,
 };
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use sha2::Sha256;
 
 const IDENTIFIER_BYTES: usize = 16;
 const ENCODED_DIGITS: usize = IDENTIFIER_BYTES * 2;
+const IDENTITY_KEY_BYTES: usize = 32;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// A 256-bit secret used to derive telemetry pseudonyms.
+///
+/// This type deliberately implements no formatting traits, which prevents the
+/// key from being printed accidentally in diagnostics. It does not promise to
+/// scrub every in-memory copy when dropped.
+struct IdentityKey([u8; IDENTITY_KEY_BYTES]);
+
+impl IdentityKey {
+    #[must_use]
+    const fn from_bytes(bytes: [u8; IDENTITY_KEY_BYTES]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Canonical bytes for an identifier-window or return-cohort anchor.
+///
+/// Keeping this distinct from a dimension makes their order in the HMAC input
+/// impossible to swap accidentally.
+struct IdentityWindow<'a>(&'a [u8]);
+
+#[cfg(test)]
+impl<'a> IdentityWindow<'a> {
+    #[must_use]
+    const fn from_bytes(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Canonically framed dimension fields belonging to domain `D`.
+///
+/// Domain-specific constructors will own field selection and order. Telemetry
+/// producers never concatenate dimension strings themselves.
+struct ScopedDimension<D> {
+    encoded_fields: Vec<u8>,
+    domain: PhantomData<D>,
+}
+
+#[cfg(test)]
+impl<D> ScopedDimension<D> {
+    #[must_use]
+    fn from_fields<'a>(fields: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut encoded_fields = Vec::new();
+        for field in fields {
+            write_frame(field, |bytes| encoded_fields.extend_from_slice(bytes));
+        }
+
+        Self {
+            encoded_fields,
+            domain: PhantomData,
+        }
+    }
+}
 
 /// A 128-bit telemetry identifier belonging to domain `D`.
 ///
@@ -79,12 +137,53 @@ impl<D> Hash for ScopedId<D> {
     }
 }
 
-/// Marker supplying a [`ScopedId`] domain's wire prefix.
+/// Marker supplying a [`ScopedId`] domain's frozen derivation and wire labels.
 ///
-/// Private, which seals it: the prefix set is a published contract surface, not
-/// an extension point.
+/// Private, which seals it: both constants are published contract surfaces,
+/// not extension points. Changing either requires a new consent version.
 trait ScopedIdDomain {
     const PREFIX: &'static str;
+    const HMAC_DOMAIN: &'static str;
+}
+
+/// Derives purpose-scoped telemetry identifiers from one secret key.
+struct IdentityDeriver {
+    key: IdentityKey,
+}
+
+impl IdentityDeriver {
+    #[must_use]
+    const fn new(key: IdentityKey) -> Self {
+        Self { key }
+    }
+
+    /// Derive an identifier from a canonical window and domain-specific fields.
+    #[must_use]
+    fn derive<D>(&self, window: &IdentityWindow<'_>, dimension: &ScopedDimension<D>) -> ScopedId<D>
+    where
+        D: ScopedIdDomain,
+    {
+        let mut hmac = HmacSha256::new_from_slice(&self.key.0)
+            .expect("BUG: HMAC-SHA-256 must accept a 32-byte key");
+        hmac.update(b"telemetry:");
+        hmac.update(D::HMAC_DOMAIN.as_bytes());
+        hmac.update(b":v1\0");
+        write_frame(window.0, |bytes| hmac.update(bytes));
+        hmac.update(&dimension.encoded_fields);
+
+        let digest = hmac.finalize().into_bytes();
+        let mut bytes = [0; IDENTIFIER_BYTES];
+        bytes.copy_from_slice(&digest[..IDENTIFIER_BYTES]);
+        ScopedId::from_bytes(bytes)
+    }
+}
+
+/// Write one unambiguous variable-length value to an HMAC input or buffer.
+fn write_frame(value: &[u8], mut write: impl FnMut(&[u8])) {
+    let length = u64::try_from(value.len())
+        .expect("BUG: a slice length must fit the telemetry frame format");
+    write(&length.to_be_bytes());
+    write(value);
 }
 
 /// Reason a stored scoped identifier is not canonical.
@@ -203,12 +302,20 @@ fn decode_lower_hex(value: u8) -> Option<u8> {
 /// A macro because a function cannot introduce types, and the prefix is the
 /// hand-written part worth handing to the tests as a table.
 macro_rules! scoped_id_domains {
-    ($($domain:ident => $prefix:literal as $alias:ident,)+) => {
+    (
+        $(
+            $domain:ident => $alias:ident {
+                hmac_domain: $hmac_domain:literal,
+                wire_prefix: $prefix:literal,
+            }
+        )+
+    ) => {
         $(
             pub(super) enum $domain {}
 
             impl ScopedIdDomain for $domain {
                 const PREFIX: &'static str = $prefix;
+                const HMAC_DOMAIN: &'static str = $hmac_domain;
             }
 
             pub(super) type $alias = ScopedId<$domain>;
@@ -218,18 +325,47 @@ macro_rules! scoped_id_domains {
         const PREFIX_PARSERS: &[(&str, fn(&str) -> bool)] = &[
             $(($prefix, |value| value.parse::<$alias>().is_ok())),+
         ];
+
+        #[cfg(test)]
+        const DOMAIN_CONTRACTS: &[(&str, &str)] = &[
+            $(($hmac_domain, $prefix)),+
+        ];
     };
 }
 
 scoped_id_domains! {
-    SessionDomain   => "sess_" as SessionId,
-    RetentionDomain => "ret_"  as RetentionSubject,
-    AgentDomain     => "agt_"  as AgentSubject,
-    PackageDomain   => "pkg_"  as PackageSubject,
-    ExtensionDomain => "ext_"  as ExtensionSubject,
-    HookDomain      => "hok_"  as HookSubject,
-    PluginDomain    => "plg_"  as PluginSubject,
-    CommandDomain   => "cmd_"  as CommandSubject,
+    SessionDomain => SessionId {
+        hmac_domain: "session_id",
+        wire_prefix: "sess_",
+    }
+    RetentionDomain => RetentionSubject {
+        hmac_domain: "retention_subject",
+        wire_prefix: "ret_",
+    }
+    AgentDomain => AgentSubject {
+        hmac_domain: "agent_subject",
+        wire_prefix: "agt_",
+    }
+    PackageDomain => PackageSubject {
+        hmac_domain: "package_subject",
+        wire_prefix: "pkg_",
+    }
+    ExtensionDomain => ExtensionSubject {
+        hmac_domain: "extension_subject",
+        wire_prefix: "ext_",
+    }
+    HookDomain => HookSubject {
+        hmac_domain: "hook_subject",
+        wire_prefix: "hok_",
+    }
+    PluginDomain => PluginSubject {
+        hmac_domain: "plugin_subject",
+        wire_prefix: "plg_",
+    }
+    CommandDomain => CommandSubject {
+        hmac_domain: "command_subject",
+        wire_prefix: "cmd_",
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +388,7 @@ mod tests {
 
     impl ScopedIdDomain for TestDomain {
         const PREFIX: &'static str = "test_";
+        const HMAC_DOMAIN: &'static str = "test_subject";
     }
 
     /// Reads the first identifier the contract spells with `prefix`.
@@ -266,6 +403,115 @@ mod tests {
             .expect("recorded-data identifier must be terminated");
 
         &value[..closing_quote]
+    }
+
+    #[test]
+    fn identity_key_wraps_exactly_32_bytes() {
+        let bytes = [0x5a; IDENTITY_KEY_BYTES];
+
+        let key = IdentityKey::from_bytes(bytes);
+
+        assert_eq!(key.0, bytes);
+        assert_eq!(size_of::<IdentityKey>(), IDENTITY_KEY_BYTES);
+    }
+
+    #[test]
+    fn identity_derivation_matches_contract_vector() {
+        let key = IdentityKey::from_bytes([0x42; IDENTITY_KEY_BYTES]);
+        let deriver = IdentityDeriver::new(key);
+        let window = IdentityWindow::from_bytes(b"window-1");
+        let dimension = ScopedDimension::<SessionDomain>::from_fields([b"dimension-1".as_slice()]);
+
+        let identifier = deriver.derive(&window, &dimension);
+
+        // Cross-checked with .NET's HMACSHA256 over the contract's header and
+        // two unsigned 64-bit big-endian length-prefixed values. The complete
+        // digest is ec1c11acdcca37eb4ab17f381c80df5246b0a66438f757eaa2a52195da40afbd.
+        assert_eq!(
+            identifier.to_string(),
+            "sess_ec1c11acdcca37eb4ab17f381c80df52"
+        );
+    }
+
+    #[test]
+    fn identical_derivation_inputs_are_stable() {
+        let key = IdentityKey::from_bytes([0x42; IDENTITY_KEY_BYTES]);
+        let deriver = IdentityDeriver::new(key);
+        let window = IdentityWindow::from_bytes(b"window-1");
+        let dimension = ScopedDimension::<SessionDomain>::from_fields([b"dimension-1".as_slice()]);
+
+        let first = deriver.derive(&window, &dimension);
+        let second = deriver.derive(&window, &dimension);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn length_framing_separates_nul_at_different_boundaries() {
+        let deriver = IdentityDeriver::new(IdentityKey::from_bytes([0x42; IDENTITY_KEY_BYTES]));
+        let first_window = IdentityWindow::from_bytes(b"a\0b");
+        let first_dimension = ScopedDimension::<SessionDomain>::from_fields([b"c".as_slice()]);
+        let second_window = IdentityWindow::from_bytes(b"a");
+        let second_dimension = ScopedDimension::<SessionDomain>::from_fields([b"b\0c".as_slice()]);
+
+        let first = deriver.derive(&first_window, &first_dimension);
+        let second = deriver.derive(&second_window, &second_dimension);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn length_framing_separates_dimension_field_boundaries() {
+        let deriver = IdentityDeriver::new(IdentityKey::from_bytes([0x42; IDENTITY_KEY_BYTES]));
+        let window = IdentityWindow::from_bytes(b"window-1");
+        let first_dimension = ScopedDimension::<PackageDomain>::from_fields([
+            b"cargo".as_slice(),
+            b"foo1".as_slice(),
+            b"2.3.4".as_slice(),
+        ]);
+        let second_dimension = ScopedDimension::<PackageDomain>::from_fields([
+            b"cargo".as_slice(),
+            b"foo".as_slice(),
+            b"12.3.4".as_slice(),
+        ]);
+
+        let first = deriver.derive(&window, &first_dimension);
+        let second = deriver.derive(&window, &second_dimension);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn changing_any_derivation_scope_changes_the_identifier() {
+        let deriver = IdentityDeriver::new(IdentityKey::from_bytes([0x42; IDENTITY_KEY_BYTES]));
+        let other_deriver =
+            IdentityDeriver::new(IdentityKey::from_bytes([0x24; IDENTITY_KEY_BYTES]));
+        let first_window = IdentityWindow::from_bytes(b"window-1");
+        let second_window = IdentityWindow::from_bytes(b"window-2");
+        let session_dimension =
+            ScopedDimension::<SessionDomain>::from_fields([b"dimension-1".as_slice()]);
+        let other_session_dimension =
+            ScopedDimension::<SessionDomain>::from_fields([b"dimension-2".as_slice()]);
+        let command_dimension =
+            ScopedDimension::<CommandDomain>::from_fields([b"dimension-1".as_slice()]);
+
+        // Different domain markers produce different identifier types, so use
+        // their shared byte representation for this one collection.
+        let identifiers = [
+            deriver.derive(&first_window, &session_dimension).bytes,
+            other_deriver
+                .derive(&first_window, &session_dimension)
+                .bytes,
+            deriver.derive(&first_window, &command_dimension).bytes,
+            deriver.derive(&second_window, &session_dimension).bytes,
+            deriver
+                .derive(&first_window, &other_session_dimension)
+                .bytes,
+        ];
+
+        let unique_identifiers = identifiers.into_iter().collect::<HashSet<_>>();
+
+        assert_eq!(unique_identifiers.len(), identifiers.len());
     }
 
     #[test]
@@ -304,6 +550,28 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(prefixes.len(), PREFIX_PARSERS.len());
+    }
+
+    #[test]
+    fn hmac_domains_are_distinct() {
+        let domains = DOMAIN_CONTRACTS
+            .iter()
+            .map(|(domain, _)| *domain)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(domains.len(), DOMAIN_CONTRACTS.len());
+    }
+
+    #[test]
+    fn derivation_constants_match_the_recorded_data_contract() {
+        for (domain, prefix) in DOMAIN_CONTRACTS {
+            let contract_row = format!("| `{domain}` | `{domain}` | `{prefix}` |");
+
+            assert!(
+                RECORDED_DATA.contains(&contract_row),
+                "recorded-data contract does not contain {contract_row}"
+            );
+        }
     }
 
     #[test]
