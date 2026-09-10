@@ -2,10 +2,19 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::{
+    CohortDay, EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, UtcSecond,
+    deserialize_version_one,
+};
+use crate::telemetry::identity::{RetentionSubject, SessionId};
+
 /// Agent that invoked a registered Symposium hook.
+///
+/// Unlike the platform enums, this has no `Other`: Symposium owns the set of
+/// registered agent hooks, so adding an agent changes the row schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum HookAgent {
+pub(in crate::telemetry) enum HookAgent {
     Claude,
     Codex,
     Copilot,
@@ -16,34 +25,144 @@ pub(super) enum HookAgent {
 /// Operating-system class for the running Symposium build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum OperatingSystem {
+pub(in crate::telemetry) enum OperatingSystem {
     Linux,
     Macos,
     Windows,
     Other,
 }
 
+impl OperatingSystem {
+    /// Return the contract bucket for the running Symposium build.
+    #[must_use]
+    pub(in crate::telemetry) fn current() -> Self {
+        Self::from_target(std::env::consts::OS)
+    }
+
+    fn from_target(target: &str) -> Self {
+        match target {
+            "linux" => Self::Linux,
+            "macos" => Self::Macos,
+            "windows" => Self::Windows,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Architecture class for the running Symposium build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Architecture {
+pub(in crate::telemetry) enum Architecture {
     X86_64,
     Aarch64,
     Other,
 }
 
+impl Architecture {
+    /// Return the contract bucket for the running Symposium build.
+    #[must_use]
+    pub(in crate::telemetry) fn current() -> Self {
+        Self::from_target(std::env::consts::ARCH)
+    }
+
+    fn from_target(target: &str) -> Self {
+        match target {
+            "x86_64" => Self::X86_64,
+            "aarch64" => Self::Aarch64,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Agent-supplied classification of how a session began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum SessionStartKind {
+pub(in crate::telemetry) enum SessionStartKind {
     Fresh,
     Resumed,
     Unknown,
 }
 
+/// Agent-supplied and derived fields for one completed session-start hook.
+///
+/// These fields are repeated on [`SessionStartV1`] because flattening this
+/// struct into the row would weaken strict unknown-field rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::telemetry) struct SessionStartFields {
+    pub(in crate::telemetry) agent: HookAgent,
+    pub(in crate::telemetry) os: OperatingSystem,
+    pub(in crate::telemetry) arch: Architecture,
+    pub(in crate::telemetry) start: SessionStartKind,
+    pub(in crate::telemetry) session_id: Option<SessionId>,
+    pub(in crate::telemetry) retention_subject: RetentionSubject,
+    pub(in crate::telemetry) cohort_day: CohortDay,
+}
+
+/// Version 1 record of a completed registered session-start hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::telemetry) struct SessionStartV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    at: UtcSecond,
+    symposium: SymposiumVersion,
+    agent: HookAgent,
+    os: OperatingSystem,
+    arch: Architecture,
+    start: SessionStartKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<SessionId>,
+    retention_subject: RetentionSubject,
+    cohort_day: CohortDay,
+}
+
+impl SessionStartV1 {
+    /// Create a record for a completed registered session-start hook.
+    #[must_use]
+    pub(in crate::telemetry) fn new(at: UtcSecond, fields: SessionStartFields) -> Self {
+        Self {
+            version: SchemaVersion::V1,
+            kind: RowKind::SessionStart,
+            event_id: EventId::new(),
+            day: at.day(),
+            at,
+            symposium: SymposiumVersion::current(),
+            agent: fields.agent,
+            os: fields.os,
+            arch: fields.arch,
+            start: fields.start,
+            session_id: fields.session_id,
+            retention_subject: fields.retention_subject,
+            cohort_day: fields.cohort_day,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::super::{RowClassification, TelemetryRow, classify_row};
     use super::*;
+
+    fn session_start_fields(session_id: Option<SessionId>) -> SessionStartFields {
+        SessionStartFields {
+            agent: HookAgent::Claude,
+            os: OperatingSystem::Linux,
+            arch: Architecture::X86_64,
+            start: SessionStartKind::Fresh,
+            session_id,
+            retention_subject: "ret_74ddf26f80ad8b58de7f03e6c632e654".parse().unwrap(),
+            cohort_day: CohortDay::D0,
+        }
+    }
+
+    fn session_start_time() -> UtcSecond {
+        UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 9, 14, 2).unwrap())
+    }
 
     #[test]
     fn hook_agents_round_trip_with_contract_names() {
@@ -83,6 +202,34 @@ mod tests {
     }
 
     #[test]
+    fn operating_system_target_names_map_to_contract_buckets() {
+        let cases = [
+            ("linux", OperatingSystem::Linux),
+            ("macos", OperatingSystem::Macos),
+            ("windows", OperatingSystem::Windows),
+            ("freebsd", OperatingSystem::Other),
+        ];
+
+        for (target, expected) in cases {
+            assert_eq!(OperatingSystem::from_target(target), expected);
+        }
+    }
+
+    #[test]
+    fn current_operating_system_matches_the_compile_target() {
+        #[cfg(target_os = "linux")]
+        let expected = OperatingSystem::Linux;
+        #[cfg(target_os = "macos")]
+        let expected = OperatingSystem::Macos;
+        #[cfg(target_os = "windows")]
+        let expected = OperatingSystem::Windows;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let expected = OperatingSystem::Other;
+
+        assert_eq!(OperatingSystem::current(), expected);
+    }
+
+    #[test]
     fn architectures_round_trip_with_contract_names() {
         let cases = [
             (Architecture::X86_64, "x86_64"),
@@ -97,6 +244,31 @@ mod tests {
             assert_eq!(json, format!(r#""{name}""#));
             assert_eq!(decoded, architecture);
         }
+    }
+
+    #[test]
+    fn architecture_target_names_map_to_contract_buckets() {
+        let cases = [
+            ("x86_64", Architecture::X86_64),
+            ("aarch64", Architecture::Aarch64),
+            ("riscv64", Architecture::Other),
+        ];
+
+        for (target, expected) in cases {
+            assert_eq!(Architecture::from_target(target), expected);
+        }
+    }
+
+    #[test]
+    fn current_architecture_matches_the_compile_target() {
+        #[cfg(target_arch = "x86_64")]
+        let expected = Architecture::X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let expected = Architecture::Aarch64;
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let expected = Architecture::Other;
+
+        assert_eq!(Architecture::current(), expected);
     }
 
     #[test]
@@ -129,5 +301,44 @@ mod tests {
         assert!(operating_system.is_err());
         assert!(architecture.is_err());
         assert!(start_kind.is_err());
+    }
+
+    #[test]
+    fn new_session_start_uses_fixed_common_fields_and_timestamp_day() {
+        let at = session_start_time();
+        let session_id = "sess_31d8b1916028f65a0c0521dc1f4c86fb".parse().unwrap();
+        let fields = session_start_fields(Some(session_id));
+
+        let row = SessionStartV1::new(at, fields);
+
+        assert_eq!(row.version, SchemaVersion::V1);
+        assert_eq!(row.kind, RowKind::SessionStart);
+        assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
+        assert_eq!(row.day, at.day());
+        assert_eq!(row.at, at);
+        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.agent, fields.agent);
+        assert_eq!(row.os, fields.os);
+        assert_eq!(row.arch, fields.arch);
+        assert_eq!(row.start, fields.start);
+        assert_eq!(row.session_id, fields.session_id);
+        assert_eq!(row.retention_subject, fields.retention_subject);
+        assert_eq!(row.cohort_day, fields.cohort_day);
+    }
+
+    #[test]
+    fn session_start_without_session_id_classifies_and_round_trips() {
+        let row = SessionStartV1::new(session_start_time(), session_start_fields(None));
+
+        let json = serde_json::to_string(&row).unwrap();
+        let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        let RowClassification::Supported(TelemetryRow::SessionStart(decoded)) = classify_row(&json)
+        else {
+            panic!("session_start without a session id was not classified as supported");
+        };
+
+        assert_eq!(value.get("session_id"), None);
+        assert!(decoded.session_id.is_none());
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
     }
 }
