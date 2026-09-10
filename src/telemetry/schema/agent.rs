@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     agents::Agent,
-    telemetry::identity::{RetentionSubject, SessionId},
+    telemetry::identity::{AgentSubject, RetentionSubject, SessionId},
 };
 
 /// Agent included in the daily configuration snapshot.
@@ -172,9 +172,52 @@ impl SessionStartV1 {
     }
 }
 
+/// Version 1 daily observation of one supported agent's configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::telemetry) struct AgentConfigurationV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    symposium: SymposiumVersion,
+    agent: SupportedAgent,
+    configured: bool,
+    os: OperatingSystem,
+    arch: Architecture,
+    agent_subject: AgentSubject,
+}
+
+impl AgentConfigurationV1 {
+    /// Create one agent entry in a daily configuration snapshot.
+    #[must_use]
+    pub(in crate::telemetry) fn new(
+        day: UtcDay,
+        agent: SupportedAgent,
+        configured: bool,
+        os: OperatingSystem,
+        arch: Architecture,
+        agent_subject: AgentSubject,
+    ) -> Self {
+        Self {
+            version: SchemaVersion::V1,
+            kind: RowKind::AgentConfiguration,
+            event_id: EventId::new(),
+            day,
+            symposium: SymposiumVersion::current(),
+            agent,
+            configured,
+            os,
+            arch,
+            agent_subject,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::super::{RowClassification, TelemetryRow, classify_row};
     use super::*;
@@ -395,6 +438,32 @@ mod tests {
         assert_eq!(row.session_id, fields.session_id);
         assert_eq!(row.retention_subject, fields.retention_subject);
         assert_eq!(row.cohort_day, fields.cohort_day);
+    }
+
+    #[test]
+    fn new_agent_configuration_uses_fixed_common_fields() {
+        let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        let agent_subject = "agt_9255770e1679cb789796a9f9e86325c5".parse().unwrap();
+
+        let row = AgentConfigurationV1::new(
+            day,
+            SupportedAgent::Claude,
+            true,
+            OperatingSystem::Linux,
+            Architecture::X86_64,
+            agent_subject,
+        );
+
+        assert_eq!(row.version, SchemaVersion::V1);
+        assert_eq!(row.kind, RowKind::AgentConfiguration);
+        assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
+        assert_eq!(row.day, day);
+        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.agent, SupportedAgent::Claude);
+        assert!(row.configured);
+        assert_eq!(row.os, OperatingSystem::Linux);
+        assert_eq!(row.arch, Architecture::X86_64);
+        assert_eq!(row.agent_subject, agent_subject);
     }
 
     #[test]
