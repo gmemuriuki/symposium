@@ -7,11 +7,13 @@
     )
 )]
 
+use std::fmt;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use super::{
     identity::{IdentityKey, state_key_hex},
-    schema::UtcDay,
+    schema::{CohortDay, UtcDay},
 };
 
 /// The initial schema version of `telemetry-state.toml`.
@@ -85,7 +87,68 @@ impl TelemetryStateV1 {
             },
         }
     }
+
+    /// Observe a session on a day accepted by the monotonic clock policy.
+    ///
+    /// The first observed session establishes D0. An existing cohort keeps its
+    /// anchor through D30; the first later observation starts another D0.
+    ///
+    /// Storage must call this while holding the telemetry lock, after rejecting
+    /// a day before the latest-opened-day high-water mark. Any high-water
+    /// advancement and this cohort transition belong to the same private-state
+    /// replacement, which must complete before the `session_start` row is
+    /// appended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `effective_day` precedes the stored cohort anchor.
+    /// A conforming storage caller filters this case first; this check protects
+    /// the state invariant against an incorrect caller or inconsistent state.
+    fn observe_session(
+        &mut self,
+        effective_day: UtcDay,
+    ) -> Result<CohortDay, SessionDayBeforeCohortAnchor> {
+        let Some(anchor) = self.identity.return_cohort_anchor else {
+            self.identity.return_cohort_anchor = Some(effective_day);
+            return Ok(CohortDay::D0);
+        };
+
+        let elapsed_days = effective_day.days_since(anchor);
+        if elapsed_days < 0 {
+            return Err(SessionDayBeforeCohortAnchor {
+                observed_day: effective_day,
+                cohort_anchor: anchor,
+            });
+        }
+
+        if elapsed_days > i64::from(CohortDay::D30.get()) {
+            self.identity.return_cohort_anchor = Some(effective_day);
+            return Ok(CohortDay::D0);
+        }
+
+        Ok(CohortDay::try_from(elapsed_days)
+            .expect("BUG: a session between D0 and D30 must have a valid cohort day"))
+    }
 }
+
+/// An observed session day earlier than its stored return-cohort anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionDayBeforeCohortAnchor {
+    observed_day: UtcDay,
+    cohort_anchor: UtcDay,
+}
+
+impl fmt::Display for SessionDayBeforeCohortAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "observed session day {} precedes the return-cohort anchor {}",
+            self.observed_day, self.cohort_anchor
+        )
+    }
+}
+
+impl std::error::Error for SessionDayBeforeCohortAnchor {}
 
 /// Stable identity material and the dates that define its rotation windows.
 #[derive(Serialize, Deserialize)]
@@ -104,15 +167,15 @@ mod tests {
 
     use chrono::NaiveDate;
 
-    use super::{IdentityKey, TelemetryStateV1, UtcDay};
+    use super::{CohortDay, IdentityKey, TelemetryStateV1, UtcDay};
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const GENERATED_KEY_BYTE: u8 = 0x42;
     /// Lowercase hexadecimal encoding of 32 [`GENERATED_KEY_BYTE`] bytes.
     const GENERATED_KEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
 
-    fn day() -> UtcDay {
-        UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())
+    fn day(year: i32, month: u32, day: u32) -> UtcDay {
+        UtcDay::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
     }
 
     fn state_with_return_cohort(key: &str) -> String {
@@ -151,7 +214,7 @@ mod tests {
 
     #[test]
     fn new_state_starts_an_identity_window_without_a_return_cohort() {
-        let day = day();
+        let day = day(2026, 9, 10);
 
         let state = TelemetryStateV1::new(day).unwrap();
 
@@ -167,7 +230,7 @@ mod tests {
         })
         .unwrap();
 
-        let state = TelemetryStateV1::with_key(day(), key);
+        let state = TelemetryStateV1::with_key(day(2026, 9, 10), key);
         let serialized = toml::to_string_pretty(&state).unwrap();
 
         let expected = state_without_return_cohort(GENERATED_KEY);
@@ -183,6 +246,63 @@ mod tests {
 
         assert!(state.identity.return_cohort_anchor.is_none());
         assert_eq!(serialized, source);
+    }
+
+    #[test]
+    fn first_observed_session_starts_d0() {
+        let source = state_without_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observed_day = day(2026, 9, 10);
+
+        let cohort_day = state.observe_session(observed_day).unwrap();
+
+        assert_eq!(cohort_day, CohortDay::D0);
+        assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
+    }
+
+    #[test]
+    fn observations_through_d30_keep_the_existing_cohort() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let anchor = day(2026, 8, 11);
+
+        for (observed_day, expected_day) in [
+            (day(2026, 8, 11), 0_i64),
+            (day(2026, 8, 12), 1),
+            (day(2026, 9, 10), 30),
+        ] {
+            let cohort_day = state.observe_session(observed_day).unwrap();
+
+            assert_eq!(cohort_day, CohortDay::try_from(expected_day).unwrap());
+            assert_eq!(state.identity.return_cohort_anchor, Some(anchor));
+        }
+    }
+
+    #[test]
+    fn first_observation_after_d30_starts_a_new_cohort() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observed_day = day(2026, 9, 11);
+
+        let cohort_day = state.observe_session(observed_day).unwrap();
+
+        assert_eq!(cohort_day, CohortDay::D0);
+        assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
+    }
+
+    #[test]
+    fn observation_before_the_cohort_anchor_is_rejected_without_mutation() {
+        let source = state_with_return_cohort(KEY);
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let original_anchor = state.identity.return_cohort_anchor;
+
+        let error = state.observe_session(day(2026, 8, 10)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "observed session day 2026-08-10 precedes the return-cohort anchor 2026-08-11"
+        );
+        assert_eq!(state.identity.return_cohort_anchor, original_anchor);
     }
 
     #[test]

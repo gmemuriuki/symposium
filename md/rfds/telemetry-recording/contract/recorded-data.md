@@ -136,7 +136,7 @@ This row records a completed registered Symposium session-start hook.
 
 GitHub Copilot does not currently supply a session id. OpenCode and Goose do not currently call Symposium through a registered session-start hook, so they do not produce this event.
 
-These rows, not `hook_metrics` rows whose `hook` is `session_start`, are authoritative for observed-session and return measurements. For each `retention_subject`, the first row establishes D0. D1, D7, or D30 is present when at least one later session-start row has that `cohort_day`, regardless of agent or vendor session id. Multiple rows on the same cohort day count once.
+These rows, not `hook_metrics` rows whose `hook` is `session_start`, are authoritative for observed-session and return measurements. A stored D0 row admits its `retention_subject` cohort to analysis. D1, D7, or D30 is present when at least one later session-start row has that `cohort_day`, regardless of agent or vendor session id. A later row without a stored D0 for the same subject is ignored. Multiple rows on the same cohort day count once.
 
 The aggregate hook rows measure only session-start hook reliability and latency.
 
@@ -405,6 +405,8 @@ The row appears at most once per UTC day, and the marker itself counts toward 8 
 Low-volume events are appended as JSON lines in `events-YYYY-MM-DD.jsonl` under the inspectable `<config-dir>/telemetry/` data directory (default `~/.symposium/telemetry/`). Current cumulative hook, plugin-hook, and extension-invocation aggregates are JSON lines in `metrics-YYYY-MM-DD.jsonl`. Symposium rewrites this bounded snapshot atomically after a merge.
 
 The lock in the telemetry directory also guards sibling private state. A recorder makes one non-waiting lock attempt. It may drop a complete buffered event batch or aggregate observation rather than delay your hook or command. Recording failures never change the user operation's result.
+
+Under that lock, session recording rejects a day before the latest-opened-day high-water mark. It applies any day advancement and cohort transition to one in-memory state, atomically replaces private state, and only then appends the `session_start` row. If that append fails after a new cohort is stored, later rows for the cohort remain ineligible for Q1 unless a D0 row was stored. This failure mode undercounts returns rather than creating an unstable cohort identity.
 
 Private state keeps the latest opened UTC day as a high-water mark. Observing a later day permanently closes earlier daily files. An observation dated before the high-water mark is dropped rather than modifying a closed day. Raw inspection still preserves every stored line. Typed reading of a closed day returns only recognized rows that pass their versioned schema and file/day invariants, and reports malformed, invalid, and unknown-version lines separately. It rejects an oversized or incompletely read day as a whole rather than returning a partial validated result.
 

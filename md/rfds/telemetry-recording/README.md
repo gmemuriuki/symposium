@@ -75,7 +75,7 @@ All measures describe opted-in installations, not the whole user population. Rep
 
 These questions have specific limits:
 
-- For Q1, the first observed `session_start` for a `retention_subject` establishes D0. D1, D7, or D30 is present when at least one later session is observed on that cohort day, from the same or a different agent. Multiple sessions on one day count once. This measures a later observed session, not one long session or continued value; session start runs automatically once Symposium is installed.
+- For Q1, a stored D0 `session_start` for a `retention_subject` admits that cohort to analysis. D1, D7, or D30 is present when at least one later session is observed on that cohort day, from the same or a different agent. Later rows without a stored D0 are ignored. Multiple sessions on one day count once. This measures a later observed session, not one long session or continued value; session start runs automatically once Symposium is installed.
 - Q2 proves resolution, not activation.
 - Q3 records relationship edges, not a complete dependency set.
 - Q4 counts completed observations, so host termination can be invisible.
@@ -329,6 +329,8 @@ Raw inspection remains byte-preserving. A separate typed reader returns only rec
 
 Recorders make one non-waiting exclusive-lock attempt. Contention drops the entire buffered batch or aggregate observation. Event batches serialize before one append so concurrent lines cannot interleave. Snapshot updates use same-directory temporary replacement.
 
+While holding that lock, session recording rejects a day before the latest-opened-day high-water mark. It applies any day advancement and cohort transition to the same in-memory state, atomically replaces private state, and only then appends the `session_start` row. If the append fails after a new cohort is stored, later rows for that cohort are ignored by Q1 unless a D0 row was stored. The partial failure therefore causes undercounting rather than an unstable cohort identity.
+
 Private-state replacement uses a temporary file beside `telemetry-state.toml` in the config directory. Abandoned state and snapshot temporaries are ignored and cleaned lazily under the telemetry lock. No `fsync` is promised, so a crash can still lose the latest update. Contribution counts detect state and snapshot divergence and permanently mark affected daily session counts incomplete.
 
 Aggregate counters are lower bounds. No durable counter can quantify observations lost to lock contention, process termination, or I/O failure because those conditions can also prevent writing the counter. A cap-only counter would not measure total loss.
@@ -507,7 +509,8 @@ Verify:
 
 - Concurrent complete lines, old-or-new snapshots, whole-operation drops, and cap/marker accounting.
 - D30/D31 cleanup, raw inspection, validated reads, and abandoned state/snapshot temporary cleanup.
-- Day advancement permanently closes earlier files; clock rollback cannot reopen them, and forward-correction drops are non-disruptive.
+- Day advancement and cohort transition share one locked state replacement before a session append. A failed D0 append cannot admit later rows as a return cohort.
+- Observations before the high-water mark are dropped before cohort mutation; clock rollback cannot reopen earlier files, and forward-correction drops are non-disruptive.
 - Malformed, invalid, and unknown-version lines remain inspectable, are reported separately, and cannot enter validated output.
 - Validated output contains no lock, temporary, or private-state file; an oversized or incompletely read day is rejected as a whole.
 - Private-state permissions and separation, clear/reset semantics, and test-only recorder isolation.
