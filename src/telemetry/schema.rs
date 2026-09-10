@@ -547,10 +547,9 @@ mod tests {
             panic!("storage_limit contract example was not classified as supported");
         };
 
-        let actual = serde_json::to_value(row).unwrap();
-        let expected = serde_json::from_str::<serde_json::Value>(example).unwrap();
-
-        assert_eq!(actual, expected);
+        // Compared as text, not as `Value`: a `Value` map sorts its keys, which
+        // would stop this from pinning the contract's field order.
+        assert_eq!(serde_json::to_string(&row).unwrap(), example);
     }
 
     #[test]
