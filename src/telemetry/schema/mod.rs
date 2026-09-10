@@ -3,6 +3,9 @@
     not(test),
     expect(dead_code, reason = "the new schema is built before storage uses it.")
 )]
+
+mod agent;
+
 use std::{fmt, num::NonZeroU64, sync::LazyLock};
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
