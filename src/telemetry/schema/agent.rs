@@ -6,7 +6,38 @@ use super::{
     CohortDay, EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, UtcSecond,
     deserialize_version_one,
 };
-use crate::telemetry::identity::{RetentionSubject, SessionId};
+use crate::{
+    agents::Agent,
+    telemetry::identity::{RetentionSubject, SessionId},
+};
+
+/// Agent included in the daily configuration snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::telemetry) enum SupportedAgent {
+    Claude,
+    Codex,
+    Copilot,
+    Gemini,
+    Kiro,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Goose,
+}
+
+impl From<Agent> for SupportedAgent {
+    fn from(agent: Agent) -> Self {
+        match agent {
+            Agent::Claude => Self::Claude,
+            Agent::Codex => Self::Codex,
+            Agent::Copilot => Self::Copilot,
+            Agent::Gemini => Self::Gemini,
+            Agent::Kiro => Self::Kiro,
+            Agent::OpenCode => Self::OpenCode,
+            Agent::Goose => Self::Goose,
+        }
+    }
+}
 
 /// Agent that invoked a registered Symposium hook.
 ///
@@ -184,6 +215,44 @@ mod tests {
     }
 
     #[test]
+    fn supported_agents_round_trip_with_contract_names() {
+        let cases = [
+            (SupportedAgent::Claude, "claude"),
+            (SupportedAgent::Codex, "codex"),
+            (SupportedAgent::Copilot, "copilot"),
+            (SupportedAgent::Gemini, "gemini"),
+            (SupportedAgent::Kiro, "kiro"),
+            (SupportedAgent::OpenCode, "opencode"),
+            (SupportedAgent::Goose, "goose"),
+        ];
+
+        for (agent, name) in cases {
+            let json = serde_json::to_string(&agent).unwrap();
+            let decoded = serde_json::from_str::<SupportedAgent>(&json).unwrap();
+
+            assert_eq!(json, format!(r#""{name}""#));
+            assert_eq!(decoded, agent);
+        }
+    }
+
+    #[test]
+    fn project_agents_convert_to_supported_telemetry_agents() {
+        let cases = [
+            (Agent::Claude, SupportedAgent::Claude),
+            (Agent::Codex, SupportedAgent::Codex),
+            (Agent::Copilot, SupportedAgent::Copilot),
+            (Agent::Gemini, SupportedAgent::Gemini),
+            (Agent::Kiro, SupportedAgent::Kiro),
+            (Agent::OpenCode, SupportedAgent::OpenCode),
+            (Agent::Goose, SupportedAgent::Goose),
+        ];
+
+        for (agent, expected) in cases {
+            assert_eq!(SupportedAgent::from(agent), expected);
+        }
+    }
+
+    #[test]
     fn operating_systems_round_trip_with_contract_names() {
         let cases = [
             (OperatingSystem::Linux, "linux"),
@@ -292,11 +361,13 @@ mod tests {
     fn agent_vocabulary_rejects_unknown_contract_names() {
         let unknown = r#""future_value""#;
 
+        let supported_agent = serde_json::from_str::<SupportedAgent>(unknown);
         let hook_agent = serde_json::from_str::<HookAgent>(unknown);
         let operating_system = serde_json::from_str::<OperatingSystem>(unknown);
         let architecture = serde_json::from_str::<Architecture>(unknown);
         let start_kind = serde_json::from_str::<SessionStartKind>(unknown);
 
+        assert!(supported_agent.is_err());
         assert!(hook_agent.is_err());
         assert!(operating_system.is_err());
         assert!(architecture.is_err());
