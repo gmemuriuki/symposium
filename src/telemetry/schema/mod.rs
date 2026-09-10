@@ -16,7 +16,7 @@ use serde::{
 };
 use uuid::Uuid;
 
-use agent::SessionStartV1;
+use agent::{AgentConfigurationV1, SessionStartV1};
 
 /// Random identifier for one telemetry row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,6 +69,7 @@ pub(super) enum RowClassification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TelemetryRow {
     SessionStart(SessionStartV1),
+    AgentConfiguration(AgentConfigurationV1),
     StorageLimit(StorageLimitV1),
 }
 
@@ -79,6 +80,7 @@ impl Serialize for TelemetryRow {
     {
         match self {
             Self::SessionStart(row) => row.serialize(serializer),
+            Self::AgentConfiguration(row) => row.serialize(serializer),
             Self::StorageLimit(row) => row.serialize(serializer),
         }
     }
@@ -381,6 +383,9 @@ pub(super) fn classify_row(line: &str) -> RowClassification {
 
     match (envelope.kind.as_str(), envelope.version) {
         ("session_start", 1) => deserialize_supported_row(line, TelemetryRow::SessionStart),
+        ("agent_configuration", 1) => {
+            deserialize_supported_row(line, TelemetryRow::AgentConfiguration)
+        }
         ("storage_limit", 1) => deserialize_supported_row(line, TelemetryRow::StorageLimit),
         _ => RowClassification::UnknownSchema,
     }
@@ -754,6 +759,37 @@ mod tests {
     fn session_start_with_unknown_field_is_invalid() {
         let example = example_row("session_start");
         let json = example.replacen(r#""agent""#, r#""future_field":true,"agent""#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn agent_configuration_example_round_trips() {
+        let example = example_row("agent_configuration");
+
+        let RowClassification::Supported(row) = classify_row(example) else {
+            panic!("agent_configuration contract example was not classified as supported");
+        };
+
+        assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
+    fn unsupported_agent_configuration_version_is_unknown_schema() {
+        let example = example_row("agent_configuration");
+        let json = example.replacen(r#""v":1"#, r#""v":2"#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::UnknownSchema);
+    }
+
+    #[test]
+    fn agent_configuration_with_unknown_field_is_invalid() {
+        let example = example_row("agent_configuration");
+        let json = example.replacen(r#""configured""#, r#""future_field":true,"configured""#, 1);
 
         let classification = classify_row(&json);
 
