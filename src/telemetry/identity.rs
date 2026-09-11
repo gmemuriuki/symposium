@@ -78,6 +78,11 @@ impl<'a> IdentityWindow<'a> {
 pub(super) trait IdentityDimension {
     type Domain;
 
+    /// Write this dimension's fields in their frozen contract order.
+    ///
+    /// Use [`DimensionWriter::variant`] for tagged values and
+    /// [`DimensionWriter::sequence`] for counted collections. Implementations
+    /// must not add their own framing.
     fn write(&self, writer: &mut DimensionWriter<'_>);
 }
 
@@ -98,6 +103,15 @@ impl<'a> DimensionWriter<'a> {
     /// Write one length-prefixed field.
     pub(super) fn field(&mut self, value: &[u8]) {
         write_frame(value, |bytes| (self.write)(bytes));
+    }
+
+    /// Write a tagged variant followed by its canonically framed fields.
+    ///
+    /// Variant labels are frozen contract values, so callers supply a static
+    /// string rather than data obtained at runtime.
+    pub(super) fn variant(&mut self, label: &'static str, write_fields: impl FnOnce(&mut Self)) {
+        self.field(label.as_bytes());
+        write_fields(self);
     }
 
     /// Write a counted sequence whose items own their recursive encoding.
@@ -545,16 +559,30 @@ mod tests {
         }
     }
 
-    struct TestSequenceDimension;
+    struct TestVariantDimension;
 
-    impl IdentityDimension for TestSequenceDimension {
+    impl IdentityDimension for TestVariantDimension {
         type Domain = TestDomain;
 
         fn write(&self, writer: &mut DimensionWriter<'_>) {
-            let items = [b"a".as_slice(), b"bc".as_slice()];
+            writer.variant("package", |writer| writer.field(b"cargo"));
+        }
+    }
 
-            writer.field(b"root");
-            writer.sequence(&items, |writer, item| writer.field(item));
+    struct TestNestedSequenceDimension;
+
+    impl IdentityDimension for TestNestedSequenceDimension {
+        type Domain = TestDomain;
+
+        fn write(&self, writer: &mut DimensionWriter<'_>) {
+            let groups = [
+                [b"a".as_slice(), b"bc".as_slice()],
+                [b"d".as_slice(), b"ef".as_slice()],
+            ];
+
+            writer.sequence(&groups, |writer, group| {
+                writer.sequence(group, |writer, item| writer.field(item));
+            });
         }
     }
 
@@ -679,23 +707,43 @@ mod tests {
     }
 
     #[test]
-    fn dimension_writer_encodes_counted_sequences_recursively() {
-        let root_length = 4_u64.to_be_bytes();
-        let item_count = 2_u64.to_be_bytes();
-        let first_item_length = 1_u64.to_be_bytes();
-        let second_item_length = 2_u64.to_be_bytes();
+    fn dimension_writer_prefixes_variant_fields_with_their_label() {
+        let variant_length = 7_u64.to_be_bytes();
+        let field_length = 5_u64.to_be_bytes();
         let expected = [
-            root_length.as_slice(),
-            b"root".as_slice(),
-            item_count.as_slice(),
-            first_item_length.as_slice(),
-            b"a".as_slice(),
-            second_item_length.as_slice(),
-            b"bc".as_slice(),
+            variant_length.as_slice(),
+            b"package".as_slice(),
+            field_length.as_slice(),
+            b"cargo".as_slice(),
         ]
         .concat();
 
-        let encoded = encode_dimension_for_test(&TestSequenceDimension);
+        let encoded = encode_dimension_for_test(&TestVariantDimension);
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn dimension_writer_encodes_counted_sequences_recursively() {
+        let item_count = 2_u64.to_be_bytes();
+        let one_byte = 1_u64.to_be_bytes();
+        let two_bytes = 2_u64.to_be_bytes();
+        let expected = [
+            item_count.as_slice(),
+            item_count.as_slice(),
+            one_byte.as_slice(),
+            b"a".as_slice(),
+            two_bytes.as_slice(),
+            b"bc".as_slice(),
+            item_count.as_slice(),
+            one_byte.as_slice(),
+            b"d".as_slice(),
+            two_bytes.as_slice(),
+            b"ef".as_slice(),
+        ]
+        .concat();
+
+        let encoded = encode_dimension_for_test(&TestNestedSequenceDimension);
 
         assert_eq!(encoded, expected);
     }
