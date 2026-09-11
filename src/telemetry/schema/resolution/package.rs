@@ -7,6 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use super::super::{
     EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, deserialize_version_one,
+    name::{InitialByteRule, PublicNameViolation, validate_public_name},
 };
 use crate::telemetry::identity::{
     DimensionWriter, IdentityDimension, PackageDomain, PackageSubject,
@@ -96,26 +97,12 @@ impl<'de> Deserialize<'de> for PublicPackageName {
 }
 
 fn validate_public_package_name(value: &str) -> Result<(), PublicPackageNameError> {
-    let Some((first, rest)) = value.as_bytes().split_first() else {
-        return Err(PublicPackageNameError::Empty);
-    };
-
-    if value.len() > MAX_PUBLIC_PACKAGE_NAME_BYTES {
-        return Err(PublicPackageNameError::TooLong);
-    }
-
-    if !first.is_ascii_alphabetic() {
-        return Err(PublicPackageNameError::NonAlphabeticFirstCharacter);
-    }
-
-    if !rest
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(PublicPackageNameError::UnsupportedCharacter);
-    }
-
-    Ok(())
+    validate_public_name(
+        value,
+        MAX_PUBLIC_PACKAGE_NAME_BYTES,
+        InitialByteRule::Alphabetic,
+    )
+    .map_err(PublicPackageNameError::from)
 }
 
 /// Reason a package name cannot enter public telemetry.
@@ -125,6 +112,17 @@ pub(in crate::telemetry) enum PublicPackageNameError {
     TooLong,
     NonAlphabeticFirstCharacter,
     UnsupportedCharacter,
+}
+
+impl From<PublicNameViolation> for PublicPackageNameError {
+    fn from(violation: PublicNameViolation) -> Self {
+        match violation {
+            PublicNameViolation::Empty => Self::Empty,
+            PublicNameViolation::TooLong => Self::TooLong,
+            PublicNameViolation::InvalidInitialByte => Self::NonAlphabeticFirstCharacter,
+            PublicNameViolation::UnsupportedCharacter => Self::UnsupportedCharacter,
+        }
+    }
 }
 
 impl fmt::Display for PublicPackageNameError {
@@ -372,6 +370,7 @@ impl PackageResolutionV1 {
 mod tests {
     use chrono::NaiveDate;
 
+    use super::super::super::{assert_contract_names, assert_contract_names_with_labels};
     use super::*;
     use crate::telemetry::identity::encode_dimension_for_test;
 
@@ -397,14 +396,7 @@ mod tests {
     fn package_ecosystems_round_trip_with_contract_names() {
         let cases = [(PackageEcosystem::Cargo, "cargo")];
 
-        for (ecosystem, name) in cases {
-            let json = serde_json::to_string(&ecosystem).unwrap();
-            let decoded = serde_json::from_str::<PackageEcosystem>(&json).unwrap();
-
-            assert_eq!(ecosystem.as_str(), name);
-            assert_eq!(json, format!(r#""{name}""#));
-            assert_eq!(decoded, ecosystem);
-        }
+        assert_contract_names_with_labels(&cases, PackageEcosystem::as_str);
     }
 
     #[test]
@@ -415,13 +407,7 @@ mod tests {
             (ExtensionMatch::None, "none"),
         ];
 
-        for (extension_match, name) in cases {
-            let json = serde_json::to_string(&extension_match).unwrap();
-            let decoded = serde_json::from_str::<ExtensionMatch>(&json).unwrap();
-
-            assert_eq!(json, format!(r#""{name}""#));
-            assert_eq!(decoded, extension_match);
-        }
+        assert_contract_names(&cases);
     }
 
     #[test]

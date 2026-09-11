@@ -117,6 +117,8 @@ Only the following stable labels can make package, plugin, skill, or plugin-comm
 
 `crates-io` applies only when core proves allowlisted crates.io provenance; `symposium-recommendations` identifies the built-in registry. `user-plugins`, configured registries, paths, workspaces, and arbitrary git sources remain unnamed. Raw registry names and URLs are never enum values. Adding an ecosystem or public-source label expands name eligibility and requires a new consent version.
 
+Public plugin and skill names use a fixed version 1 grammar: 1 through 64 ASCII bytes, beginning with an ASCII letter or digit, followed by ASCII letters, digits, `-`, or `_`. Unlike public package names, extension names may begin with a digit because they are authored extension identifiers rather than crates.io package coordinates. Symposium preserves the spelling without case folding or Unicode normalization. An otherwise valid extension whose name does not fit this telemetry grammar remains usable but is treated as unnamed by telemetry.
+
 ## Event kinds
 
 ### `session_start`
@@ -215,7 +217,7 @@ This row records one public plugin or skill and one safe path that selected it.
 | ------------------- | --------------------------- | --------------------------------------------------- |
 | `target.type`       | `plugin`, `skill`           | Resolved extension type.                            |
 | `target.source`     | `symposium-recommendations`, `crates-io` | Stable label, never a configured URL or local name. |
-| `target.name`       | validated string            | Name defined by eligible public content.            |
+| `target.name`       | public extension name       | Name defined by eligible public content.            |
 | `path`              | bounded typed nodes         | Actual safe package/predicate/extension chain.      |
 | `extension_subject` | scoped id                   | Deduplicates this safe target/path for 30 days.     |
 
@@ -268,7 +270,7 @@ This cumulative row combines plugin-hook observations for one UTC day, agent, ho
 | `hook`                        | `pre_tool_use`, `post_tool_use`, `user_prompt_submit`, `session_start`, `stop` | Symposium hook surface.                                                                     |
 | `plugin_scope`                | `public`, `unnamed`, `overflow`                                                | Whether the bucket names an eligible public plugin.                                         |
 | `plugin.source`               | `symposium-recommendations`, `crates-io`, conditional                         | Present only when `plugin_scope=public`.                                                     |
-| `plugin.name`                 | validated string, conditional                                                  | Present only when `plugin_scope=public`.                                                     |
+| `plugin.name`                 | public extension name, conditional                                             | Present only when `plugin_scope=public`.                                                     |
 | `attempts`                    | integer                                                                        | Plugin-hook attempts that reached an observed terminal result.                              |
 | `executions`                  | integer                                                                        | Those completed attempts that reached child execution.                                      |
 | `outcomes`                    | plugin outcome counters                                                        | Exact counters named `ok`, `blocked`, and `error`.                                           |
@@ -319,7 +321,7 @@ This cumulative row combines skill-invocation observations for one UTC day, supp
 | `target_scope`                  | `public`, `unnamed`, `overflow`                                                                    | Whether the bucket names an eligible public skill.                                                      |
 | `target.type`                   | `skill`, conditional                                                                                 | Present only when `target_scope=public`.                                                               |
 | `target.source`                 | `symposium-recommendations`, `crates-io`, conditional                                              | Reviewed public source; present only when `target_scope=public`.                                       |
-| `target.name`                   | validated string, conditional                                                                        | Public skill name; present only when `target_scope=public`.                                            |
+| `target.name`                   | public extension name, conditional                                                                 | Public skill name; present only when `target_scope=public`.                                            |
 | `unnamed_reason`                | `ineligible`, `not_indexed`, `attribution_unavailable`, `ambiguous`, `invalid_signal`, conditional    | Present only when `target_scope=unnamed`.                                                              |
 | `attempted`                     | integer                                                                                              | Valid Claude `PreToolUse:Skill` observations merged into the row.                                      |
 | `completed`                     | integer                                                                                              | Successful Claude `PostToolUse:Skill` observations merged into the row.                                |
