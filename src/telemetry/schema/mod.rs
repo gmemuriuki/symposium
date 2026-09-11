@@ -18,6 +18,7 @@ use serde::{
 use uuid::Uuid;
 
 use agent::{AgentConfigurationV1, SessionStartV1};
+use resolution::ResolutionSummaryV1;
 
 /// Random identifier for one telemetry row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,6 +72,7 @@ pub(super) enum RowClassification {
 pub(super) enum TelemetryRow {
     SessionStart(SessionStartV1),
     AgentConfiguration(AgentConfigurationV1),
+    ResolutionSummary(ResolutionSummaryV1),
     StorageLimit(StorageLimitV1),
 }
 
@@ -82,6 +84,7 @@ impl Serialize for TelemetryRow {
         match self {
             Self::SessionStart(row) => row.serialize(serializer),
             Self::AgentConfiguration(row) => row.serialize(serializer),
+            Self::ResolutionSummary(row) => row.serialize(serializer),
             Self::StorageLimit(row) => row.serialize(serializer),
         }
     }
@@ -387,6 +390,9 @@ pub(super) fn classify_row(line: &str) -> RowClassification {
         ("agent_configuration", 1) => {
             deserialize_supported_row(line, TelemetryRow::AgentConfiguration)
         }
+        ("resolution_summary", 1) => {
+            deserialize_supported_row(line, TelemetryRow::ResolutionSummary)
+        }
         ("storage_limit", 1) => deserialize_supported_row(line, TelemetryRow::StorageLimit),
         _ => RowClassification::UnknownSchema,
     }
@@ -404,7 +410,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::resolution::ResolutionSummaryV1;
     use super::*;
 
     const RECORDED_DATA: &str =
@@ -782,9 +787,41 @@ mod tests {
     fn resolution_summary_example_round_trips() {
         let example = example_row("resolution_summary");
 
-        let row = serde_json::from_str::<ResolutionSummaryV1>(example).unwrap();
+        let RowClassification::Supported(row) = classify_row(example) else {
+            panic!("resolution_summary contract example was not classified as supported");
+        };
 
         assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
+    fn unsupported_resolution_summary_version_is_unknown_schema() {
+        let example = example_row("resolution_summary");
+        let json = example.replacen(r#""v":1"#, r#""v":2"#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::UnknownSchema);
+    }
+
+    #[test]
+    fn resolution_summary_with_unknown_field_is_invalid() {
+        let example = example_row("resolution_summary");
+        let json = example.replacen(r#""trigger""#, r#""future_field":true,"trigger""#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn resolution_summary_with_mismatched_unnamed_count_is_invalid() {
+        let example = example_row("resolution_summary");
+        let json = example.replacen(r#""unnamed_packages":1"#, r#""unnamed_packages":2"#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
     }
 
     #[test]
