@@ -1,10 +1,12 @@
 //! Public extension vocabulary shared by telemetry rows.
 
-use std::{fmt, str::FromStr};
+use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde::{Deserialize, Serialize};
 
-use super::name::{InitialByteRule, PublicNameViolation, validate_public_name};
+use super::name::{
+    InitialByteRule, PublicNameViolation, validate_public_name, validated_string_newtype,
+};
 
 const MAX_PUBLIC_EXTENSION_NAME_BYTES: usize = 64;
 
@@ -46,59 +48,12 @@ impl PublicExtensionSource {
     }
 }
 
-/// Public plugin or skill name accepted by the version 1 telemetry contract.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(in crate::telemetry) struct PublicExtensionName(String);
-
-impl PublicExtensionName {
-    /// Return the validated extension name without changing its spelling.
-    #[must_use]
-    pub(in crate::telemetry) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for PublicExtensionName {
-    type Error = PublicExtensionNameError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_public_extension_name(&value)?;
-        Ok(Self(value))
-    }
-}
-
-impl FromStr for PublicExtensionName {
-    type Err = PublicExtensionNameError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        validate_public_extension_name(value)?;
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl fmt::Display for PublicExtensionName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Serialize for PublicExtensionName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for PublicExtensionName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .try_into()
-            .map_err(D::Error::custom)
+validated_string_newtype! {
+    /// Public plugin or skill name accepted by the version 1 telemetry contract.
+    pub(in crate::telemetry) struct PublicExtensionName {
+        error = PublicExtensionNameError;
+        validate = validate_public_extension_name;
+        as_str_doc = "Return the validated extension name without changing its spelling.";
     }
 }
 

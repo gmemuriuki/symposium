@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use super::super::{
     EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, deserialize_version_one,
-    name::{InitialByteRule, PublicNameViolation, validate_public_name},
+    name::{InitialByteRule, PublicNameViolation, validate_public_name, validated_string_newtype},
 };
 use crate::telemetry::identity::{
     DimensionWriter, IdentityDimension, PackageDomain, PackageSubject,
@@ -40,59 +40,12 @@ pub(in crate::telemetry) enum ExtensionMatch {
     None,
 }
 
-/// Public package name accepted by the version 1 telemetry contract.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(in crate::telemetry) struct PublicPackageName(String);
-
-impl PublicPackageName {
-    /// Return the validated package name.
-    #[must_use]
-    pub(in crate::telemetry) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for PublicPackageName {
-    type Error = PublicPackageNameError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_public_package_name(&value)?;
-        Ok(Self(value))
-    }
-}
-
-impl FromStr for PublicPackageName {
-    type Err = PublicPackageNameError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        validate_public_package_name(value)?;
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl fmt::Display for PublicPackageName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl Serialize for PublicPackageName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for PublicPackageName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .try_into()
-            .map_err(D::Error::custom)
+validated_string_newtype! {
+    /// Public package name accepted by the version 1 telemetry contract.
+    pub(in crate::telemetry) struct PublicPackageName {
+        error = PublicPackageNameError;
+        validate = validate_public_package_name;
+        as_str_doc = "Return the validated package name.";
     }
 }
 
