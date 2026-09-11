@@ -5,7 +5,12 @@ use std::{fmt, str::FromStr};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-use crate::telemetry::identity::{DimensionWriter, IdentityDimension, PackageDomain};
+use super::super::{
+    EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, deserialize_version_one,
+};
+use crate::telemetry::identity::{
+    DimensionWriter, IdentityDimension, PackageDomain, PackageSubject,
+};
 
 const MAX_PUBLIC_PACKAGE_NAME_BYTES: usize = 64;
 
@@ -326,8 +331,47 @@ impl std::error::Error for InvalidPublicPackageCoordinate {
     }
 }
 
+/// Version 1 record of one eligible public package used during resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::telemetry) struct PackageResolutionV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    symposium: SymposiumVersion,
+    package: PublicPackageCoordinate,
+    extension_match: ExtensionMatch,
+    package_subject: PackageSubject,
+}
+
+impl PackageResolutionV1 {
+    /// Create a record for one eligible public resolution-input package.
+    #[must_use]
+    pub(in crate::telemetry) fn new(
+        day: UtcDay,
+        package: PublicPackageCoordinate,
+        extension_match: ExtensionMatch,
+        package_subject: PackageSubject,
+    ) -> Self {
+        Self {
+            version: SchemaVersion::V1,
+            kind: RowKind::PackageResolution,
+            event_id: EventId::new(),
+            day,
+            symposium: SymposiumVersion::current(),
+            package,
+            extension_match,
+            package_subject,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::*;
     use crate::telemetry::identity::encode_dimension_for_test;
 
@@ -337,6 +381,16 @@ mod tests {
 
     fn package_version(value: &str) -> ExactPackageVersion {
         value.parse().unwrap()
+    }
+
+    fn package_resolution() -> PackageResolutionV1 {
+        PackageResolutionV1::new(
+            UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap()),
+            PublicPackageCoordinate::try_new(PackageEcosystem::Cargo, "example-runtime", "1.2.3")
+                .unwrap(),
+            ExtensionMatch::Public,
+            "pkg_f6db813c87209816ae4896f3e60dd774".parse().unwrap(),
+        )
     }
 
     #[test]
@@ -562,5 +616,54 @@ mod tests {
 
         assert!(name_result.is_err());
         assert!(version_result.is_err());
+    }
+
+    #[test]
+    fn new_package_resolution_uses_fixed_common_fields() {
+        let expected_day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        let expected_subject = "pkg_f6db813c87209816ae4896f3e60dd774".parse().unwrap();
+
+        let row = package_resolution();
+
+        assert_eq!(row.version, SchemaVersion::V1);
+        assert_eq!(row.kind, RowKind::PackageResolution);
+        assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
+        assert_eq!(row.day, expected_day);
+        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.package.ecosystem(), PackageEcosystem::Cargo);
+        assert_eq!(row.package.name().as_str(), "example-runtime");
+        assert_eq!(row.package.version().to_string(), "1.2.3");
+        assert_eq!(row.extension_match, ExtensionMatch::Public);
+        assert_eq!(row.package_subject, expected_subject);
+    }
+
+    #[test]
+    fn package_resolution_rejects_future_version() {
+        let json = serde_json::to_string(&package_resolution()).unwrap();
+        let future = json.replacen(r#""v":1"#, r#""v":2"#, 1);
+
+        let result = serde_json::from_str::<PackageResolutionV1>(&future);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_resolution_rejects_unknown_fields() {
+        let json = serde_json::to_string(&package_resolution()).unwrap();
+        let unknown = json.replacen(r#""package""#, r#""future_field":true,"package""#, 1);
+
+        let result = serde_json::from_str::<PackageResolutionV1>(&unknown);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn package_resolution_requires_every_field() {
+        let json = serde_json::to_string(&package_resolution()).unwrap();
+        let missing = json.replacen(r#","extension_match":"public""#, "", 1);
+
+        let result = serde_json::from_str::<PackageResolutionV1>(&missing);
+
+        assert!(result.is_err());
     }
 }

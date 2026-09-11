@@ -807,6 +807,16 @@ mod tests {
     }
 
     #[test]
+    fn package_resolution_example_round_trips() {
+        let example = example_row("package_resolution");
+
+        let row = serde_json::from_str::<resolution::package::PackageResolutionV1>(example)
+            .expect("package_resolution contract example must be valid");
+
+        assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
     fn unsupported_resolution_summary_version_is_unknown_schema() {
         let example = example_row("resolution_summary");
         let json = example.replacen(r#""v":1"#, r#""v":2"#, 1);
