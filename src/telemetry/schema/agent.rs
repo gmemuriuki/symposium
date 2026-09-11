@@ -53,6 +53,18 @@ pub(in crate::telemetry) enum HookAgent {
     Kiro,
 }
 
+impl From<HookAgent> for SupportedAgent {
+    fn from(agent: HookAgent) -> Self {
+        match agent {
+            HookAgent::Claude => Self::Claude,
+            HookAgent::Codex => Self::Codex,
+            HookAgent::Copilot => Self::Copilot,
+            HookAgent::Gemini => Self::Gemini,
+            HookAgent::Kiro => Self::Kiro,
+        }
+    }
+}
+
 /// Operating-system class for the running Symposium build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +184,17 @@ impl SessionStartV1 {
     }
 }
 
+/// Fields that vary for each entry in a daily agent configuration snapshot.
+///
+/// These fields are repeated on [`AgentConfigurationV1`] because flattening
+/// this struct into the row would weaken strict unknown-field rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::telemetry) struct AgentConfigurationFields {
+    pub(in crate::telemetry) agent: SupportedAgent,
+    pub(in crate::telemetry) configured: bool,
+    pub(in crate::telemetry) agent_subject: AgentSubject,
+}
+
 /// Version 1 daily observation of one supported agent's configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -194,11 +217,9 @@ impl AgentConfigurationV1 {
     #[must_use]
     pub(in crate::telemetry) fn new(
         day: UtcDay,
-        agent: SupportedAgent,
-        configured: bool,
         os: OperatingSystem,
         arch: Architecture,
-        agent_subject: AgentSubject,
+        fields: AgentConfigurationFields,
     ) -> Self {
         Self {
             version: SchemaVersion::V1,
@@ -206,11 +227,11 @@ impl AgentConfigurationV1 {
             event_id: EventId::new(),
             day,
             symposium: SymposiumVersion::current(),
-            agent,
-            configured,
+            agent: fields.agent,
+            configured: fields.configured,
             os,
             arch,
-            agent_subject,
+            agent_subject: fields.agent_subject,
         }
     }
 }
@@ -258,6 +279,24 @@ mod tests {
     }
 
     #[test]
+    fn hook_agent_names_match_supported_agent_names() {
+        let agents = [
+            HookAgent::Claude,
+            HookAgent::Codex,
+            HookAgent::Copilot,
+            HookAgent::Gemini,
+            HookAgent::Kiro,
+        ];
+
+        for agent in agents {
+            let hook_name = serde_json::to_string(&agent).unwrap();
+            let supported_name = serde_json::to_string(&SupportedAgent::from(agent)).unwrap();
+
+            assert_eq!(hook_name, supported_name);
+        }
+    }
+
+    #[test]
     fn supported_agents_round_trip_with_contract_names() {
         let cases = [
             (SupportedAgent::Claude, "claude"),
@@ -279,19 +318,12 @@ mod tests {
     }
 
     #[test]
-    fn project_agents_convert_to_supported_telemetry_agents() {
-        let cases = [
-            (Agent::Claude, SupportedAgent::Claude),
-            (Agent::Codex, SupportedAgent::Codex),
-            (Agent::Copilot, SupportedAgent::Copilot),
-            (Agent::Gemini, SupportedAgent::Gemini),
-            (Agent::Kiro, SupportedAgent::Kiro),
-            (Agent::OpenCode, SupportedAgent::OpenCode),
-            (Agent::Goose, SupportedAgent::Goose),
-        ];
+    fn project_agent_names_match_telemetry_contract_names() {
+        for &agent in Agent::all() {
+            let telemetry_name = serde_json::to_string(&SupportedAgent::from(agent)).unwrap();
+            let config_name = format!(r#""{}""#, agent.config_name());
 
-        for (agent, expected) in cases {
-            assert_eq!(SupportedAgent::from(agent), expected);
+            assert_eq!(telemetry_name, config_name);
         }
     }
 
@@ -447,11 +479,13 @@ mod tests {
 
         let row = AgentConfigurationV1::new(
             day,
-            SupportedAgent::Claude,
-            true,
             OperatingSystem::Linux,
             Architecture::X86_64,
-            agent_subject,
+            AgentConfigurationFields {
+                agent: SupportedAgent::Claude,
+                configured: true,
+                agent_subject,
+            },
         );
 
         assert_eq!(row.version, SchemaVersion::V1);
