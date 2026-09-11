@@ -10,7 +10,7 @@ use super::super::{
     name::{InitialByteRule, PublicNameViolation, validate_public_name, validated_string_newtype},
 };
 use crate::telemetry::identity::{
-    DimensionWriter, IdentityDimension, PackageDomain, PackageSubject,
+    DimensionWriter, IdentifierWindowScope, IdentityDimension, PackageDomain, PackageSubject,
 };
 
 const MAX_PUBLIC_PACKAGE_NAME_BYTES: usize = 64;
@@ -301,11 +301,13 @@ impl PackageResolutionV1 {
     /// Create a record for one eligible public resolution-input package.
     #[must_use]
     pub(in crate::telemetry) fn new(
+        identity: &IdentifierWindowScope<'_>,
         day: UtcDay,
         package: PublicPackageCoordinate,
         extension_match: ExtensionMatch,
-        package_subject: PackageSubject,
     ) -> Self {
+        let package_subject = identity.derive(&package);
+
         Self {
             version: SchemaVersion::V1,
             kind: RowKind::PackageResolution,
@@ -325,7 +327,14 @@ mod tests {
 
     use super::super::super::{assert_contract_names, assert_contract_names_with_labels};
     use super::*;
-    use crate::telemetry::identity::encode_dimension_for_test;
+    use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
+
+    const TEST_STATE: &str = r#"version = 1
+
+[identity]
+key = "4242424242424242424242424242424242424242424242424242424242424242"
+identifier-window-anchor = "2026-08-03"
+"#;
 
     fn package_name(value: &str) -> PublicPackageName {
         value.parse().unwrap()
@@ -336,12 +345,19 @@ mod tests {
     }
 
     fn package_resolution() -> PackageResolutionV1 {
+        package_resolution_for("example-runtime")
+    }
+
+    fn package_resolution_for(package_name: &str) -> PackageResolutionV1 {
+        let state: TelemetryStateV1 = toml::from_str(TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+
         PackageResolutionV1::new(
+            &identity,
             UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap()),
-            PublicPackageCoordinate::try_new(PackageEcosystem::Cargo, "example-runtime", "1.2.3")
+            PublicPackageCoordinate::try_new(PackageEcosystem::Cargo, package_name, "1.2.3")
                 .unwrap(),
             ExtensionMatch::Public,
-            "pkg_f6db813c87209816ae4896f3e60dd774".parse().unwrap(),
         )
     }
 
@@ -558,9 +574,12 @@ mod tests {
     }
 
     #[test]
-    fn new_package_resolution_uses_fixed_common_fields() {
+    fn new_package_resolution_derives_subject_from_its_coordinate() {
         let expected_day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
-        let expected_subject = "pkg_f6db813c87209816ae4896f3e60dd774".parse().unwrap();
+        // Cross-checked with .NET's HMACSHA256 over the contract header,
+        // identifier window, ecosystem, published name, and exact version. The
+        // complete digest is a7907f7a5ae0de9ae55469f276ba73b2fe68e9b97c4bdd1867dd0685acd297ee.
+        let expected_subject = "pkg_a7907f7a5ae0de9ae55469f276ba73b2".parse().unwrap();
 
         let row = package_resolution();
 
@@ -574,6 +593,14 @@ mod tests {
         assert_eq!(row.package.version().to_string(), "1.2.3");
         assert_eq!(row.extension_match, ExtensionMatch::Public);
         assert_eq!(row.package_subject, expected_subject);
+    }
+
+    #[test]
+    fn package_subject_changes_with_the_source_coordinate() {
+        let first = package_resolution_for("example-runtime");
+        let second = package_resolution_for("example-tools");
+
+        assert_ne!(first.package_subject, second.package_subject);
     }
 
     #[test]

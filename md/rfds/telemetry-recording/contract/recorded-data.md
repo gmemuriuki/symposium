@@ -70,20 +70,20 @@ HMAC(
 )
 ```
 
-The window is the canonical byte form of the relevant anchor in `telemetry-state.toml`. Dimension fields use the exact UTF-8 bytes of their stable labels and validated strings, without case folding or Unicode normalization. Length framing keeps field boundaries unambiguous even when a value contains a NUL byte. Domains with no dimension fields end after the framed window.
+The window is the anchor's ASCII `YYYY-MM-DD` representation from `telemetry-state.toml`. Dimension fields use the exact UTF-8 bytes of their stable labels and validated strings, without case folding or Unicode normalization. Length framing keeps field boundaries unambiguous even when a value contains a NUL byte. Domains with no dimension fields end after the framed window.
 
 The domain strings, wire prefixes, and ordered dimension fields are frozen for consent version 1:
 
-| Identifier | HMAC domain | Wire prefix | Ordered dimension fields |
-| --- | --- | --- | --- |
-| `session_id` | `session_id` | `sess_` | Agent, vendor session id. |
-| `retention_subject` | `retention_subject` | `ret_` | None; the return-cohort anchor is the window. |
-| `agent_subject` | `agent_subject` | `agt_` | Agent. |
-| `package_subject` | `package_subject` | `pkg_` | Package ecosystem, name, exact version. |
-| `extension_subject` | `extension_subject` | `ext_` | Target type, source, name, then the complete safe resolution path. |
-| `hook_subject` | `hook_subject` | `hok_` | Agent, hook surface. |
-| `plugin_subject` | `plugin_subject` | `plg_` | Public source, plugin name. |
-| `command_subject` | `command_subject` | `cmd_` | Command type, then its typed coordinate fields in event order. |
+| Identifier | HMAC domain | Wire prefix | Window anchor | Ordered dimension fields |
+| --- | --- | --- | --- | --- |
+| `session_id` | `session_id` | `sess_` | `identifier-window` | Agent, vendor session id. |
+| `retention_subject` | `retention_subject` | `ret_` | `return-cohort` | None. |
+| `agent_subject` | `agent_subject` | `agt_` | `identifier-window` | Agent. |
+| `package_subject` | `package_subject` | `pkg_` | `identifier-window` | Package ecosystem, name, exact version. |
+| `extension_subject` | `extension_subject` | `ext_` | `identifier-window` | Target type, source, name, then the complete safe resolution path. |
+| `hook_subject` | `hook_subject` | `hok_` | `identifier-window` | Agent, hook surface. |
+| `plugin_subject` | `plugin_subject` | `plg_` | `identifier-window` | Public source, plugin name. |
+| `command_subject` | `command_subject` | `cmd_` | `identifier-window` | Command type, then its typed coordinate fields in event order. |
 
 Structured values such as an extension path use the same framing recursively. A sequence starts with its eight-byte unsigned big-endian item count. Each variant starts with its framed type label, followed by its fields in the order used by the corresponding event schema. Identity code owns this encoding; telemetry producers pass typed coordinates rather than concatenating strings.
 
