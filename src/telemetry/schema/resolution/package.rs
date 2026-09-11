@@ -5,6 +5,8 @@ use std::{fmt, str::FromStr};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
+use crate::telemetry::identity::{DimensionWriter, IdentityDimension, PackageDomain};
+
 const MAX_PUBLIC_PACKAGE_NAME_BYTES: usize = 64;
 
 /// Public package ecosystem approved for version 1 telemetry.
@@ -12,6 +14,15 @@ const MAX_PUBLIC_PACKAGE_NAME_BYTES: usize = 64;
 #[serde(rename_all = "snake_case")]
 pub(in crate::telemetry) enum PackageEcosystem {
     Cargo,
+}
+
+impl PackageEcosystem {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+        }
+    }
 }
 
 /// Kind of extension content contributed by one public package.
@@ -266,6 +277,18 @@ impl PublicPackageCoordinate {
     }
 }
 
+impl IdentityDimension for PublicPackageCoordinate {
+    type Domain = PackageDomain;
+
+    /// Write the version 1 `package_subject` fields in contract order.
+    fn write(&self, writer: &mut DimensionWriter<'_>) {
+        let version = self.version.to_string();
+        writer.field(self.ecosystem.as_str().as_bytes());
+        writer.field(self.name.as_str().as_bytes());
+        writer.field(version.as_bytes());
+    }
+}
+
 /// Error returned when a public package coordinate has an invalid component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::telemetry) enum InvalidPublicPackageCoordinate {
@@ -306,6 +329,7 @@ impl std::error::Error for InvalidPublicPackageCoordinate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::identity::encode_dimension_for_test;
 
     fn package_name(value: &str) -> PublicPackageName {
         value.parse().unwrap()
@@ -323,6 +347,7 @@ mod tests {
             let json = serde_json::to_string(&ecosystem).unwrap();
             let decoded = serde_json::from_str::<PackageEcosystem>(&json).unwrap();
 
+            assert_eq!(ecosystem.as_str(), name);
             assert_eq!(json, format!(r#""{name}""#));
             assert_eq!(decoded, ecosystem);
         }
@@ -466,6 +491,32 @@ mod tests {
                 InvalidExactPackageVersion
             ))
         );
+    }
+
+    #[test]
+    fn package_subject_dimension_uses_contract_field_order() {
+        let coordinate = PublicPackageCoordinate::try_new(
+            PackageEcosystem::Cargo,
+            "example-runtime",
+            "1.2.3-alpha.1+build.5",
+        )
+        .unwrap();
+        let ecosystem_length = 5_u64.to_be_bytes();
+        let name_length = 15_u64.to_be_bytes();
+        let version_length = 21_u64.to_be_bytes();
+        let expected = [
+            ecosystem_length.as_slice(),
+            b"cargo".as_slice(),
+            name_length.as_slice(),
+            b"example-runtime".as_slice(),
+            version_length.as_slice(),
+            b"1.2.3-alpha.1+build.5".as_slice(),
+        ]
+        .concat();
+
+        let encoded = encode_dimension_for_test(&coordinate);
+
+        assert_eq!(encoded, expected);
     }
 
     #[test]
