@@ -404,6 +404,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::resolution::ResolutionSummaryV1;
     use super::*;
 
     const RECORDED_DATA: &str =
@@ -773,6 +774,15 @@ mod tests {
         let RowClassification::Supported(row) = classify_row(example) else {
             panic!("agent_configuration contract example was not classified as supported");
         };
+
+        assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
+    fn resolution_summary_example_round_trips() {
+        let example = example_row("resolution_summary");
+
+        let row = serde_json::from_str::<ResolutionSummaryV1>(example).unwrap();
 
         assert_eq!(serde_json::to_string(&row).unwrap(), example);
     }
