@@ -5,6 +5,7 @@
 )]
 
 mod agent;
+mod resolution;
 
 use std::{fmt, num::NonZeroU64, sync::LazyLock};
 
