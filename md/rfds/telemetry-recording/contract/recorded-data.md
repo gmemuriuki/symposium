@@ -232,6 +232,23 @@ Path nodes are limited to:
 | `not`       | Marker only; the child is not recorded.                              |
 | `opaque`    | Fixed reason: `private_source`, `non_package_predicate`, or `limit`. |
 
+The exact version 1 node shapes are shown below. These examples use public
+placeholder coordinates; the same package and extension validation rules
+described above apply inside path nodes.
+
+```json
+{"type":"package","ecosystem":"cargo","name":"example-runtime","version":"1.2.3"}
+{"type":"extension","extension_type":"skill","source":"symposium-recommendations","name":"example-debugging"}
+{"type":"all","children":[{"type":"package","ecosystem":"cargo","name":"example-runtime","version":"1.2.3"},{"type":"any","child":{"type":"extension","extension_type":"skill","source":"symposium-recommendations","name":"example-debugging"}},{"type":"not"},{"type":"opaque","reason":"limit"}]}
+{"type":"any","child":{"type":"not"}}
+{"type":"not"}
+{"type":"opaque","reason":"non_package_predicate"}
+```
+
+`all.children` contains one or more nodes. `any.child` contains the one branch
+that made the expression succeed. Each object is strict: missing fields,
+additional fields, unknown node types, and unknown opaque reasons are invalid.
+
 Shell commands, paths, environment variables, custom predicate names or arguments, and private package or extension names never enter a path. An opaque marker can represent their position.
 
 Witness depth counts nested evidence nodes from the root, which is level 1, to a terminal package, extension, `not`, or opaque node. A subtree that would exceed level 8 becomes `opaque: limit`. The complete path is also limited to 16 evidence leaves and 4 KiB. Evidence depth does not count filesystem components; filesystem paths are never recorded.

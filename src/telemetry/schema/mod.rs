@@ -416,6 +416,25 @@ where
 }
 
 #[cfg(test)]
+const RECORDED_DATA_CONTRACT: &str =
+    include_str!("../../../md/rfds/telemetry-recording/contract/recorded-data.md");
+
+#[cfg(test)]
+fn recorded_data_example_block(section_heading: &str, opening_fence: &str) -> &'static str {
+    let (_, after_heading) = RECORDED_DATA_CONTRACT
+        .split_once(section_heading)
+        .unwrap_or_else(|| panic!("recorded-data contract must contain {section_heading}"));
+    let (_, after_fence) = after_heading
+        .split_once(opening_fence)
+        .unwrap_or_else(|| panic!("{section_heading} must contain an {opening_fence} block"));
+    let (example_block, _) = after_fence
+        .split_once("```")
+        .unwrap_or_else(|| panic!("{section_heading} example block must have a closing fence"));
+
+    example_block
+}
+
+#[cfg(test)]
 fn assert_contract_names<T>(cases: &[(T, &str)])
 where
     T: Copy + fmt::Debug + PartialEq + Serialize + DeserializeOwned,
@@ -445,16 +464,9 @@ where
 mod tests {
     use super::*;
 
-    const RECORDED_DATA: &str =
-        include_str!("../../../md/rfds/telemetry-recording/contract/recorded-data.md");
-
     fn example_row(requested_kind: &str) -> &'static str {
-        let (_, after_fence) = RECORDED_DATA
-            .split_once("```jsonl")
-            .expect("recorded-data contract must contain a JSONL example block");
-        let (example_block, _) = after_fence
-            .split_once("```")
-            .expect("recorded-data JSONL example block must have a closing fence");
+        let example_block =
+            recorded_data_example_block("## Example JSONL for every row kind", "```jsonl");
 
         example_block
             .lines()
