@@ -420,6 +420,14 @@ const RECORDED_DATA_CONTRACT: &str =
     include_str!("../../../md/rfds/telemetry-recording/contract/recorded-data.md");
 
 #[cfg(test)]
+const IDENTIFIER_WINDOW_TEST_STATE: &str = r#"version = 1
+
+[identity]
+key = "4242424242424242424242424242424242424242424242424242424242424242"
+identifier-window-anchor = "2026-08-03"
+"#;
+
+#[cfg(test)]
 fn recorded_data_example_block(section_heading: &str, opening_fence: &str) -> &'static str {
     let (_, after_heading) = RECORDED_DATA_CONTRACT
         .split_once(section_heading)

@@ -10,6 +10,9 @@ use super::{
     },
     package::PublicPackageCoordinate,
 };
+use crate::telemetry::identity::{
+    DimensionWriter, ExtensionDomain, ExtensionSubject, IdentifierWindowScope, IdentityDimension,
+};
 
 /// Maximum root-to-leaf depth of a recorded resolution path.
 const MAX_RESOLUTION_PATH_DEPTH: usize = 8;
@@ -33,6 +36,31 @@ enum ResolutionPathNode {
 }
 
 impl ResolutionPathNode {
+    fn write_identity(&self, writer: &mut DimensionWriter<'_>) {
+        match self {
+            Self::Package(coordinate) => writer.variant("package", |writer| {
+                coordinate.write_identity_fields(writer);
+            }),
+            Self::Extension(node) => writer.variant("extension", |writer| {
+                writer.field(node.extension_type.as_str().as_bytes());
+                writer.field(node.source.as_str().as_bytes());
+                writer.field(node.name.as_str().as_bytes());
+            }),
+            Self::All(node) => writer.variant("all", |writer| {
+                writer.sequence(&node.children, |writer, child| {
+                    child.write_identity(writer);
+                });
+            }),
+            Self::Any(node) => writer.variant("any", |writer| {
+                node.child.write_identity(writer);
+            }),
+            Self::Not(_) => writer.variant("not", |_| {}),
+            Self::Opaque(node) => writer.variant("opaque", |writer| {
+                writer.field(node.reason.as_str().as_bytes());
+            }),
+        }
+    }
+
     fn validate_depth(&self, depth: usize) -> Result<(), ResolutionPathError> {
         if depth > MAX_RESOLUTION_PATH_DEPTH {
             return Err(ResolutionPathError::DepthExceeded {
@@ -94,6 +122,39 @@ impl ResolutionPathNode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<ResolutionPathNode>")]
 struct ResolutionPath(Vec<ResolutionPathNode>);
+
+impl ResolutionPath {
+    /// Derive the subject for this path and its resolved public target.
+    #[must_use]
+    fn derive_subject(
+        &self,
+        scope: &IdentifierWindowScope<'_>,
+        target: &PublicExtensionCoordinate,
+    ) -> ExtensionSubject {
+        scope.derive(&ExtensionSubjectDimension { target, path: self })
+    }
+
+    fn write_identity(&self, writer: &mut DimensionWriter<'_>) {
+        writer.sequence(&self.0, |writer, node| node.write_identity(writer));
+    }
+}
+
+struct ExtensionSubjectDimension<'a> {
+    target: &'a PublicExtensionCoordinate,
+    path: &'a ResolutionPath,
+}
+
+impl IdentityDimension for ExtensionSubjectDimension<'_> {
+    type Domain = ExtensionDomain;
+
+    /// Write the version 1 `extension_subject` fields in contract order.
+    fn write(&self, writer: &mut DimensionWriter<'_>) {
+        writer.field(self.target.kind().as_str().as_bytes());
+        writer.field(self.target.source().as_str().as_bytes());
+        writer.field(self.target.name().as_str().as_bytes());
+        self.path.write_identity(writer);
+    }
+}
 
 impl TryFrom<Vec<ResolutionPathNode>> for ResolutionPath {
     type Error = ResolutionPathError;
@@ -236,10 +297,24 @@ enum OpaqueResolutionReason {
     Limit,
 }
 
+impl OpaqueResolutionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrivateSource => "private_source",
+            Self::NonPackagePredicate => "non_package_predicate",
+            Self::Limit => "limit",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::super::recorded_data_example_block;
+    use super::super::super::{
+        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names_with_labels,
+        recorded_data_example_block,
+    };
     use super::*;
+    use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
 
     fn documented_path_node_examples() -> impl Iterator<Item = &'static str> {
         let example_block = recorded_data_example_block("### `extension_resolution`", "```json");
@@ -321,6 +396,28 @@ mod tests {
         ResolutionPath::try_from(nodes)
     }
 
+    fn append_expected_field(output: &mut Vec<u8>, value: &str) {
+        let length = u64::try_from(value.len()).unwrap();
+        output.extend_from_slice(&length.to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn public_target() -> PublicExtensionCoordinate {
+        PublicExtensionCoordinate::try_new(
+            ExtensionKind::Skill,
+            PublicExtensionSource::SymposiumRecommendations,
+            "example-debugging",
+        )
+        .unwrap()
+    }
+
+    fn resolution_path_with_every_node_variant() -> ResolutionPath {
+        serde_json::from_str(
+            r#"[{"type":"package","ecosystem":"cargo","name":"example-runtime","version":"1.2.3"},{"type":"extension","extension_type":"plugin","source":"crates-io","name":"example-tools"},{"type":"all","children":[{"type":"any","child":{"type":"opaque","reason":"private_source"}},{"type":"not"}]}]"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn documented_resolution_path_nodes_round_trip_in_contract_shape() {
         for json in documented_path_node_examples() {
@@ -332,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn opaque_resolution_reasons_round_trip_with_identity_labels() {
+        let cases = [
+            (OpaqueResolutionReason::PrivateSource, "private_source"),
+            (
+                OpaqueResolutionReason::NonPackagePredicate,
+                "non_package_predicate",
+            ),
+            (OpaqueResolutionReason::Limit, "limit"),
+        ];
+
+        assert_contract_names_with_labels(&cases, OpaqueResolutionReason::as_str);
+    }
+
+    #[test]
     fn non_empty_resolution_path_round_trips_as_an_array() {
         let json = r#"[{"type":"not"}]"#;
 
@@ -339,6 +450,82 @@ mod tests {
         let encoded = serde_json::to_string(&path).unwrap();
 
         assert_eq!(encoded, json);
+    }
+
+    #[test]
+    fn extension_subject_dimension_places_target_before_counted_path() {
+        let target = public_target();
+        let path = serde_json::from_str::<ResolutionPath>(r#"[{"type":"not"}]"#).unwrap();
+        let dimension = ExtensionSubjectDimension {
+            target: &target,
+            path: &path,
+        };
+
+        let encoded = encode_dimension_for_test(&dimension);
+        let expected = [
+            5_u64.to_be_bytes().as_slice(),
+            b"skill",
+            25_u64.to_be_bytes().as_slice(),
+            b"symposium-recommendations",
+            17_u64.to_be_bytes().as_slice(),
+            b"example-debugging",
+            1_u64.to_be_bytes().as_slice(),
+            3_u64.to_be_bytes().as_slice(),
+            b"not",
+        ]
+        .concat();
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn extension_subject_dimension_encodes_every_path_node_variant() {
+        let target = public_target();
+        let path = resolution_path_with_every_node_variant();
+        let dimension = ExtensionSubjectDimension {
+            target: &target,
+            path: &path,
+        };
+
+        let encoded = encode_dimension_for_test(&dimension);
+        let mut expected = Vec::new();
+        append_expected_field(&mut expected, "skill");
+        append_expected_field(&mut expected, "symposium-recommendations");
+        append_expected_field(&mut expected, "example-debugging");
+        expected.extend_from_slice(&3_u64.to_be_bytes());
+        append_expected_field(&mut expected, "package");
+        append_expected_field(&mut expected, "cargo");
+        append_expected_field(&mut expected, "example-runtime");
+        append_expected_field(&mut expected, "1.2.3");
+        append_expected_field(&mut expected, "extension");
+        append_expected_field(&mut expected, "plugin");
+        append_expected_field(&mut expected, "crates-io");
+        append_expected_field(&mut expected, "example-tools");
+        append_expected_field(&mut expected, "all");
+        expected.extend_from_slice(&2_u64.to_be_bytes());
+        append_expected_field(&mut expected, "any");
+        append_expected_field(&mut expected, "opaque");
+        append_expected_field(&mut expected, "private_source");
+        append_expected_field(&mut expected, "not");
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn extension_subject_derivation_matches_independent_vector() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let target = public_target();
+        let path = resolution_path_with_every_node_variant();
+        // Cross-checked with .NET's HMACSHA256 over the contract header,
+        // identifier window, public target, and complete recursive path. The
+        // complete digest is
+        // 63872efd4737ec84179b4e8b0662c1212e9e3295e1940387c4a4e2cca0a9090e.
+        let expected_subject = "ext_63872efd4737ec84179b4e8b0662c121".parse().unwrap();
+
+        let subject = path.derive_subject(&identity, &target);
+
+        assert_eq!(subject, expected_subject);
     }
 
     #[test]
