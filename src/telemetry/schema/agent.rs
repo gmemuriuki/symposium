@@ -1,5 +1,7 @@
 //! Closed vocabulary shared by agent-originated telemetry rows.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -143,9 +145,9 @@ pub(in crate::telemetry) struct SessionStartFields {
 
 /// Version 1 record of a completed registered session-start hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawSessionStartV1")]
 pub(in crate::telemetry) struct SessionStartV1 {
-    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    #[serde(rename = "v")]
     version: SchemaVersion,
     kind: RowKind,
     event_id: EventId,
@@ -181,6 +183,78 @@ impl SessionStartV1 {
             retention_subject: fields.retention_subject,
             cohort_day: fields.cohort_day,
         }
+    }
+}
+
+/// Invalid relationship between fields in a session-start row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStartError {
+    DayDoesNotMatchTimestamp { stored: UtcDay, timestamp: UtcDay },
+}
+
+impl fmt::Display for SessionStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DayDoesNotMatchTimestamp { stored, timestamp } => write!(
+                formatter,
+                "stored session-start day {stored} does not match timestamp day {timestamp}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionStartError {}
+
+/// Strict wire representation validated before becoming a session-start row.
+///
+/// Serde's `try_from` deserializes this type rather than the outer row, so its
+/// version and unknown-field checks are deliberately declared here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSessionStartV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    at: UtcSecond,
+    symposium: SymposiumVersion,
+    agent: HookAgent,
+    os: OperatingSystem,
+    arch: Architecture,
+    start: SessionStartKind,
+    session_id: Option<SessionId>,
+    retention_subject: RetentionSubject,
+    cohort_day: CohortDay,
+}
+
+impl TryFrom<RawSessionStartV1> for SessionStartV1 {
+    type Error = SessionStartError;
+
+    fn try_from(raw: RawSessionStartV1) -> Result<Self, Self::Error> {
+        let timestamp_day = raw.at.day();
+        if raw.day != timestamp_day {
+            return Err(SessionStartError::DayDoesNotMatchTimestamp {
+                stored: raw.day,
+                timestamp: timestamp_day,
+            });
+        }
+
+        Ok(Self {
+            version: raw.version,
+            kind: raw.kind,
+            event_id: raw.event_id,
+            day: raw.day,
+            at: raw.at,
+            symposium: raw.symposium,
+            agent: raw.agent,
+            os: raw.os,
+            arch: raw.arch,
+            start: raw.start,
+            session_id: raw.session_id,
+            retention_subject: raw.retention_subject,
+            cohort_day: raw.cohort_day,
+        })
     }
 }
 
@@ -514,5 +588,18 @@ mod tests {
         assert_eq!(value.get("session_id"), None);
         assert!(decoded.session_id.is_none());
         assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn session_start_rejects_a_day_that_disagrees_with_its_timestamp() {
+        let row = SessionStartV1::new(session_start_time(), session_start_fields(None));
+        let mut value = serde_json::to_value(row).unwrap();
+        value["day"] = serde_json::Value::String("2026-08-04".to_owned());
+
+        let result = serde_json::from_value::<SessionStartV1>(value);
+
+        assert!(result.unwrap_err().to_string().contains(
+            "stored session-start day 2026-08-04 does not match timestamp day 2026-08-03"
+        ));
     }
 }

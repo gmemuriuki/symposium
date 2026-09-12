@@ -773,6 +773,18 @@ mod tests {
     }
 
     #[test]
+    fn session_start_with_a_timestamp_from_another_day_is_invalid() {
+        let example = example_row("session_start");
+        let mut value = serde_json::from_str::<serde_json::Value>(example).unwrap();
+        value["day"] = serde_json::Value::String("2026-08-04".to_owned());
+        let json = serde_json::to_string(&value).unwrap();
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
     fn agent_configuration_example_round_trips() {
         let example = example_row("agent_configuration");
 
