@@ -156,6 +156,45 @@ impl IdentityDimension for SessionDimension<'_> {
     }
 }
 
+/// An agent session paired with its optional scoped identifier.
+///
+/// The identifier is derived from the same agent stored here, so callers
+/// cannot associate one agent with an identifier derived for another. Agents
+/// that do not supply a vendor session identifier remain explicitly
+/// unidentified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::telemetry) struct AgentSessionIdentity {
+    agent: HookAgent,
+    session_id: Option<SessionId>,
+}
+
+impl AgentSessionIdentity {
+    /// Derive the identifier for one agent session in an identifier window.
+    #[must_use]
+    pub(in crate::telemetry) fn new(
+        identity: &IdentifierWindowScope<'_>,
+        agent: HookAgent,
+        vendor_session_id: Option<&VendorSessionId>,
+    ) -> Self {
+        let session_id = vendor_session_id.map(|vendor_session_id| {
+            identity.derive(&SessionDimension::new(agent, vendor_session_id))
+        });
+
+        Self { agent, session_id }
+    }
+
+    /// Return the agent whose session this identity describes.
+    #[must_use]
+    pub(in crate::telemetry) const fn agent(self) -> HookAgent {
+        self.agent
+    }
+
+    /// Return the scoped identifier when the agent supplied a vendor id.
+    pub(in crate::telemetry) const fn session_id(self) -> Option<SessionId> {
+        self.session_id
+    }
+}
+
 /// Operating-system class for the running Symposium build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -480,17 +519,17 @@ mod tests {
         let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
         let identity = state.identifier_window_scope();
         let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
-        let dimension = SessionDimension::new(HookAgent::Claude, &vendor_session_id);
 
-        let subject = identity.derive(&dimension);
+        let session =
+            AgentSessionIdentity::new(&identity, HookAgent::Claude, Some(&vendor_session_id));
 
         // Cross-checked with .NET's HMACSHA256 over the contract header,
         // identifier window, agent, and vendor session id. The complete
         // digest is
         // 2f77ea40740f4be8e85ba05e7924e1ad054037d26629db2ef7dc7097dddf723a.
         assert_eq!(
-            subject,
-            "sess_2f77ea40740f4be8e85ba05e7924e1ad".parse().unwrap()
+            session.session_id(),
+            Some("sess_2f77ea40740f4be8e85ba05e7924e1ad".parse().unwrap())
         );
     }
 
@@ -501,14 +540,25 @@ mod tests {
         let first_vendor_id = VendorSessionId::new("vendor-session-123".to_owned());
         let second_vendor_id = VendorSessionId::new("vendor-session-456".to_owned());
 
-        let first = identity.derive(&SessionDimension::new(HookAgent::Claude, &first_vendor_id));
+        let first = AgentSessionIdentity::new(&identity, HookAgent::Claude, Some(&first_vendor_id));
         let other_agent =
-            identity.derive(&SessionDimension::new(HookAgent::Codex, &first_vendor_id));
+            AgentSessionIdentity::new(&identity, HookAgent::Codex, Some(&first_vendor_id));
         let other_vendor_id =
-            identity.derive(&SessionDimension::new(HookAgent::Claude, &second_vendor_id));
+            AgentSessionIdentity::new(&identity, HookAgent::Claude, Some(&second_vendor_id));
 
-        assert_ne!(first, other_agent);
-        assert_ne!(first, other_vendor_id);
+        assert_ne!(first.session_id(), other_agent.session_id());
+        assert_ne!(first.session_id(), other_vendor_id.session_id());
+    }
+
+    #[test]
+    fn agent_session_without_vendor_id_is_unidentified() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+
+        let session = AgentSessionIdentity::new(&identity, HookAgent::Copilot, None);
+
+        assert_eq!(session.agent(), HookAgent::Copilot);
+        assert_eq!(session.session_id(), None);
     }
 
     #[test]
