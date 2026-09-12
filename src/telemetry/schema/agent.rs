@@ -10,7 +10,10 @@ use super::{
 };
 use crate::{
     agents::Agent,
-    telemetry::identity::{AgentSubject, RetentionSubject, SessionId},
+    telemetry::identity::{
+        AgentDomain, AgentSubject, DimensionWriter, IdentifierWindowScope, IdentityDimension,
+        RetentionSubject, SessionId,
+    },
 };
 
 /// Agent included in the daily configuration snapshot.
@@ -25,6 +28,31 @@ pub(in crate::telemetry) enum SupportedAgent {
     #[serde(rename = "opencode")]
     OpenCode,
     Goose,
+}
+
+impl SupportedAgent {
+    /// Return the frozen version 1 wire label.
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
+            Self::Kiro => "kiro",
+            Self::OpenCode => "opencode",
+            Self::Goose => "goose",
+        }
+    }
+}
+
+impl IdentityDimension for SupportedAgent {
+    type Domain = AgentDomain;
+
+    /// Write the version 1 `agent_subject` fields in contract order.
+    fn write(&self, writer: &mut DimensionWriter<'_>) {
+        writer.field(self.as_str().as_bytes());
+    }
 }
 
 impl From<Agent> for SupportedAgent {
@@ -266,7 +294,6 @@ impl TryFrom<RawSessionStartV1> for SessionStartV1 {
 pub(in crate::telemetry) struct AgentConfigurationFields {
     pub(in crate::telemetry) agent: SupportedAgent,
     pub(in crate::telemetry) configured: bool,
-    pub(in crate::telemetry) agent_subject: AgentSubject,
 }
 
 /// Version 1 daily observation of one supported agent's configuration.
@@ -290,11 +317,14 @@ impl AgentConfigurationV1 {
     /// Create one agent entry in a daily configuration snapshot.
     #[must_use]
     pub(in crate::telemetry) fn new(
+        identity: &IdentifierWindowScope<'_>,
         day: UtcDay,
         os: OperatingSystem,
         arch: Architecture,
         fields: AgentConfigurationFields,
     ) -> Self {
+        let agent_subject = identity.derive(&fields.agent);
+
         Self {
             version: SchemaVersion::V1,
             kind: RowKind::AgentConfiguration,
@@ -305,7 +335,7 @@ impl AgentConfigurationV1 {
             configured: fields.configured,
             os,
             arch,
-            agent_subject: fields.agent_subject,
+            agent_subject,
         }
     }
 }
@@ -314,8 +344,12 @@ impl AgentConfigurationV1 {
 mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
 
-    use super::super::{RowClassification, TelemetryRow, assert_contract_names, classify_row};
+    use super::super::{
+        IDENTIFIER_WINDOW_TEST_STATE, RowClassification, TelemetryRow, assert_contract_names,
+        assert_contract_names_with_labels, classify_row,
+    };
     use super::*;
+    use crate::telemetry::state::TelemetryStateV1;
 
     fn session_start_fields(session_id: Option<SessionId>) -> SessionStartFields {
         SessionStartFields {
@@ -331,6 +365,23 @@ mod tests {
 
     fn session_start_time() -> UtcSecond {
         UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 9, 14, 2).unwrap())
+    }
+
+    fn agent_configuration(agent: SupportedAgent) -> AgentConfigurationV1 {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+
+        AgentConfigurationV1::new(
+            &identity,
+            day,
+            OperatingSystem::Linux,
+            Architecture::X86_64,
+            AgentConfigurationFields {
+                agent,
+                configured: true,
+            },
+        )
     }
 
     #[test]
@@ -376,7 +427,7 @@ mod tests {
             (SupportedAgent::Goose, "goose"),
         ];
 
-        assert_contract_names(&cases);
+        assert_contract_names_with_labels(&cases, SupportedAgent::as_str);
     }
 
     #[test]
@@ -517,20 +568,14 @@ mod tests {
     }
 
     #[test]
-    fn new_agent_configuration_uses_fixed_common_fields() {
+    fn new_agent_configuration_derives_subject_from_its_agent() {
         let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
-        let agent_subject = "agt_9255770e1679cb789796a9f9e86325c5".parse().unwrap();
+        // Cross-checked with .NET's HMACSHA256 over the contract header,
+        // identifier window, and agent. The complete digest is
+        // e346647f3c83e0f8bea71a0ff04bfb6fa601f0967a92713894dcea7f793214b0.
+        let expected_subject = "agt_e346647f3c83e0f8bea71a0ff04bfb6f".parse().unwrap();
 
-        let row = AgentConfigurationV1::new(
-            day,
-            OperatingSystem::Linux,
-            Architecture::X86_64,
-            AgentConfigurationFields {
-                agent: SupportedAgent::Claude,
-                configured: true,
-                agent_subject,
-            },
-        );
+        let row = agent_configuration(SupportedAgent::Claude);
 
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::AgentConfiguration);
@@ -541,7 +586,15 @@ mod tests {
         assert!(row.configured);
         assert_eq!(row.os, OperatingSystem::Linux);
         assert_eq!(row.arch, Architecture::X86_64);
-        assert_eq!(row.agent_subject, agent_subject);
+        assert_eq!(row.agent_subject, expected_subject);
+    }
+
+    #[test]
+    fn agent_subject_changes_with_the_agent() {
+        let claude = agent_configuration(SupportedAgent::Claude);
+        let codex = agent_configuration(SupportedAgent::Codex);
+
+        assert_ne!(claude.agent_subject, codex.agent_subject);
     }
 
     #[test]
