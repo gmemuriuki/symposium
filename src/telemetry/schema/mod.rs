@@ -20,7 +20,9 @@ use serde::{
 use uuid::Uuid;
 
 use agent::{AgentConfigurationV1, SessionStartV1};
-use resolution::{ResolutionSummaryV1, package::PackageResolutionV1};
+use resolution::{
+    ResolutionSummaryV1, extension::ExtensionResolutionV1, package::PackageResolutionV1,
+};
 
 /// Random identifier for one telemetry row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,6 +78,7 @@ pub(super) enum TelemetryRow {
     AgentConfiguration(AgentConfigurationV1),
     ResolutionSummary(ResolutionSummaryV1),
     PackageResolution(PackageResolutionV1),
+    ExtensionResolution(ExtensionResolutionV1),
     StorageLimit(StorageLimitV1),
 }
 
@@ -89,6 +92,7 @@ impl Serialize for TelemetryRow {
             Self::AgentConfiguration(row) => row.serialize(serializer),
             Self::ResolutionSummary(row) => row.serialize(serializer),
             Self::PackageResolution(row) => row.serialize(serializer),
+            Self::ExtensionResolution(row) => row.serialize(serializer),
             Self::StorageLimit(row) => row.serialize(serializer),
         }
     }
@@ -399,6 +403,9 @@ pub(super) fn classify_row(line: &str) -> RowClassification {
         }
         ("package_resolution", 1) => {
             deserialize_supported_row(line, TelemetryRow::PackageResolution)
+        }
+        ("extension_resolution", 1) => {
+            deserialize_supported_row(line, TelemetryRow::ExtensionResolution)
         }
         ("storage_limit", 1) => deserialize_supported_row(line, TelemetryRow::StorageLimit),
         _ => RowClassification::UnknownSchema,
@@ -862,6 +869,75 @@ mod tests {
         };
 
         assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
+    fn extension_resolution_example_round_trips() {
+        let example = example_row("extension_resolution");
+
+        let RowClassification::Supported(row) = classify_row(example) else {
+            panic!("extension_resolution contract example was not classified as supported");
+        };
+
+        assert_eq!(serde_json::to_string(&row).unwrap(), example);
+    }
+
+    #[test]
+    fn unsupported_extension_resolution_version_is_unknown_schema() {
+        let example = example_row("extension_resolution");
+        let json = example.replacen(r#""v":1"#, r#""v":2"#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::UnknownSchema);
+    }
+
+    #[test]
+    fn extension_resolution_with_unknown_field_is_invalid() {
+        let example = example_row("extension_resolution");
+        let json = example.replacen(r#""target""#, r#""future_field":true,"target""#, 1);
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn extension_resolution_with_missing_field_is_invalid() {
+        let example = example_row("extension_resolution");
+        let mut value = serde_json::from_str::<serde_json::Value>(example).unwrap();
+        value.as_object_mut().unwrap().remove("path");
+        let json = serde_json::to_string(&value).unwrap();
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn extension_resolution_with_invalid_target_is_invalid() {
+        let example = example_row("extension_resolution");
+        let mut value = serde_json::from_str::<serde_json::Value>(example).unwrap();
+        value["target"]["name"] = serde_json::json!("private/example-debugging");
+        let json = serde_json::to_string(&value).unwrap();
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
+    }
+
+    #[test]
+    fn extension_resolution_with_over_limit_path_is_invalid() {
+        let example = example_row("extension_resolution");
+        let mut value = serde_json::from_str::<serde_json::Value>(example).unwrap();
+        value["path"] = serde_json::Value::Array(
+            std::iter::repeat_n(serde_json::json!({ "type": "not" }), 17).collect(),
+        );
+        let json = serde_json::to_string(&value).unwrap();
+
+        let classification = classify_row(&json);
+
+        assert_eq!(classification, RowClassification::Invalid);
     }
 
     #[test]

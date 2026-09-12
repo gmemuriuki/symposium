@@ -354,8 +354,8 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::super::super::{
-        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names_with_labels,
-        recorded_data_example_block,
+        IDENTIFIER_WINDOW_TEST_STATE, RowClassification, TelemetryRow,
+        assert_contract_names_with_labels, classify_row, recorded_data_example_block,
     };
     use super::*;
     use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
@@ -591,6 +591,28 @@ mod tests {
         assert_eq!(row.target, public_target());
         assert_eq!(row.path, resolution_path_with_every_node_variant());
         assert_eq!(row.extension_subject, expected_subject);
+    }
+
+    #[test]
+    fn nested_extension_resolution_round_trips_through_the_classifier() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        let row = ExtensionResolutionV1::new(
+            &identity,
+            day,
+            public_target(),
+            resolution_path_with_every_node_variant(),
+        );
+        let json = serde_json::to_string(&row).unwrap();
+
+        let RowClassification::Supported(TelemetryRow::ExtensionResolution(decoded)) =
+            classify_row(&json)
+        else {
+            panic!("nested extension_resolution row was not classified as supported");
+        };
+
+        assert_eq!(decoded, row);
     }
 
     #[test]
