@@ -104,7 +104,9 @@ pub(super) type ReturnCohortScope<'a> = IdentityScope<'a, ReturnCohortAnchor>;
 ///
 /// Each schema type implements this trait for the domain it belongs to. This
 /// keeps field selection and order beside the validated value while leaving
-/// framing under the identity module's control.
+/// framing under the identity module's control. A domain with no schema value,
+/// such as retention, keeps its empty dimension here so private state can use
+/// the production encoding without depending on a row module.
 pub(super) trait IdentityDimension {
     type Domain;
 

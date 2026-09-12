@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::{IdentityState, TelemetryStateV1};
 use crate::telemetry::{
-    identity::IdentityKey,
+    identity::{IdentifierWindowScope, IdentityKey, ReturnCohortScope},
     schema::{CohortDay, UtcDay},
 };
 
@@ -100,6 +100,56 @@ impl TelemetryStateV1 {
         })
     }
 
+    /// Bind a completed session transition to the unchanged private state.
+    ///
+    /// Storage calls this only after atomically persisting the state changed by
+    /// [`Self::observe_session`]. Both selected anchors are checked before any
+    /// identity scope is exposed, so an observation whose anchors no longer
+    /// match current state is rejected. Storage must still bind immediately
+    /// after persistence while holding the same telemetry lock; anchors do not
+    /// identify a private-state instance by themselves. When private-state
+    /// persistence is implemented, its successful write token will become an
+    /// additional required binding input so this ordering is structural.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either stored anchor differs from the anchor
+    /// selected by `observation`.
+    pub(super) fn bind_session_observation(
+        &self,
+        observation: SessionObservation,
+    ) -> Result<BoundSessionObservation<'_>, SessionObservationBindingError> {
+        let selected_identifier_window = observation.identifier_window.anchor();
+        let current_identifier_window = self.identity.identifier_window_anchor;
+        if selected_identifier_window != current_identifier_window {
+            return Err(SessionObservationBindingError::IdentifierWindowChanged {
+                selected_anchor: selected_identifier_window,
+                current_anchor: current_identifier_window,
+            });
+        }
+
+        let selected_return_cohort = observation.return_cohort.anchor();
+        let current_return_cohort = self.identity.return_cohort_anchor;
+        if current_return_cohort != Some(selected_return_cohort) {
+            return Err(SessionObservationBindingError::ReturnCohortChanged {
+                selected_anchor: selected_return_cohort,
+                current_anchor: current_return_cohort,
+            });
+        }
+
+        let identifier_window_scope = self.identifier_window_scope();
+        let return_cohort_scope = self
+            .return_cohort_scope()
+            .expect("BUG: the checked return-cohort anchor must be present");
+
+        Ok(BoundSessionObservation {
+            identifier_window: observation.identifier_window,
+            return_cohort: observation.return_cohort,
+            identifier_window_scope,
+            return_cohort_scope,
+        })
+    }
+
     /// Select the identifier window without mutating private state.
     fn select_identifier_window(
         &self,
@@ -157,11 +207,83 @@ impl TelemetryStateV1 {
 
 /// Identity and return-cohort selections for one observed session.
 #[must_use = "session identity state must be persisted before identifiers are emitted"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct SessionObservation {
     pub(super) identifier_window: IdentifierWindowUpdate,
     pub(super) return_cohort: ReturnCohortUpdate,
 }
+
+/// A persisted session transition bound to both of its identity scopes.
+#[must_use = "a bound session observation supplies the session-start identity fields"]
+pub(super) struct BoundSessionObservation<'a> {
+    identifier_window: IdentifierWindowUpdate,
+    return_cohort: ReturnCohortUpdate,
+    identifier_window_scope: IdentifierWindowScope<'a>,
+    return_cohort_scope: ReturnCohortScope<'a>,
+}
+
+impl BoundSessionObservation<'_> {
+    /// Return identity material bound to the selected identifier window.
+    #[must_use]
+    pub(super) fn identifier_window_scope(&self) -> &IdentifierWindowScope<'_> {
+        &self.identifier_window_scope
+    }
+
+    /// Return identity material bound to the selected return cohort.
+    #[must_use]
+    pub(super) fn return_cohort_scope(&self) -> &ReturnCohortScope<'_> {
+        &self.return_cohort_scope
+    }
+
+    /// Return the observed day within the selected return cohort.
+    #[must_use]
+    pub(super) fn cohort_day(&self) -> CohortDay {
+        self.return_cohort.day()
+    }
+}
+
+/// A session transition that no longer matches the current private state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionObservationBindingError {
+    IdentifierWindowChanged {
+        selected_anchor: UtcDay,
+        current_anchor: UtcDay,
+    },
+    ReturnCohortChanged {
+        selected_anchor: UtcDay,
+        current_anchor: Option<UtcDay>,
+    },
+}
+
+impl fmt::Display for SessionObservationBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentifierWindowChanged {
+                selected_anchor,
+                current_anchor,
+            } => write!(
+                formatter,
+                "session selected identifier-window anchor {selected_anchor}, but current state uses {current_anchor}"
+            ),
+            Self::ReturnCohortChanged {
+                selected_anchor,
+                current_anchor: Some(current_anchor),
+            } => write!(
+                formatter,
+                "session selected return-cohort anchor {selected_anchor}, but current state uses {current_anchor}"
+            ),
+            Self::ReturnCohortChanged {
+                selected_anchor,
+                current_anchor: None,
+            } => write!(
+                formatter,
+                "session selected return-cohort anchor {selected_anchor}, but current state has no return cohort"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionObservationBindingError {}
 
 /// Whether selecting an identifier window changed private state.
 #[must_use = "an advanced identifier window must be persisted before use"]
@@ -255,6 +377,9 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
+    use crate::telemetry::identity::{
+        DimensionWriter, IdentityDimension, RetentionDimension, SessionDomain,
+    };
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const GENERATED_KEY_BYTE: u8 = 0x42;
@@ -263,6 +388,16 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct TestKeySourceError;
+
+    struct TestSessionDimension;
+
+    impl IdentityDimension for TestSessionDimension {
+        type Domain = SessionDomain;
+
+        fn write(&self, writer: &mut DimensionWriter<'_>) {
+            writer.field(b"test-session");
+        }
+    }
 
     fn day(year: i32, month: u32, day: u32) -> UtcDay {
         UtcDay::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
@@ -397,6 +532,101 @@ mod tests {
         );
         assert_eq!(state.identity.identifier_window_anchor, observed_day);
         assert_eq!(state.identity.return_cohort_anchor, Some(observed_day));
+    }
+
+    #[test]
+    fn observed_session_binds_both_scopes_to_the_selected_anchors() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let old_session = state
+            .identifier_window_scope()
+            .derive(&TestSessionDimension);
+        let old_retention = state
+            .return_cohort_scope()
+            .expect("fixture has an observed-session cohort")
+            .derive(&RetentionDimension);
+
+        let observation = state.observe_session(day(2026, 10, 25)).unwrap();
+        let observation = state.bind_session_observation(observation).unwrap();
+        let new_session = observation
+            .identifier_window_scope()
+            .derive(&TestSessionDimension);
+        let new_retention = observation
+            .return_cohort_scope()
+            .derive(&RetentionDimension);
+
+        assert_ne!(new_session, old_session);
+        assert_ne!(new_retention, old_retention);
+        assert_eq!(observation.cohort_day(), CohortDay::D0);
+        assert!(matches!(
+            observation.identifier_window,
+            IdentifierWindowUpdate::Advanced { .. }
+        ));
+        assert!(matches!(
+            observation.return_cohort,
+            ReturnCohortUpdate::Started { .. }
+        ));
+    }
+
+    #[test]
+    fn binding_rejects_an_observation_from_an_older_identifier_window() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let older_observation = state.observe_session(day(2026, 9, 11)).unwrap();
+        let current_day = day(2026, 10, 25);
+        let _current_observation = state.observe_session(current_day).unwrap();
+
+        let result = state.bind_session_observation(older_observation);
+
+        assert!(matches!(
+            result,
+            Err(SessionObservationBindingError::IdentifierWindowChanged {
+                selected_anchor,
+                current_anchor,
+            }) if selected_anchor == day(2026, 9, 10) && current_anchor == current_day
+        ));
+    }
+
+    #[test]
+    fn binding_rejects_an_observation_from_an_older_return_cohort() {
+        let source = state_with_anchors(KEY, "2026-09-01", "2026-08-11");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let older_observation = state.observe_session(day(2026, 9, 10)).unwrap();
+        let current_cohort = day(2026, 9, 11);
+        let _current_observation = state.observe_session(current_cohort).unwrap();
+
+        let result = state.bind_session_observation(older_observation);
+
+        assert!(matches!(
+            result,
+            Err(SessionObservationBindingError::ReturnCohortChanged {
+                selected_anchor,
+                current_anchor: Some(current_anchor),
+            }) if selected_anchor == day(2026, 8, 11) && current_anchor == current_cohort
+        ));
+    }
+
+    #[test]
+    fn binding_rejects_an_observation_after_identifier_reset() {
+        let source = state_with_anchors(KEY, "2026-09-10", "2026-09-10");
+        let mut state: TelemetryStateV1 = toml::from_str(&source).unwrap();
+        let observation = state.observe_session(day(2026, 9, 11)).unwrap();
+        state
+            .reset_identifiers_with::<Infallible>(day(2026, 9, 10), |bytes| {
+                bytes.fill(GENERATED_KEY_BYTE);
+                Ok(())
+            })
+            .unwrap();
+
+        let result = state.bind_session_observation(observation);
+
+        assert!(matches!(
+            result,
+            Err(SessionObservationBindingError::ReturnCohortChanged {
+                selected_anchor,
+                current_anchor: None,
+            }) if selected_anchor == day(2026, 9, 10)
+        ));
     }
 
     #[test]
