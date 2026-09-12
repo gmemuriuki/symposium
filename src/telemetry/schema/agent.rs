@@ -12,7 +12,7 @@ use crate::{
     agents::Agent,
     telemetry::identity::{
         AgentDomain, AgentSubject, DimensionWriter, IdentifierWindowScope, IdentityDimension,
-        RetentionSubject, SessionId,
+        RetentionSubject, SessionDomain, SessionId,
     },
 };
 
@@ -83,6 +83,20 @@ pub(in crate::telemetry) enum HookAgent {
     Kiro,
 }
 
+impl HookAgent {
+    /// Return the frozen version 1 wire label.
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
+            Self::Kiro => "kiro",
+        }
+    }
+}
+
 impl From<HookAgent> for SupportedAgent {
     fn from(agent: HookAgent) -> Self {
         match agent {
@@ -92,6 +106,53 @@ impl From<HookAgent> for SupportedAgent {
             HookAgent::Gemini => Self::Gemini,
             HookAgent::Kiro => Self::Kiro,
         }
+    }
+}
+
+/// A raw vendor session identifier supplied by an agent.
+///
+/// This value is used only as an identity-derivation input. It deliberately
+/// implements neither formatting nor serialization traits so telemetry cannot
+/// accidentally write it to a row or diagnostic.
+pub(in crate::telemetry) struct VendorSessionId(String);
+
+impl VendorSessionId {
+    /// Wrap a vendor session identifier without changing its UTF-8 bytes.
+    #[must_use]
+    pub(in crate::telemetry) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the exact UTF-8 bytes supplied by the agent.
+    #[must_use]
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// Canonical version 1 inputs for a scoped session identifier.
+struct SessionDimension<'a> {
+    agent: HookAgent,
+    vendor_session_id: &'a VendorSessionId,
+}
+
+impl<'a> SessionDimension<'a> {
+    #[must_use]
+    const fn new(agent: HookAgent, vendor_session_id: &'a VendorSessionId) -> Self {
+        Self {
+            agent,
+            vendor_session_id,
+        }
+    }
+}
+
+impl IdentityDimension for SessionDimension<'_> {
+    type Domain = SessionDomain;
+
+    /// Write the version 1 `session_id` fields in contract order.
+    fn write(&self, writer: &mut DimensionWriter<'_>) {
+        writer.field(self.agent.as_str().as_bytes());
+        writer.field(self.vendor_session_id.as_bytes());
     }
 }
 
@@ -349,7 +410,7 @@ mod tests {
         assert_contract_names_with_labels, classify_row,
     };
     use super::*;
-    use crate::telemetry::state::TelemetryStateV1;
+    use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
 
     fn session_start_fields(session_id: Option<SessionId>) -> SessionStartFields {
         SessionStartFields {
@@ -394,7 +455,60 @@ mod tests {
             (HookAgent::Kiro, "kiro"),
         ];
 
-        assert_contract_names(&cases);
+        assert_contract_names_with_labels(&cases, HookAgent::as_str);
+    }
+
+    #[test]
+    fn session_dimension_uses_agent_then_vendor_session_id() {
+        let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
+        let dimension = SessionDimension::new(HookAgent::Claude, &vendor_session_id);
+        let expected = [
+            [0, 0, 0, 0, 0, 0, 0, 6].as_slice(),
+            b"claude".as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 18].as_slice(),
+            b"vendor-session-123".as_slice(),
+        ]
+        .concat();
+
+        let encoded = encode_dimension_for_test(&dimension);
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn session_subject_derivation_matches_independent_vector() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
+        let dimension = SessionDimension::new(HookAgent::Claude, &vendor_session_id);
+
+        let subject = identity.derive(&dimension);
+
+        // Cross-checked with .NET's HMACSHA256 over the contract header,
+        // identifier window, agent, and vendor session id. The complete
+        // digest is
+        // 2f77ea40740f4be8e85ba05e7924e1ad054037d26629db2ef7dc7097dddf723a.
+        assert_eq!(
+            subject,
+            "sess_2f77ea40740f4be8e85ba05e7924e1ad".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn session_subject_changes_with_the_agent_or_vendor_session_id() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let first_vendor_id = VendorSessionId::new("vendor-session-123".to_owned());
+        let second_vendor_id = VendorSessionId::new("vendor-session-456".to_owned());
+
+        let first = identity.derive(&SessionDimension::new(HookAgent::Claude, &first_vendor_id));
+        let other_agent =
+            identity.derive(&SessionDimension::new(HookAgent::Codex, &first_vendor_id));
+        let other_vendor_id =
+            identity.derive(&SessionDimension::new(HookAgent::Claude, &second_vendor_id));
+
+        assert_ne!(first, other_agent);
+        assert_ne!(first, other_vendor_id);
     }
 
     #[test]

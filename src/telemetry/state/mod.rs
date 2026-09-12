@@ -134,23 +134,12 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::{IdentityKey, TelemetryStateV1};
-    use crate::telemetry::{
-        identity::{DimensionWriter, IdentityDimension, RetentionDomain},
-        schema::UtcDay,
-    };
+    use crate::telemetry::{identity::RetentionDimension, schema::UtcDay};
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const GENERATED_KEY_BYTE: u8 = 0x42;
     /// Lowercase hexadecimal encoding of 32 [`GENERATED_KEY_BYTE`] bytes.
     const GENERATED_KEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
-
-    struct RetentionDimension;
-
-    impl IdentityDimension for RetentionDimension {
-        type Domain = RetentionDomain;
-
-        fn write(&self, _writer: &mut DimensionWriter<'_>) {}
-    }
 
     fn day(year: i32, month: u32, day: u32) -> UtcDay {
         UtcDay::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
