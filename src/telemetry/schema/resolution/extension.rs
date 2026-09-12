@@ -5,8 +5,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    super::extension::{
-        ExtensionKind, PublicExtensionCoordinate, PublicExtensionName, PublicExtensionSource,
+    super::{
+        EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, deserialize_version_one,
+        extension::{
+            ExtensionKind, PublicExtensionCoordinate, PublicExtensionName, PublicExtensionSource,
+        },
     },
     package::PublicPackageCoordinate,
 };
@@ -121,7 +124,7 @@ impl ResolutionPathNode {
 /// Complete evidence path for one successful extension resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<ResolutionPathNode>")]
-struct ResolutionPath(Vec<ResolutionPathNode>);
+pub(in crate::telemetry) struct ResolutionPath(Vec<ResolutionPathNode>);
 
 impl ResolutionPath {
     /// Derive the subject for this path and its resolved public target.
@@ -136,6 +139,45 @@ impl ResolutionPath {
 
     fn write_identity(&self, writer: &mut DimensionWriter<'_>) {
         writer.sequence(&self.0, |writer, node| node.write_identity(writer));
+    }
+}
+
+/// Version 1 record of one public extension and a safe path that selected it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::telemetry) struct ExtensionResolutionV1 {
+    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
+    version: SchemaVersion,
+    kind: RowKind,
+    event_id: EventId,
+    day: UtcDay,
+    symposium: SymposiumVersion,
+    target: PublicExtensionCoordinate,
+    path: ResolutionPath,
+    extension_subject: ExtensionSubject,
+}
+
+impl ExtensionResolutionV1 {
+    /// Create a record for one public extension and its safe resolution path.
+    #[must_use]
+    pub(in crate::telemetry) fn new(
+        identity: &IdentifierWindowScope<'_>,
+        day: UtcDay,
+        target: PublicExtensionCoordinate,
+        path: ResolutionPath,
+    ) -> Self {
+        let extension_subject = path.derive_subject(identity, &target);
+
+        Self {
+            version: SchemaVersion::V1,
+            kind: RowKind::ExtensionResolution,
+            event_id: EventId::new(),
+            day,
+            symposium: SymposiumVersion::current(),
+            target,
+            path,
+            extension_subject,
+        }
     }
 }
 
@@ -309,6 +351,8 @@ impl OpaqueResolutionReason {
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::super::super::{
         IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names_with_labels,
         recorded_data_example_block,
@@ -526,6 +570,27 @@ mod tests {
         let subject = path.derive_subject(&identity, &target);
 
         assert_eq!(subject, expected_subject);
+    }
+
+    #[test]
+    fn new_extension_resolution_derives_subject_from_its_target_and_path() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        let target = public_target();
+        let path = resolution_path_with_every_node_variant();
+        let expected_subject = "ext_63872efd4737ec84179b4e8b0662c121".parse().unwrap();
+
+        let row = ExtensionResolutionV1::new(&identity, day, target, path);
+
+        assert_eq!(row.version, SchemaVersion::V1);
+        assert_eq!(row.kind, RowKind::ExtensionResolution);
+        assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
+        assert_eq!(row.day, day);
+        assert_eq!(row.symposium, SymposiumVersion::current());
+        assert_eq!(row.target, public_target());
+        assert_eq!(row.path, resolution_path_with_every_node_variant());
+        assert_eq!(row.extension_subject, expected_subject);
     }
 
     #[test]
