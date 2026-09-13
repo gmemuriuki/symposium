@@ -8,8 +8,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DroppedOperation, EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay,
-    deserialize_version_one,
+    DroppedOperation, EventId, RowKind, SchemaVersion, SymposiumVersion,
+    macros::strict_versioned_row,
 };
 use crate::telemetry::{identity::SessionId, state::BoundRecordingObservation};
 
@@ -131,29 +131,29 @@ pub(in crate::telemetry) struct ResolutionSummaryFields {
     pub(in crate::telemetry) session_id: Option<SessionId>,
 }
 
-/// Version 1 summary of one completed full resolution and sync.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawResolutionSummaryV1")]
-pub(in crate::telemetry) struct ResolutionSummaryV1 {
-    #[serde(rename = "v")]
-    version: SchemaVersion,
-    kind: RowKind,
-    event_id: EventId,
-    day: UtcDay,
-    symposium: SymposiumVersion,
-    trigger: ResolutionTrigger,
-    outcome: ResolutionOutcome,
-    duration_ms: u64,
-    public_packages: u64,
-    unnamed_packages: u64,
-    unnamed_package_reasons: UnnamedPackageReasons,
-    plugins: u64,
-    skills: u64,
-    installed: u64,
-    updated: u64,
-    reaped: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<SessionId>,
+strict_versioned_row! {
+    /// Version 1 summary of one completed full resolution and sync.
+    pub(in crate::telemetry) struct ResolutionSummaryV1 {
+        symposium: SymposiumVersion,
+        trigger: ResolutionTrigger,
+        outcome: ResolutionOutcome,
+        duration_ms: u64,
+        public_packages: u64,
+        unnamed_packages: u64,
+        unnamed_package_reasons: UnnamedPackageReasons,
+        plugins: u64,
+        skills: u64,
+        installed: u64,
+        updated: u64,
+        reaped: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    }
+
+    kind: RowKind::ResolutionSummary,
+    raw: RawResolutionSummaryV1,
+    error: ResolutionSummaryError,
+    validate: validate_resolution_summary,
 }
 
 impl ResolutionSummaryV1 {
@@ -174,7 +174,7 @@ impl ResolutionSummaryV1 {
 
         Ok(Self {
             version: SchemaVersion::V1,
-            kind: RowKind::ResolutionSummary,
+            kind: Self::KIND,
             event_id: EventId::new(),
             day: observation.day(),
             symposium: SymposiumVersion::current(),
@@ -217,69 +217,20 @@ impl fmt::Display for ResolutionSummaryError {
 
 impl std::error::Error for ResolutionSummaryError {}
 
-/// Strict wire representation validated before becoming a resolution summary.
-///
-/// Serde's `try_from` deserializes this type rather than the outer row, so its
-/// version and unknown-field checks are deliberately declared here.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawResolutionSummaryV1 {
-    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
-    version: SchemaVersion,
-    kind: RowKind,
-    event_id: EventId,
-    day: UtcDay,
-    symposium: SymposiumVersion,
-    trigger: ResolutionTrigger,
-    outcome: ResolutionOutcome,
-    duration_ms: u64,
-    public_packages: u64,
-    unnamed_packages: u64,
-    unnamed_package_reasons: UnnamedPackageReasons,
-    plugins: u64,
-    skills: u64,
-    installed: u64,
-    updated: u64,
-    reaped: u64,
-    session_id: Option<SessionId>,
-}
+fn validate_resolution_summary(raw: &RawResolutionSummaryV1) -> Result<(), ResolutionSummaryError> {
+    let derived = raw
+        .unnamed_package_reasons
+        .checked_total()
+        .ok_or(ResolutionSummaryError::UnnamedPackageCountOverflow)?;
 
-impl TryFrom<RawResolutionSummaryV1> for ResolutionSummaryV1 {
-    type Error = ResolutionSummaryError;
-
-    fn try_from(raw: RawResolutionSummaryV1) -> Result<Self, Self::Error> {
-        let derived = raw
-            .unnamed_package_reasons
-            .checked_total()
-            .ok_or(ResolutionSummaryError::UnnamedPackageCountOverflow)?;
-
-        if raw.unnamed_packages != derived {
-            return Err(ResolutionSummaryError::UnnamedPackageCountMismatch {
-                stored: raw.unnamed_packages,
-                derived,
-            });
-        }
-
-        Ok(Self {
-            version: raw.version,
-            kind: raw.kind,
-            event_id: raw.event_id,
-            day: raw.day,
-            symposium: raw.symposium,
-            trigger: raw.trigger,
-            outcome: raw.outcome,
-            duration_ms: raw.duration_ms,
-            public_packages: raw.public_packages,
-            unnamed_packages: raw.unnamed_packages,
-            unnamed_package_reasons: raw.unnamed_package_reasons,
-            plugins: raw.plugins,
-            skills: raw.skills,
-            installed: raw.installed,
-            updated: raw.updated,
-            reaped: raw.reaped,
-            session_id: raw.session_id,
-        })
+    if raw.unnamed_packages != derived {
+        return Err(ResolutionSummaryError::UnnamedPackageCountMismatch {
+            stored: raw.unnamed_packages,
+            derived,
+        });
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -287,7 +238,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::super::{
-        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names, recording_observation,
+        IDENTIFIER_WINDOW_TEST_STATE, UtcDay, assert_contract_names, recording_observation,
     };
     use super::*;
     use crate::telemetry::state::TelemetryStateV1;

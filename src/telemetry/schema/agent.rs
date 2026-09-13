@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CohortDay, EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay, UtcSecond,
-    deserialize_version_one,
+    deserialize_version_one, macros::strict_versioned_row,
 };
 use crate::{
     agents::Agent,
@@ -272,25 +272,25 @@ pub(in crate::telemetry) struct SessionStartFields<'a> {
     pub(in crate::telemetry) vendor_session_id: Option<&'a VendorSessionId>,
 }
 
-/// Version 1 record of a completed registered session-start hook.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawSessionStartV1")]
-pub(in crate::telemetry) struct SessionStartV1 {
-    #[serde(rename = "v")]
-    version: SchemaVersion,
-    kind: RowKind,
-    event_id: EventId,
-    day: UtcDay,
-    at: UtcSecond,
-    symposium: SymposiumVersion,
-    agent: HookAgent,
-    os: OperatingSystem,
-    arch: Architecture,
-    start: SessionStartKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<SessionId>,
-    retention_subject: RetentionSubject,
-    cohort_day: CohortDay,
+strict_versioned_row! {
+    /// Version 1 record of a completed registered session-start hook.
+    pub(in crate::telemetry) struct SessionStartV1 {
+        at: UtcSecond,
+        symposium: SymposiumVersion,
+        agent: HookAgent,
+        os: OperatingSystem,
+        arch: Architecture,
+        start: SessionStartKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        retention_subject: RetentionSubject,
+        cohort_day: CohortDay,
+    }
+
+    kind: RowKind::SessionStart,
+    raw: RawSessionStartV1,
+    error: SessionStartError,
+    validate: validate_session_start,
 }
 
 impl SessionStartV1 {
@@ -315,7 +315,7 @@ impl SessionStartV1 {
 
         Self {
             version: SchemaVersion::V1,
-            kind: RowKind::SessionStart,
+            kind: Self::KIND,
             event_id: EventId::new(),
             day: at.day(),
             at,
@@ -350,57 +350,16 @@ impl fmt::Display for SessionStartError {
 
 impl std::error::Error for SessionStartError {}
 
-/// Strict wire representation validated before becoming a session-start row.
-///
-/// Serde's `try_from` deserializes this type rather than the outer row, so its
-/// version and unknown-field checks are deliberately declared here.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSessionStartV1 {
-    #[serde(rename = "v", deserialize_with = "deserialize_version_one")]
-    version: SchemaVersion,
-    kind: RowKind,
-    event_id: EventId,
-    day: UtcDay,
-    at: UtcSecond,
-    symposium: SymposiumVersion,
-    agent: HookAgent,
-    os: OperatingSystem,
-    arch: Architecture,
-    start: SessionStartKind,
-    session_id: Option<SessionId>,
-    retention_subject: RetentionSubject,
-    cohort_day: CohortDay,
-}
-
-impl TryFrom<RawSessionStartV1> for SessionStartV1 {
-    type Error = SessionStartError;
-
-    fn try_from(raw: RawSessionStartV1) -> Result<Self, Self::Error> {
-        let timestamp_day = raw.at.day();
-        if raw.day != timestamp_day {
-            return Err(SessionStartError::DayDoesNotMatchTimestamp {
-                stored: raw.day,
-                timestamp: timestamp_day,
-            });
-        }
-
-        Ok(Self {
-            version: raw.version,
-            kind: raw.kind,
-            event_id: raw.event_id,
-            day: raw.day,
-            at: raw.at,
-            symposium: raw.symposium,
-            agent: raw.agent,
-            os: raw.os,
-            arch: raw.arch,
-            start: raw.start,
-            session_id: raw.session_id,
-            retention_subject: raw.retention_subject,
-            cohort_day: raw.cohort_day,
-        })
+fn validate_session_start(raw: &RawSessionStartV1) -> Result<(), SessionStartError> {
+    let timestamp_day = raw.at.day();
+    if raw.day != timestamp_day {
+        return Err(SessionStartError::DayDoesNotMatchTimestamp {
+            stored: raw.day,
+            timestamp: timestamp_day,
+        });
     }
+
+    Ok(())
 }
 
 /// Fields that vary for each entry in a daily agent configuration snapshot.

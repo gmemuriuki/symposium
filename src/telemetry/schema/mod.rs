@@ -7,6 +7,7 @@
 mod agent;
 mod command;
 mod extension;
+mod macros;
 mod name;
 mod resolution;
 
