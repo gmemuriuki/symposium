@@ -368,6 +368,12 @@ impl BoundSessionObservation<'_> {
         self.recording.completed_at()
     }
 
+    /// Return the recording context shared by every row from this session-start
+    /// operation.
+    pub(in crate::telemetry) fn recording(&self) -> &BoundRecordingObservation<'_> {
+        &self.recording
+    }
+
     /// Return identity material bound to the selected identifier window.
     #[must_use]
     pub(in crate::telemetry) fn identifier_window_scope(&self) -> &IdentifierWindowScope<'_> {
