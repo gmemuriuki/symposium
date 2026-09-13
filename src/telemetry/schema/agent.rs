@@ -10,9 +10,12 @@ use super::{
 };
 use crate::{
     agents::Agent,
-    telemetry::identity::{
-        AgentDomain, AgentSubject, DimensionWriter, IdentifierWindowScope, IdentityDimension,
-        RetentionSubject, SessionDomain, SessionId,
+    telemetry::{
+        identity::{
+            AgentDomain, AgentSubject, DimensionWriter, IdentifierWindowScope, IdentityDimension,
+            RetentionDimension, RetentionSubject, SessionDomain, SessionId,
+        },
+        state::BoundSessionObservation,
     },
 };
 
@@ -256,19 +259,16 @@ pub(in crate::telemetry) enum SessionStartKind {
     Unknown,
 }
 
-/// Agent-supplied and derived fields for one completed session-start hook.
+/// Non-derived inputs for one completed session-start hook.
 ///
-/// These fields are repeated on [`SessionStartV1`] because flattening this
-/// struct into the row would weaken strict unknown-field rejection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) struct SessionStartFields {
+/// The raw vendor identifier is used only during subject derivation and cannot
+/// be formatted or serialized as part of this input bundle.
+pub(in crate::telemetry) struct SessionStartFields<'a> {
     pub(in crate::telemetry) agent: HookAgent,
     pub(in crate::telemetry) os: OperatingSystem,
     pub(in crate::telemetry) arch: Architecture,
     pub(in crate::telemetry) start: SessionStartKind,
-    pub(in crate::telemetry) session_id: Option<SessionId>,
-    pub(in crate::telemetry) retention_subject: RetentionSubject,
-    pub(in crate::telemetry) cohort_day: CohortDay,
+    pub(in crate::telemetry) vendor_session_id: Option<&'a VendorSessionId>,
 }
 
 /// Version 1 record of a completed registered session-start hook.
@@ -294,8 +294,24 @@ pub(in crate::telemetry) struct SessionStartV1 {
 
 impl SessionStartV1 {
     /// Create a record for a completed registered session-start hook.
+    ///
+    /// Both scoped identifiers and the cohort day come from the same bound
+    /// state transition as its captured completion timestamp.
     #[must_use]
-    pub(in crate::telemetry) fn new(at: UtcSecond, fields: SessionStartFields) -> Self {
+    pub(in crate::telemetry) fn new(
+        fields: SessionStartFields<'_>,
+        observation: &BoundSessionObservation<'_>,
+    ) -> Self {
+        let at = observation.completed_at();
+        let session = AgentSessionIdentity::new(
+            observation.identifier_window_scope(),
+            fields.agent,
+            fields.vendor_session_id,
+        );
+        let retention_subject = observation
+            .return_cohort_scope()
+            .derive(&RetentionDimension);
+
         Self {
             version: SchemaVersion::V1,
             kind: RowKind::SessionStart,
@@ -303,13 +319,13 @@ impl SessionStartV1 {
             day: at.day(),
             at,
             symposium: SymposiumVersion::current(),
-            agent: fields.agent,
+            agent: session.agent(),
             os: fields.os,
             arch: fields.arch,
             start: fields.start,
-            session_id: fields.session_id,
-            retention_subject: fields.retention_subject,
-            cohort_day: fields.cohort_day,
+            session_id: session.session_id(),
+            retention_subject,
+            cohort_day: observation.cohort_day(),
         }
     }
 }
@@ -451,20 +467,29 @@ mod tests {
     use super::*;
     use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
 
-    fn session_start_fields(session_id: Option<SessionId>) -> SessionStartFields {
+    fn session_start_fields(vendor_session_id: Option<&VendorSessionId>) -> SessionStartFields<'_> {
         SessionStartFields {
             agent: HookAgent::Claude,
             os: OperatingSystem::Linux,
             arch: Architecture::X86_64,
             start: SessionStartKind::Fresh,
-            session_id,
-            retention_subject: "ret_74ddf26f80ad8b58de7f03e6c632e654".parse().unwrap(),
-            cohort_day: CohortDay::D0,
+            vendor_session_id,
         }
     }
 
     fn session_start_time() -> UtcSecond {
         UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 9, 14, 2).unwrap())
+    }
+
+    fn session_start(
+        completed_at: UtcSecond,
+        vendor_session_id: Option<&VendorSessionId>,
+    ) -> SessionStartV1 {
+        let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let observation = state.observe_session(completed_at).unwrap();
+        let observation = state.bind_session_observation(observation).unwrap();
+
+        SessionStartV1::new(session_start_fields(vendor_session_id), &observation)
     }
 
     fn agent_configuration(agent: SupportedAgent) -> AgentConfigurationV1 {
@@ -709,12 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn new_session_start_uses_fixed_common_fields_and_timestamp_day() {
+    fn new_session_start_derives_identity_and_cohort_from_bound_observation() {
         let at = session_start_time();
-        let session_id = "sess_31d8b1916028f65a0c0521dc1f4c86fb".parse().unwrap();
-        let fields = session_start_fields(Some(session_id));
+        let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
+        // These are the independently cross-checked session and retention
+        // vectors pinned by the focused identity tests above and in
+        // `identity.rs`.
+        let expected_session = "sess_2f77ea40740f4be8e85ba05e7924e1ad".parse().unwrap();
+        let expected_retention = "ret_270adecd2120c543261f04bd771df491".parse().unwrap();
 
-        let row = SessionStartV1::new(at, fields);
+        let row = session_start(at, Some(&vendor_session_id));
 
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::SessionStart);
@@ -722,13 +751,13 @@ mod tests {
         assert_eq!(row.day, at.day());
         assert_eq!(row.at, at);
         assert_eq!(row.symposium, SymposiumVersion::current());
-        assert_eq!(row.agent, fields.agent);
-        assert_eq!(row.os, fields.os);
-        assert_eq!(row.arch, fields.arch);
-        assert_eq!(row.start, fields.start);
-        assert_eq!(row.session_id, fields.session_id);
-        assert_eq!(row.retention_subject, fields.retention_subject);
-        assert_eq!(row.cohort_day, fields.cohort_day);
+        assert_eq!(row.agent, HookAgent::Claude);
+        assert_eq!(row.os, OperatingSystem::Linux);
+        assert_eq!(row.arch, Architecture::X86_64);
+        assert_eq!(row.start, SessionStartKind::Fresh);
+        assert_eq!(row.session_id, Some(expected_session));
+        assert_eq!(row.retention_subject, expected_retention);
+        assert_eq!(row.cohort_day, CohortDay::D0);
     }
 
     #[test]
@@ -763,7 +792,7 @@ mod tests {
 
     #[test]
     fn session_start_without_session_id_classifies_and_round_trips() {
-        let row = SessionStartV1::new(session_start_time(), session_start_fields(None));
+        let row = session_start(session_start_time(), None);
 
         let json = serde_json::to_string(&row).unwrap();
         let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
@@ -779,7 +808,7 @@ mod tests {
 
     #[test]
     fn session_start_rejects_a_day_that_disagrees_with_its_timestamp() {
-        let row = SessionStartV1::new(session_start_time(), session_start_fields(None));
+        let row = session_start(session_start_time(), None);
         let mut value = serde_json::to_value(row).unwrap();
         value["day"] = serde_json::Value::String("2026-08-04".to_owned());
 

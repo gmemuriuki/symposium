@@ -16,6 +16,8 @@ use super::{
 
 mod lifecycle;
 
+pub(in crate::telemetry) use lifecycle::BoundSessionObservation;
+
 /// The initial schema version of `telemetry-state.toml`.
 ///
 /// Exact rather than permissive, unlike a row's `SchemaVersion`: a row written by
