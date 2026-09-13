@@ -761,6 +761,27 @@ mod tests {
     }
 
     #[test]
+    fn session_start_before_utc_midnight_keeps_row_and_cohort_on_the_same_day() {
+        let completed_at =
+            UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 23, 59, 59).unwrap());
+        let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let observation = state.observe_session(completed_at).unwrap();
+        let observation = state.bind_session_observation(observation).unwrap();
+
+        let row = SessionStartV1::new(session_start_fields(None), &observation);
+        let stored_state = toml::to_string(&state).unwrap();
+        let stored_state = toml::from_str::<toml::Value>(&stored_state).unwrap();
+        let cohort_anchor = stored_state["identity"]["return-cohort-anchor"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(row.at, completed_at);
+        assert_eq!(row.day, completed_at.day());
+        assert_eq!(cohort_anchor, row.day.to_string());
+        assert_eq!(row.cohort_day, CohortDay::D0);
+    }
+
+    #[test]
     fn new_agent_configuration_derives_subject_from_its_agent() {
         let day = UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
         // Cross-checked with .NET's HMACSHA256 over the contract header,
