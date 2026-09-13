@@ -8,7 +8,10 @@ use super::{
     extension::{PublicExtensionName, PublicExtensionNameError, PublicExtensionSource},
     name::{InitialByteRule, validated_string_newtype},
 };
-use crate::cli::{Commands, PluginCommand};
+use crate::{
+    cli::{Commands, PluginCommand},
+    telemetry::identity::{CommandDomain, DimensionWriter, IdentityDimension},
+};
 
 const MAX_PUBLIC_COMMAND_NAME_BYTES: usize = 64;
 
@@ -199,21 +202,53 @@ impl CommandCoordinate {
     }
 }
 
+impl IdentityDimension for CommandCoordinate {
+    type Domain = CommandDomain;
+
+    /// Write the version 1 `command_subject` fields in contract order.
+    fn write(&self, writer: &mut DimensionWriter<'_>) {
+        match self {
+            Self::Builtin { name } => writer.variant("builtin", |writer| {
+                writer.field(name.as_str().as_bytes());
+            }),
+            Self::Plugin(coordinate) => writer.variant("plugin", |writer| {
+                writer.field(coordinate.source.as_str().as_bytes());
+                writer.field(coordinate.plugin.as_str().as_bytes());
+                writer.field(coordinate.name.as_str().as_bytes());
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
     use super::super::{
-        assert_contract_names, assert_contract_names_with_labels, recorded_data_example_block_at,
+        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names, assert_contract_names_with_labels,
+        recorded_data_example_block_at,
     };
     use super::*;
-    use crate::cli::Cli;
+    use crate::{
+        cli::Cli,
+        telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1},
+    };
 
     fn parse_command(arguments: &[&str]) -> Commands {
         Cli::try_parse_from(std::iter::once("cargo-agents").chain(arguments.iter().copied()))
             .unwrap()
             .command
             .unwrap()
+    }
+
+    fn plugin_command(
+        source: PublicExtensionSource,
+        plugin: &str,
+        name: &str,
+    ) -> CommandCoordinate {
+        CommandCoordinate::plugin(
+            PublicPluginCommandCoordinate::try_new(source, plugin, name).unwrap(),
+        )
     }
 
     #[test]
@@ -340,13 +375,11 @@ mod tests {
 
     #[test]
     fn plugin_command_coordinate_round_trips_in_contract_shape() {
-        let coordinate = PublicPluginCommandCoordinate::try_new(
+        let command = plugin_command(
             PublicExtensionSource::SymposiumRecommendations,
             "example-tools",
             "example-check",
-        )
-        .unwrap();
-        let command = CommandCoordinate::plugin(coordinate);
+        );
 
         let json = serde_json::to_string(&command).unwrap();
         let decoded = serde_json::from_str::<CommandCoordinate>(&json).unwrap();
@@ -370,6 +403,106 @@ mod tests {
             recorded_data_example_block_at("### `command`", "```json", 0).trim()
         );
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn builtin_command_subject_dimension_uses_type_then_name() {
+        let command = CommandCoordinate::builtin(BuiltinCommand::Use);
+        let expected = [
+            [0, 0, 0, 0, 0, 0, 0, 7].as_slice(),
+            b"builtin".as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 3].as_slice(),
+            b"use".as_slice(),
+        ]
+        .concat();
+
+        let encoded = encode_dimension_for_test(&command);
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn plugin_command_subject_dimension_uses_contract_field_order() {
+        let command = plugin_command(
+            PublicExtensionSource::SymposiumRecommendations,
+            "example-tools",
+            "example-check",
+        );
+        let expected = [
+            [0, 0, 0, 0, 0, 0, 0, 6].as_slice(),
+            b"plugin".as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 25].as_slice(),
+            b"symposium-recommendations".as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 13].as_slice(),
+            b"example-tools".as_slice(),
+            [0, 0, 0, 0, 0, 0, 0, 13].as_slice(),
+            b"example-check".as_slice(),
+        ]
+        .concat();
+
+        let encoded = encode_dimension_for_test(&command);
+
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn command_subject_derivation_matches_independent_vector() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let command = plugin_command(
+            PublicExtensionSource::SymposiumRecommendations,
+            "example-tools",
+            "example-check",
+        );
+
+        let subject = identity.derive(&command);
+
+        // Cross-checked with .NET's HMACSHA256 over the contract header,
+        // identifier window, command type, source, plugin name, and command
+        // name. The complete digest is
+        // c50f828e42f9eb719589039d90da38fa69c82f644689a19ce34562513a236c41.
+        assert_eq!(
+            subject,
+            "cmd_c50f828e42f9eb719589039d90da38fa".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn command_subject_changes_with_the_typed_coordinate() {
+        let state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let identity = state.identifier_window_scope();
+        let baseline = plugin_command(
+            PublicExtensionSource::SymposiumRecommendations,
+            "example-tools",
+            "example-check",
+        );
+        let changed_coordinates = [
+            CommandCoordinate::builtin(BuiltinCommand::Use),
+            plugin_command(
+                PublicExtensionSource::CratesIo,
+                "example-tools",
+                "example-check",
+            ),
+            plugin_command(
+                PublicExtensionSource::SymposiumRecommendations,
+                "other-tools",
+                "example-check",
+            ),
+            plugin_command(
+                PublicExtensionSource::SymposiumRecommendations,
+                "example-tools",
+                "other-check",
+            ),
+        ];
+
+        let baseline_subject = identity.derive(&baseline);
+        let use_subject = identity.derive(&CommandCoordinate::builtin(BuiltinCommand::Use));
+        let remove_subject = identity.derive(&CommandCoordinate::builtin(BuiltinCommand::Remove));
+
+        for coordinate in &changed_coordinates {
+            assert_ne!(identity.derive(coordinate), baseline_subject);
+        }
+        assert_ne!(use_subject, remove_subject);
     }
 
     #[test]
