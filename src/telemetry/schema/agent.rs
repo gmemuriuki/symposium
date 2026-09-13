@@ -166,7 +166,7 @@ impl IdentityDimension for SessionDimension<'_> {
 /// that do not supply a vendor session identifier remain explicitly
 /// unidentified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) struct AgentSessionIdentity {
+struct AgentSessionIdentity {
     agent: HookAgent,
     session_id: Option<SessionId>,
 }
@@ -188,12 +188,13 @@ impl AgentSessionIdentity {
 
     /// Return the agent whose session this identity describes.
     #[must_use]
-    pub(in crate::telemetry) const fn agent(self) -> HookAgent {
+    const fn agent(self) -> HookAgent {
         self.agent
     }
 
     /// Return the scoped identifier when the agent supplied a vendor id.
-    pub(in crate::telemetry) const fn session_id(self) -> Option<SessionId> {
+    #[must_use]
+    const fn session_id(self) -> Option<SessionId> {
         self.session_id
     }
 }
@@ -461,7 +462,7 @@ mod tests {
 
     use super::super::{
         IDENTIFIER_WINDOW_TEST_STATE, RowClassification, TelemetryRow, assert_contract_names,
-        assert_contract_names_with_labels, classify_row,
+        assert_contract_names_with_labels, classify_row, recording_observation,
     };
     use super::*;
     use crate::telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1};
@@ -504,11 +505,10 @@ mod tests {
 
     fn agent_configuration(agent: SupportedAgent) -> AgentConfigurationV1 {
         let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
-        let observation = state.observe_session(session_start_time()).unwrap();
-        let observation = state.bind_session_observation(observation).unwrap();
+        let observation = recording_observation(&mut state);
 
         AgentConfigurationV1::new(
-            observation.recording(),
+            &observation,
             OperatingSystem::Linux,
             Architecture::X86_64,
             AgentConfigurationFields {
@@ -794,7 +794,6 @@ mod tests {
 
     #[test]
     fn new_agent_configuration_derives_subject_from_its_agent() {
-        let day = session_start_time().day();
         // Cross-checked with .NET's HMACSHA256 over the contract header,
         // identifier window, and agent. The complete digest is
         // e346647f3c83e0f8bea71a0ff04bfb6fa601f0967a92713894dcea7f793214b0.
@@ -805,7 +804,7 @@ mod tests {
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::AgentConfiguration);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
-        assert_eq!(row.day, day);
+        assert_eq!(row.day.to_string(), "2026-08-03");
         assert_eq!(row.symposium, SymposiumVersion::current());
         assert_eq!(row.agent, SupportedAgent::Claude);
         assert!(row.configured);

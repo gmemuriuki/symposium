@@ -337,20 +337,17 @@ impl std::error::Error for CommandError {}
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
     use clap::Parser as _;
 
     use super::super::{
-        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names, assert_contract_names_with_labels,
-        recorded_data_example_block_at, recorded_data_example_row,
+        IDENTIFIER_WINDOW_TEST_STATE, RowClassification, TelemetryRow, assert_contract_names,
+        assert_contract_names_with_labels, classify_row, recorded_data_example_block_at,
+        recorded_data_example_row, recording_observation,
     };
     use super::*;
     use crate::{
         cli::Cli,
-        telemetry::{
-            identity::encode_dimension_for_test,
-            state::{BoundRecordingObservation, TelemetryStateV1},
-        },
+        telemetry::{identity::encode_dimension_for_test, state::TelemetryStateV1},
     };
 
     fn parse_command(arguments: &[&str]) -> Commands {
@@ -370,18 +367,9 @@ mod tests {
         )
     }
 
-    fn command_time() -> UtcSecond {
-        UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 10, 2, 11).unwrap())
-    }
-
-    fn command_observation(state: &mut TelemetryStateV1) -> BoundRecordingObservation<'_> {
-        let observation = state.observe_recording(command_time()).unwrap();
-        state.bind_recording_observation(observation).unwrap()
-    }
-
     fn command_row(command: CommandCoordinate) -> CommandV1 {
         let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
-        let observation = command_observation(&mut state);
+        let observation = recording_observation(&mut state);
 
         CommandV1::new(&observation, command, 820, CommandOutcome::Ok)
     }
@@ -642,7 +630,9 @@ mod tests {
     fn command_example_round_trips_in_contract_shape() {
         let source = recorded_data_example_row("command");
 
-        let row = serde_json::from_str::<CommandV1>(source).unwrap();
+        let RowClassification::Supported(TelemetryRow::Command(row)) = classify_row(source) else {
+            panic!("documented command row was not classified as supported");
+        };
         let serialized = serde_json::to_string(&row).unwrap();
 
         assert_eq!(serialized, source);
@@ -650,7 +640,6 @@ mod tests {
 
     #[test]
     fn new_command_derives_fixed_fields_day_and_subject() {
-        let at = command_time();
         let command = CommandCoordinate::builtin(BuiltinCommand::Use);
         // Cross-checked in the same independent .NET calculation as the
         // plugin-command vector. The complete digest is
@@ -662,8 +651,11 @@ mod tests {
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::Command);
         assert_eq!(row.event_id.0.get_version(), Some(uuid::Version::Random));
-        assert_eq!(row.day, at.day());
-        assert_eq!(row.at, at);
+        assert_eq!(row.day, row.at.day());
+        assert_eq!(
+            serde_json::to_string(&row.at).unwrap(),
+            r#""2026-08-03T10:02:11Z""#
+        );
         assert_eq!(row.symposium, SymposiumVersion::current());
         assert_eq!(row.command, command);
         assert_eq!(row.duration_ms, 820);

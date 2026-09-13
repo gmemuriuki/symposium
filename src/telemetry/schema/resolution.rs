@@ -11,7 +11,7 @@ use super::{
     DroppedOperation, EventId, RowKind, SchemaVersion, SymposiumVersion, UtcDay,
     deserialize_version_one,
 };
-use crate::telemetry::identity::SessionId;
+use crate::telemetry::{identity::SessionId, state::BoundRecordingObservation};
 
 /// Operation that caused a full resolution and sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -164,7 +164,7 @@ impl ResolutionSummaryV1 {
     /// Returns [`ResolutionSummaryError::UnnamedPackageCountOverflow`] when
     /// the unnamed-package reason counters cannot be represented by `u64`.
     pub(in crate::telemetry) fn new(
-        day: UtcDay,
+        observation: &BoundRecordingObservation<'_>,
         fields: ResolutionSummaryFields,
     ) -> Result<Self, ResolutionSummaryError> {
         let unnamed_packages = fields
@@ -176,7 +176,7 @@ impl ResolutionSummaryV1 {
             version: SchemaVersion::V1,
             kind: RowKind::ResolutionSummary,
             event_id: EventId::new(),
-            day,
+            day: observation.day(),
             symposium: SymposiumVersion::current(),
             trigger: fields.trigger,
             outcome: fields.outcome,
@@ -286,8 +286,11 @@ impl TryFrom<RawResolutionSummaryV1> for ResolutionSummaryV1 {
 mod tests {
     use chrono::NaiveDate;
 
-    use super::super::assert_contract_names;
+    use super::super::{
+        IDENTIFIER_WINDOW_TEST_STATE, assert_contract_names, recording_observation,
+    };
     use super::*;
+    use crate::telemetry::state::TelemetryStateV1;
 
     fn example_reasons() -> UnnamedPackageReasons {
         UnnamedPackageReasons {
@@ -302,6 +305,15 @@ mod tests {
 
     fn summary_day() -> UtcDay {
         UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap())
+    }
+
+    fn resolution_summary(
+        fields: ResolutionSummaryFields,
+    ) -> Result<ResolutionSummaryV1, ResolutionSummaryError> {
+        let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
+        let observation = recording_observation(&mut state);
+
+        ResolutionSummaryV1::new(&observation, fields)
     }
 
     fn summary_fields(session_id: Option<SessionId>) -> ResolutionSummaryFields {
@@ -353,7 +365,7 @@ mod tests {
         let session_id = "sess_31d8b1916028f65a0c0521dc1f4c86fb".parse().unwrap();
         let fields = summary_fields(Some(session_id));
 
-        let row = ResolutionSummaryV1::new(summary_day(), fields).unwrap();
+        let row = resolution_summary(fields).unwrap();
 
         assert_eq!(row.version, SchemaVersion::V1);
         assert_eq!(row.kind, RowKind::ResolutionSummary);
@@ -383,7 +395,7 @@ mod tests {
             ..UnnamedPackageReasons::default()
         };
 
-        let result = ResolutionSummaryV1::new(summary_day(), fields);
+        let result = resolution_summary(fields);
 
         assert_eq!(
             result,
@@ -393,7 +405,7 @@ mod tests {
 
     #[test]
     fn direct_resolution_summary_deserialization_rejects_future_version() {
-        let row = ResolutionSummaryV1::new(summary_day(), summary_fields(None)).unwrap();
+        let row = resolution_summary(summary_fields(None)).unwrap();
         let json = serde_json::to_string(&row).unwrap();
         let future = json.replacen(r#""v":1"#, r#""v":2"#, 1);
 
@@ -404,7 +416,7 @@ mod tests {
 
     #[test]
     fn resolution_summary_rejects_unknown_fields() {
-        let row = ResolutionSummaryV1::new(summary_day(), summary_fields(None)).unwrap();
+        let row = resolution_summary(summary_fields(None)).unwrap();
         let json = serde_json::to_string(&row).unwrap();
         let unknown = json.replacen(r#""trigger""#, r#""future_field":true,"trigger""#, 1);
 
@@ -415,7 +427,7 @@ mod tests {
 
     #[test]
     fn resolution_summary_requires_every_top_level_field() {
-        let row = ResolutionSummaryV1::new(summary_day(), summary_fields(None)).unwrap();
+        let row = resolution_summary(summary_fields(None)).unwrap();
         let json = serde_json::to_string(&row).unwrap();
         let missing = json.replacen(r#","plugins":1"#, "", 1);
 
@@ -426,7 +438,7 @@ mod tests {
 
     #[test]
     fn resolution_summary_json_rejects_mismatched_unnamed_count() {
-        let row = ResolutionSummaryV1::new(summary_day(), summary_fields(None)).unwrap();
+        let row = resolution_summary(summary_fields(None)).unwrap();
         let json = serde_json::to_string(&row).unwrap();
         let mismatched = json.replacen(r#""unnamed_packages":1"#, r#""unnamed_packages":2"#, 1);
 
@@ -473,7 +485,7 @@ mod tests {
 
     #[test]
     fn resolution_summary_without_session_id_round_trips_without_the_field() {
-        let row = ResolutionSummaryV1::new(summary_day(), summary_fields(None)).unwrap();
+        let row = resolution_summary(summary_fields(None)).unwrap();
 
         let json = serde_json::to_string(&row).unwrap();
         let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
