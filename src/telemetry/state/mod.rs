@@ -16,7 +16,7 @@ use super::{
 
 mod lifecycle;
 
-pub(in crate::telemetry) use lifecycle::BoundSessionObservation;
+pub(in crate::telemetry) use lifecycle::{BoundRecordingObservation, BoundSessionObservation};
 
 /// The initial schema version of `telemetry-state.toml`.
 ///
