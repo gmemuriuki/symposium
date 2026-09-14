@@ -272,9 +272,9 @@ This cumulative row combines completed hook observations for one UTC day, agent,
 | `plugins_attempted`               | integer                                                                        | Plugin hooks whose preparation began.                                                       |
 | `plugins_completed`               | integer                                                                        | Plugin hooks with an observed terminal result.                                              |
 | `duration_ms`                     | latency histogram                                                              | Parsed-input-to-response-ready latency; telemetry update time is excluded.                   |
-| `session_counts_complete`         | boolean                                                                        | Whether the two distinct identified-session counts are complete for every observation.      |
 | `identified_sessions`             | integer, optional                                                              | Distinct identified sessions represented; present only when `session_counts_complete=true`. |
 | `identified_sessions_non_ok`      | integer, optional                                                              | Those sessions with at least one non-`ok` observation; present only when counts are complete. |
+| `session_counts_complete`         | boolean                                                                        | Whether the two distinct identified-session counts are complete for every observation.      |
 | `hook_subject`                    | scoped id                                                                      | Links this agent/hook dimension inside its 30-day identifier window.                         |
 
 `outcomes` and the duration histogram each sum to `invocations`. Exactly one outcome counter advances for each completed observation. Precedence is `internal_error`, then `blocked`, then `plugin_error`, then `ok`.
@@ -297,9 +297,9 @@ This cumulative row combines plugin-hook observations for one UTC day, agent, ho
 | `outcomes`                    | plugin outcome counters                                                        | Exact counters named `ok`, `blocked`, and `error`.                                           |
 | `prepare_ms`                  | latency histogram                                                              | Preparation time for every attempt.                                                         |
 | `execute_ms`                  | latency histogram                                                              | Child execution time for attempts counted by `executions`.                                  |
-| `session_counts_complete`     | boolean                                                                        | Whether the two distinct identified-session counts are complete for every attempt.          |
 | `identified_sessions`         | integer, optional                                                              | Distinct identified sessions represented; present only when `session_counts_complete=true`. |
 | `identified_sessions_non_ok`  | integer, optional                                                              | Those sessions with at least one non-`ok` attempt; present only when counts are complete.    |
+| `session_counts_complete`     | boolean                                                                        | Whether the two distinct identified-session counts are complete for every attempt.          |
 | `plugin_subject`              | scoped id, conditional                                                         | Present only with an eligible public plugin.                                                |
 
 #### Counting rules
