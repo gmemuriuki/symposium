@@ -20,6 +20,8 @@ Completed operational events (`session_start` and `command`) also have `at`, an 
 
 Counters and durations are non-negative JSON integers that fit an unsigned 64-bit value. Symposium checks arithmetic and drops an overflowing batch or observation instead of wrapping the value.
 
+Durations are converted to whole milliseconds by truncating any sub-millisecond remainder. A duration above the unsigned 64-bit millisecond range is recorded as the maximum value instead of wrapping.
+
 `event_id` exists to deduplicate a future retry of the same event or identify one cumulative metric row. A metric row keeps the `event_id` minted when its dimension first appears that UTC day as the row is rewritten. It is not an installation, session, account, or project identifier.
 
 ## Example JSONL for every row kind
