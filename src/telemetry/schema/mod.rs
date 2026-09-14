@@ -7,6 +7,7 @@
 mod agent;
 mod command;
 mod extension;
+mod hook;
 mod macros;
 mod metrics;
 mod name;
