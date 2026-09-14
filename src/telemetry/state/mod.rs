@@ -15,6 +15,7 @@ use super::{
 };
 
 mod lifecycle;
+mod session_counts;
 
 pub(in crate::telemetry) use lifecycle::{BoundRecordingObservation, BoundSessionObservation};
 

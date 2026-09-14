@@ -8,10 +8,7 @@ use super::{
     RowKind, SymposiumVersion,
     agent::HookAgent,
     macros::strict_versioned_row,
-    metrics::{
-        HookSessionCountError, HookSessionCountInput, LatencyHistogram,
-        validate_hook_session_counts,
-    },
+    metrics::{LatencyHistogram, SessionCountError, SessionCountInput, validate_session_counts},
 };
 use crate::{
     hook_schema::HookEvent,
@@ -266,12 +263,12 @@ fn validate_hook_metrics(raw: &RawHookMetricsV1) -> Result<(), HookMetricsError>
         });
     }
 
-    validate_hook_session_counts(HookSessionCountInput {
+    validate_session_counts(SessionCountInput {
         counts_complete: raw.session_counts_complete,
         identified_sessions: raw.identified_sessions,
         identified_sessions_non_ok: raw.identified_sessions_non_ok,
-        invocations: raw.invocations,
-        ok_invocations: raw.outcomes.ok,
+        observations: raw.invocations,
+        ok_observations: raw.outcomes.ok,
     })?;
 
     Ok(())
@@ -286,11 +283,11 @@ enum HookMetricsError {
     DurationTotalOverflow,
     DurationTotalMismatch { invocations: u64, durations: u64 },
     CompletedPluginsExceedAttempts { attempted: u64, completed: u64 },
-    SessionCounts(HookSessionCountError),
+    SessionCounts(SessionCountError),
 }
 
-impl From<HookSessionCountError> for HookMetricsError {
-    fn from(error: HookSessionCountError) -> Self {
+impl From<SessionCountError> for HookMetricsError {
+    fn from(error: SessionCountError) -> Self {
         Self::SessionCounts(error)
     }
 }
@@ -327,14 +324,7 @@ impl fmt::Display for HookMetricsError {
     }
 }
 
-impl std::error::Error for HookMetricsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SessionCounts(error) => Some(error),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for HookMetricsError {}
 
 #[cfg(test)]
 mod tests {
@@ -769,7 +759,7 @@ mod tests {
 
         let error = hook_metrics_error(value);
 
-        assert!(error.contains("identified sessions 2 exceed 1 hook invocations"));
+        assert!(error.contains("identified sessions 2 exceed 1 observations"));
     }
 
     #[test]
@@ -780,7 +770,7 @@ mod tests {
 
         let error = hook_metrics_error(value);
 
-        assert!(error.contains("non-ok identified sessions 3 exceed 2 non-ok hook invocations"));
+        assert!(error.contains("non-ok identified sessions 3 exceed 2 non-ok observations"));
     }
 
     #[test]
@@ -816,7 +806,7 @@ mod tests {
 
         let error = hook_metrics_error(value);
 
-        assert!(error.contains("complete hook session counts contain no identified sessions"));
+        assert!(error.contains("complete session counts contain no identified sessions"));
     }
 
     #[test]
@@ -827,9 +817,7 @@ mod tests {
         let error = hook_metrics_error(value);
 
         assert!(
-            error.contains(
-                "2 non-ok hook invocations require at least one non-ok identified session"
-            )
+            error.contains("2 non-ok observations require at least one non-ok identified session")
         );
     }
 
@@ -849,7 +837,7 @@ mod tests {
 
         let error = hook_metrics_error(value);
 
-        assert!(error.contains("all-ok identified sessions 2 exceed 1 ok hook invocations"));
+        assert!(error.contains("all-ok identified sessions 2 exceed 1 ok observations"));
     }
 
     #[test]

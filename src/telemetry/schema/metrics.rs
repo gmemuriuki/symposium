@@ -124,23 +124,23 @@ struct RawLatencyHistogram {
 /// A named input keeps the two optional counters and the two observation
 /// totals from being transposed at call sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) struct HookSessionCountInput {
+pub(in crate::telemetry) struct SessionCountInput {
     pub(in crate::telemetry) counts_complete: bool,
     pub(in crate::telemetry) identified_sessions: Option<u64>,
     pub(in crate::telemetry) identified_sessions_non_ok: Option<u64>,
-    pub(in crate::telemetry) invocations: u64,
-    pub(in crate::telemetry) ok_invocations: u64,
+    pub(in crate::telemetry) observations: u64,
+    pub(in crate::telemetry) ok_observations: u64,
 }
 
 /// Validate the complete-session rules shared by hook aggregate rows.
 ///
 /// # Errors
 ///
-/// Returns [`HookSessionCountError`] when the presence or value of a session
-/// counter is inconsistent with the aggregate's invocation counters.
-pub(in crate::telemetry) fn validate_hook_session_counts(
-    input: HookSessionCountInput,
-) -> Result<(), HookSessionCountError> {
+/// Returns [`SessionCountError`] when the presence or value of a session
+/// counter is inconsistent with the aggregate's observation counters.
+pub(in crate::telemetry) fn validate_session_counts(
+    input: SessionCountInput,
+) -> Result<(), SessionCountError> {
     match (
         input.counts_complete,
         input.identified_sessions,
@@ -148,112 +148,112 @@ pub(in crate::telemetry) fn validate_hook_session_counts(
     ) {
         (true, Some(identified), Some(non_ok)) => {
             if identified == 0 {
-                return Err(HookSessionCountError::NoIdentifiedSessions);
+                return Err(SessionCountError::NoIdentifiedSessions);
             }
             if identified > MAX_IDENTIFIED_SESSIONS {
-                return Err(HookSessionCountError::IdentifiedSessionsExceedLimit {
+                return Err(SessionCountError::IdentifiedSessionsExceedLimit {
                     identified,
                     maximum: MAX_IDENTIFIED_SESSIONS,
                 });
             }
-            if identified > input.invocations {
-                return Err(HookSessionCountError::IdentifiedSessionsExceedInvocations {
+            if identified > input.observations {
+                return Err(SessionCountError::IdentifiedSessionsExceedObservations {
                     identified,
-                    invocations: input.invocations,
+                    observations: input.observations,
                 });
             }
             if non_ok > identified {
-                return Err(HookSessionCountError::NonOkSessionsExceedIdentified {
+                return Err(SessionCountError::NonOkSessionsExceedIdentified {
                     identified,
                     non_ok,
                 });
             }
 
-            let non_ok_invocations = input.invocations.checked_sub(input.ok_invocations).ok_or(
-                HookSessionCountError::OkInvocationsExceedInvocations {
-                    invocations: input.invocations,
-                    ok_invocations: input.ok_invocations,
-                },
-            )?;
-            if non_ok_invocations > 0 && non_ok == 0 {
-                return Err(HookSessionCountError::NoNonOkSessions {
-                    invocations: non_ok_invocations,
+            let non_ok_observations = input
+                .observations
+                .checked_sub(input.ok_observations)
+                .ok_or(SessionCountError::OkObservationsExceedObservations {
+                    observations: input.observations,
+                    ok_observations: input.ok_observations,
+                })?;
+            if non_ok_observations > 0 && non_ok == 0 {
+                return Err(SessionCountError::NoNonOkSessions {
+                    observations: non_ok_observations,
                 });
             }
-            if non_ok > non_ok_invocations {
-                return Err(HookSessionCountError::NonOkSessionsExceedNonOkInvocations {
+            if non_ok > non_ok_observations {
+                return Err(SessionCountError::NonOkSessionsExceedNonOkObservations {
                     sessions: non_ok,
-                    invocations: non_ok_invocations,
+                    observations: non_ok_observations,
                 });
             }
 
             // The subset check above proves that this subtraction cannot
             // underflow. Every remaining session contributed an `ok` result.
             let all_ok_sessions = identified - non_ok;
-            if all_ok_sessions > input.ok_invocations {
-                return Err(HookSessionCountError::AllOkSessionsExceedOkInvocations {
+            if all_ok_sessions > input.ok_observations {
+                return Err(SessionCountError::AllOkSessionsExceedOkObservations {
                     sessions: all_ok_sessions,
-                    invocations: input.ok_invocations,
+                    observations: input.ok_observations,
                 });
             }
 
             Ok(())
         }
         (false, None, None) => Ok(()),
-        (true, _, _) => Err(HookSessionCountError::CompleteCountsMissing),
-        (false, _, _) => Err(HookSessionCountError::IncompleteCountsPresent),
+        (true, _, _) => Err(SessionCountError::CompleteCountsMissing),
+        (false, _, _) => Err(SessionCountError::IncompleteCountsPresent),
     }
 }
 
 /// Invalid relationship between session counters in a hook aggregate row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) enum HookSessionCountError {
+pub(in crate::telemetry) enum SessionCountError {
     CompleteCountsMissing,
     IncompleteCountsPresent,
     NoIdentifiedSessions,
     NoNonOkSessions {
-        invocations: u64,
+        observations: u64,
     },
     IdentifiedSessionsExceedLimit {
         identified: u64,
         maximum: u64,
     },
-    IdentifiedSessionsExceedInvocations {
+    IdentifiedSessionsExceedObservations {
         identified: u64,
-        invocations: u64,
+        observations: u64,
     },
     NonOkSessionsExceedIdentified {
         identified: u64,
         non_ok: u64,
     },
-    OkInvocationsExceedInvocations {
-        invocations: u64,
-        ok_invocations: u64,
+    OkObservationsExceedObservations {
+        observations: u64,
+        ok_observations: u64,
     },
-    NonOkSessionsExceedNonOkInvocations {
+    NonOkSessionsExceedNonOkObservations {
         sessions: u64,
-        invocations: u64,
+        observations: u64,
     },
-    AllOkSessionsExceedOkInvocations {
+    AllOkSessionsExceedOkObservations {
         sessions: u64,
-        invocations: u64,
+        observations: u64,
     },
 }
 
-impl fmt::Display for HookSessionCountError {
+impl fmt::Display for SessionCountError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CompleteCountsMissing => formatter
-                .write_str("complete hook session counts require both identified session counters"),
-            Self::IncompleteCountsPresent => formatter.write_str(
-                "incomplete hook session counts must omit both identified session counters",
-            ),
+                .write_str("complete session counts require both identified session counters"),
+            Self::IncompleteCountsPresent => formatter
+                .write_str("incomplete session counts must omit both identified session counters"),
             Self::NoIdentifiedSessions => {
-                formatter.write_str("complete hook session counts contain no identified sessions")
+                formatter.write_str("complete session counts contain no identified sessions")
             }
-            Self::NoNonOkSessions { invocations } => write!(
+            Self::NoNonOkSessions { observations } => write!(
                 formatter,
-                "{invocations} non-ok hook invocations require at least one non-ok identified session"
+                "{observations} non-ok observations require at least one non-ok identified session"
             ),
             Self::IdentifiedSessionsExceedLimit {
                 identified,
@@ -262,43 +262,43 @@ impl fmt::Display for HookSessionCountError {
                 formatter,
                 "identified sessions {identified} exceed the version 1 limit {maximum}"
             ),
-            Self::IdentifiedSessionsExceedInvocations {
+            Self::IdentifiedSessionsExceedObservations {
                 identified,
-                invocations,
+                observations,
             } => write!(
                 formatter,
-                "identified sessions {identified} exceed {invocations} hook invocations"
+                "identified sessions {identified} exceed {observations} observations"
             ),
             Self::NonOkSessionsExceedIdentified { identified, non_ok } => write!(
                 formatter,
                 "non-ok identified sessions {non_ok} exceed {identified} identified sessions"
             ),
-            Self::OkInvocationsExceedInvocations {
-                invocations,
-                ok_invocations,
+            Self::OkObservationsExceedObservations {
+                observations,
+                ok_observations,
             } => write!(
                 formatter,
-                "ok hook invocations {ok_invocations} exceed {invocations} hook invocations"
+                "ok observations {ok_observations} exceed {observations} observations"
             ),
-            Self::NonOkSessionsExceedNonOkInvocations {
+            Self::NonOkSessionsExceedNonOkObservations {
                 sessions,
-                invocations,
+                observations,
             } => write!(
                 formatter,
-                "non-ok identified sessions {sessions} exceed {invocations} non-ok hook invocations"
+                "non-ok identified sessions {sessions} exceed {observations} non-ok observations"
             ),
-            Self::AllOkSessionsExceedOkInvocations {
+            Self::AllOkSessionsExceedOkObservations {
                 sessions,
-                invocations,
+                observations,
             } => write!(
                 formatter,
-                "all-ok identified sessions {sessions} exceed {invocations} ok hook invocations"
+                "all-ok identified sessions {sessions} exceed {observations} ok observations"
             ),
         }
     }
 }
 
-impl std::error::Error for HookSessionCountError {}
+impl std::error::Error for SessionCountError {}
 
 #[cfg(test)]
 mod tests {
@@ -440,22 +440,22 @@ mod tests {
     }
 
     #[test]
-    fn session_counts_reject_more_ok_than_total_invocations() {
-        let input = HookSessionCountInput {
+    fn session_counts_reject_more_ok_than_total_observations() {
+        let input = SessionCountInput {
             counts_complete: true,
             identified_sessions: Some(1),
             identified_sessions_non_ok: Some(0),
-            invocations: 1,
-            ok_invocations: 2,
+            observations: 1,
+            ok_observations: 2,
         };
 
-        let result = validate_hook_session_counts(input);
+        let result = validate_session_counts(input);
 
         assert_eq!(
             result,
-            Err(HookSessionCountError::OkInvocationsExceedInvocations {
-                invocations: 1,
-                ok_invocations: 2,
+            Err(SessionCountError::OkObservationsExceedObservations {
+                observations: 1,
+                ok_observations: 2,
             })
         );
     }

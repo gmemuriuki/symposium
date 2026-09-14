@@ -13,6 +13,9 @@ mod metrics;
 mod name;
 mod resolution;
 
+pub(in crate::telemetry) use hook::HookOutcome;
+pub(in crate::telemetry) use metrics::MAX_IDENTIFIED_SESSIONS;
+
 use std::{fmt, num::NonZeroU64, sync::LazyLock};
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
