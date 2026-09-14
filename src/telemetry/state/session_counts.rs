@@ -77,12 +77,13 @@ impl TrackedHookSessions {
 /// with the snapshot contribution count, this tracker discards both sets and
 /// remains incomplete for the rest of its lifetime.
 #[derive(Clone, PartialEq, Eq)]
-struct HookSessionCountTracker {
+pub(in crate::telemetry) struct HookSessionCountTracker<K> {
+    key: K,
     contribution_count: u64,
     sessions: TrackedHookSessions,
 }
 
-impl fmt::Debug for HookSessionCountTracker {
+impl<K> fmt::Debug for HookSessionCountTracker<K> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("HookSessionCountTracker");
         debug.field("contribution_count", &self.contribution_count);
@@ -99,9 +100,12 @@ impl fmt::Debug for HookSessionCountTracker {
     }
 }
 
-impl Default for HookSessionCountTracker {
-    fn default() -> Self {
+impl<K> HookSessionCountTracker<K> {
+    /// Start private session tracking for one aggregate key.
+    #[must_use]
+    pub(in crate::telemetry) fn new(key: K) -> Self {
         Self {
+            key,
             contribution_count: 0,
             sessions: TrackedHookSessions::Complete {
                 identified: BTreeSet::new(),
@@ -109,9 +113,13 @@ impl Default for HookSessionCountTracker {
             },
         }
     }
-}
 
-impl HookSessionCountTracker {
+    /// Return the aggregate key this private state belongs to.
+    #[must_use]
+    pub(in crate::telemetry) const fn key(&self) -> &K {
+        &self.key
+    }
+
     /// Add one aggregate observation without partially changing the tracker.
     ///
     /// A missing identifier or a 257th distinct identifier makes the session
@@ -127,10 +135,11 @@ impl HookSessionCountTracker {
     /// Returns [`HookSessionCountUpdateError::ContributionCountOverflow`] when
     /// the contribution count cannot be incremented.
     #[must_use = "counter overflow must drop the containing telemetry update"]
-    fn checked_record(
+    pub(in crate::telemetry) fn checked_record(
         &mut self,
         snapshot_contributions: u64,
-        contribution: HookSessionContribution,
+        session_id: Option<SessionId>,
+        outcome: HookOutcome,
     ) -> Result<(), HookSessionCountUpdateError> {
         let next_contribution_count = snapshot_contributions
             .checked_add(1)
@@ -140,14 +149,15 @@ impl HookSessionCountTracker {
             self.sessions = TrackedHookSessions::Incomplete;
         }
 
-        self.sessions.record(contribution);
+        self.sessions
+            .record(HookSessionContribution::new(session_id, outcome));
         self.contribution_count = next_contribution_count;
         Ok(())
     }
 
     /// Return the aggregate fields represented by the current private sets.
     #[must_use]
-    fn snapshot(&self) -> HookSessionCountSnapshot {
+    pub(in crate::telemetry) fn snapshot(&self) -> HookSessionCountSnapshot {
         match &self.sessions {
             TrackedHookSessions::Complete { identified, non_ok } => {
                 HookSessionCountSnapshot::Complete {
@@ -166,7 +176,7 @@ fn set_len(sessions: &BTreeSet<SessionId>) -> u64 {
 
 /// Session-count fields supplied to one hook aggregate snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HookSessionCountSnapshot {
+pub(in crate::telemetry) enum HookSessionCountSnapshot {
     Complete {
         identified_sessions: u64,
         identified_sessions_non_ok: u64,
@@ -176,7 +186,7 @@ enum HookSessionCountSnapshot {
 
 /// A hook session-count update that cannot be represented in private state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HookSessionCountUpdateError {
+pub(in crate::telemetry) enum HookSessionCountUpdateError {
     ContributionCountOverflow,
 }
 
@@ -196,6 +206,13 @@ impl std::error::Error for HookSessionCountUpdateError {}
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestAggregateKey;
+
+    fn tracker() -> HookSessionCountTracker<TestAggregateKey> {
+        HookSessionCountTracker::new(TestAggregateKey)
+    }
+
     fn session_id(value: u128) -> SessionId {
         format!("sess_{value:032x}").parse().unwrap()
     }
@@ -207,15 +224,11 @@ mod tests {
         HookSessionContribution::new(session_id, outcome)
     }
 
-    fn identified(value: u128, outcome: HookOutcome) -> HookSessionContribution {
-        contribution(Some(session_id(value)), outcome)
-    }
-
-    fn tracker_at_limit() -> HookSessionCountTracker {
-        let mut tracker = HookSessionCountTracker::default();
+    fn tracker_at_limit() -> HookSessionCountTracker<TestAggregateKey> {
+        let mut tracker = tracker();
         for value in 0..MAX_IDENTIFIED_SESSIONS {
             tracker
-                .checked_record(value, identified(u128::from(value), HookOutcome::Ok))
+                .checked_record(value, Some(session_id(u128::from(value))), HookOutcome::Ok)
                 .unwrap();
         }
 
@@ -248,18 +261,18 @@ mod tests {
 
     #[test]
     fn identified_contributions_count_distinct_and_non_ok_sessions() {
-        let mut tracker = HookSessionCountTracker::default();
+        let mut tracker = tracker();
         let first = session_id(1);
         let second = session_id(2);
 
         tracker
-            .checked_record(0, contribution(Some(first), HookOutcome::Ok))
+            .checked_record(0, Some(first), HookOutcome::Ok)
             .unwrap();
         tracker
-            .checked_record(1, contribution(Some(first), HookOutcome::Blocked))
+            .checked_record(1, Some(first), HookOutcome::Blocked)
             .unwrap();
         tracker
-            .checked_record(2, contribution(Some(second), HookOutcome::PluginError))
+            .checked_record(2, Some(second), HookOutcome::PluginError)
             .unwrap();
 
         assert_eq!(tracker.contribution_count, 3);
@@ -274,16 +287,14 @@ mod tests {
 
     #[test]
     fn an_unidentified_contribution_discards_both_sets_permanently() {
-        let mut tracker = HookSessionCountTracker::default();
+        let mut tracker = tracker();
         tracker
-            .checked_record(0, identified(1, HookOutcome::Blocked))
+            .checked_record(0, Some(session_id(1)), HookOutcome::Blocked)
             .unwrap();
 
+        tracker.checked_record(1, None, HookOutcome::Ok).unwrap();
         tracker
-            .checked_record(1, contribution(None, HookOutcome::Ok))
-            .unwrap();
-        tracker
-            .checked_record(2, identified(2, HookOutcome::Ok))
+            .checked_record(2, Some(session_id(2)), HookOutcome::Ok)
             .unwrap();
 
         assert_eq!(tracker.contribution_count, 3);
@@ -310,10 +321,8 @@ mod tests {
         tracker
             .checked_record(
                 MAX_IDENTIFIED_SESSIONS,
-                identified(
-                    u128::from(MAX_IDENTIFIED_SESSIONS),
-                    HookOutcome::InternalError,
-                ),
+                Some(session_id(u128::from(MAX_IDENTIFIED_SESSIONS))),
+                HookOutcome::InternalError,
             )
             .unwrap();
 
@@ -326,7 +335,11 @@ mod tests {
         let mut tracker = tracker_at_limit();
 
         tracker
-            .checked_record(MAX_IDENTIFIED_SESSIONS, identified(0, HookOutcome::Blocked))
+            .checked_record(
+                MAX_IDENTIFIED_SESSIONS,
+                Some(session_id(0)),
+                HookOutcome::Blocked,
+            )
             .unwrap();
 
         assert_eq!(
@@ -340,13 +353,13 @@ mod tests {
 
     #[test]
     fn contribution_mismatch_discards_sets_and_uses_the_snapshot_baseline() {
-        let mut tracker = HookSessionCountTracker::default();
+        let mut tracker = tracker();
         tracker
-            .checked_record(0, identified(1, HookOutcome::Ok))
+            .checked_record(0, Some(session_id(1)), HookOutcome::Ok)
             .unwrap();
 
         tracker
-            .checked_record(0, identified(2, HookOutcome::Ok))
+            .checked_record(0, Some(session_id(2)), HookOutcome::Ok)
             .unwrap();
 
         assert_eq!(tracker.contribution_count, 1);
@@ -354,14 +367,26 @@ mod tests {
     }
 
     #[test]
-    fn matching_snapshot_contributions_preserve_complete_sets_during_update() {
-        let mut tracker = HookSessionCountTracker::default();
+    fn a_fresh_tracker_for_an_existing_row_starts_incomplete() {
+        let mut tracker = tracker();
+
         tracker
-            .checked_record(0, identified(1, HookOutcome::Ok))
+            .checked_record(1, Some(session_id(1)), HookOutcome::Ok)
+            .unwrap();
+
+        assert_eq!(tracker.contribution_count, 2);
+        assert_eq!(tracker.snapshot(), HookSessionCountSnapshot::Incomplete);
+    }
+
+    #[test]
+    fn matching_snapshot_contributions_preserve_complete_sets_during_update() {
+        let mut tracker = tracker();
+        tracker
+            .checked_record(0, Some(session_id(1)), HookOutcome::Ok)
             .unwrap();
 
         tracker
-            .checked_record(1, identified(1, HookOutcome::Ok))
+            .checked_record(1, Some(session_id(1)), HookOutcome::Ok)
             .unwrap();
 
         assert_eq!(
@@ -375,11 +400,10 @@ mod tests {
 
     #[test]
     fn contribution_overflow_rejects_the_update_without_mutation() {
-        let mut tracker = HookSessionCountTracker::default();
+        let mut tracker = tracker();
         let before = tracker.clone();
 
-        let result =
-            tracker.checked_record(u64::MAX, contribution(None, HookOutcome::InternalError));
+        let result = tracker.checked_record(u64::MAX, None, HookOutcome::InternalError);
 
         assert_eq!(
             result,
@@ -390,10 +414,10 @@ mod tests {
 
     #[test]
     fn tracker_debug_output_omits_session_identifiers() {
-        let mut tracker = HookSessionCountTracker::default();
+        let mut tracker = tracker();
         let session_id = session_id(1);
         tracker
-            .checked_record(0, contribution(Some(session_id), HookOutcome::Ok))
+            .checked_record(0, Some(session_id), HookOutcome::Ok)
             .unwrap();
 
         let debug = format!("{tracker:?}");

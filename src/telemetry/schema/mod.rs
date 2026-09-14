@@ -13,6 +13,11 @@ mod metrics;
 mod name;
 mod resolution;
 
+#[expect(
+    unused_imports,
+    reason = "the aggregate key is built before its storage producer uses it"
+)]
+pub(in crate::telemetry) use hook::HookMetricsKey;
 pub(in crate::telemetry) use hook::HookOutcome;
 pub(in crate::telemetry) use metrics::MAX_IDENTIFIED_SESSIONS;
 
