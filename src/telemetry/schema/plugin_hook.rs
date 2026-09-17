@@ -61,6 +61,67 @@ pub(in crate::telemetry) struct PluginHookOutcomeSignals {
     pub(in crate::telemetry) blocked: bool,
 }
 
+/// Mutually exclusive outcomes of completed plugin-hook attempts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginHookOutcomeCounters {
+    ok: u64,
+    blocked: u64,
+    error: u64,
+}
+
+impl PluginHookOutcomeCounters {
+    /// Increment exactly one outcome counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginHookOutcomeCounterOverflow`] when the selected counter
+    /// cannot be incremented. The counters are unchanged on failure.
+    #[must_use = "counter overflow must drop the containing telemetry update"]
+    fn checked_record(
+        &mut self,
+        outcome: PluginHookOutcome,
+    ) -> Result<(), PluginHookOutcomeCounterOverflow> {
+        let counter = match outcome {
+            PluginHookOutcome::Ok => &mut self.ok,
+            PluginHookOutcome::Blocked => &mut self.blocked,
+            PluginHookOutcome::Error => &mut self.error,
+        };
+        let next = counter
+            .checked_add(1)
+            .ok_or(PluginHookOutcomeCounterOverflow { outcome })?;
+
+        *counter = next;
+        Ok(())
+    }
+
+    /// Return the sum of every outcome counter, or `None` on overflow.
+    #[must_use]
+    fn checked_total(&self) -> Option<u64> {
+        [self.ok, self.blocked, self.error]
+            .into_iter()
+            .try_fold(0_u64, u64::checked_add)
+    }
+}
+
+/// A selected plugin-hook outcome counter that cannot be incremented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PluginHookOutcomeCounterOverflow {
+    outcome: PluginHookOutcome,
+}
+
+impl fmt::Display for PluginHookOutcomeCounterOverflow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} plugin-hook outcome counter overflows u64",
+            self.outcome.counter_name()
+        )
+    }
+}
+
+impl std::error::Error for PluginHookOutcomeCounterOverflow {}
+
 /// Public plugin coordinate safe to place in plugin-hook telemetry.
 ///
 /// The enclosing row establishes that this coordinate identifies a plugin,
@@ -238,16 +299,109 @@ mod tests {
     }
 
     #[test]
-    fn plugin_hook_outcomes_select_contract_counter_names() {
+    fn plugin_hook_outcome_counters_round_trip_in_contract_order() {
+        let counters = PluginHookOutcomeCounters {
+            ok: 1,
+            blocked: 2,
+            error: 3,
+        };
+        let expected = r#"{"ok":1,"blocked":2,"error":3}"#;
+
+        let json = serde_json::to_string(&counters).unwrap();
+        let decoded = serde_json::from_str::<PluginHookOutcomeCounters>(&json).unwrap();
+
+        assert_eq!(json, expected);
+        assert_eq!(decoded, counters);
+    }
+
+    #[test]
+    fn recording_each_plugin_hook_outcome_increments_only_its_counter() {
         let cases = [
-            (PluginHookOutcome::Ok, "ok"),
-            (PluginHookOutcome::Blocked, "blocked"),
-            (PluginHookOutcome::Error, "error"),
+            (PluginHookOutcome::Ok, r#"{"ok":1,"blocked":0,"error":0}"#),
+            (
+                PluginHookOutcome::Blocked,
+                r#"{"ok":0,"blocked":1,"error":0}"#,
+            ),
+            (
+                PluginHookOutcome::Error,
+                r#"{"ok":0,"blocked":0,"error":1}"#,
+            ),
         ];
 
         for (outcome, expected) in cases {
-            assert_eq!(outcome.counter_name(), expected);
+            let mut counters = PluginHookOutcomeCounters::default();
+
+            counters.checked_record(outcome).unwrap();
+
+            let json = serde_json::to_string(&counters).unwrap();
+            let value = serde_json::to_value(counters).unwrap();
+            let active_counter = value
+                .as_object()
+                .unwrap()
+                .iter()
+                .find_map(|(name, count)| (count.as_u64() == Some(1)).then_some(name.as_str()))
+                .unwrap();
+
+            assert_eq!(json, expected);
+            assert_eq!(active_counter, outcome.counter_name());
         }
+    }
+
+    #[test]
+    fn plugin_hook_outcome_counters_reject_missing_unknown_and_invalid_fields() {
+        let cases = [
+            r#"{"ok":0,"blocked":0}"#,
+            r#"{"ok":0,"blocked":0,"error":0,"future":0}"#,
+            r#"{"ok":"none","blocked":0,"error":0}"#,
+            r#"{"ok":-1,"blocked":0,"error":0}"#,
+        ];
+
+        for json in cases {
+            assert!(
+                serde_json::from_str::<PluginHookOutcomeCounters>(json).is_err(),
+                "accepted invalid plugin-hook outcome counters {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_a_plugin_hook_outcome_rejects_overflow_without_mutation() {
+        let outcomes = [
+            PluginHookOutcome::Ok,
+            PluginHookOutcome::Blocked,
+            PluginHookOutcome::Error,
+        ];
+
+        for outcome in outcomes {
+            let mut counters = PluginHookOutcomeCounters {
+                ok: u64::MAX,
+                blocked: u64::MAX,
+                error: u64::MAX,
+            };
+            let before = counters;
+
+            let result = counters.checked_record(outcome);
+
+            assert_eq!(result, Err(PluginHookOutcomeCounterOverflow { outcome }));
+            assert_eq!(counters, before);
+        }
+    }
+
+    #[test]
+    fn plugin_hook_outcome_counter_total_is_checked_for_overflow() {
+        let representable = PluginHookOutcomeCounters {
+            ok: 1,
+            blocked: 2,
+            error: 3,
+        };
+        let overflowing = PluginHookOutcomeCounters {
+            ok: u64::MAX,
+            blocked: 1,
+            error: 0,
+        };
+
+        assert_eq!(representable.checked_total(), Some(6));
+        assert_eq!(overflowing.checked_total(), None);
     }
 
     #[test]
