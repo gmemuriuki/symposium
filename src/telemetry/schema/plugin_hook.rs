@@ -256,7 +256,6 @@ strict_versioned_row! {
 
     kind: RowKind::PluginHookMetrics,
     raw: RawPluginHookMetricsV1,
-    error: PluginHookMetricsError,
     validate: validate_plugin_hook_metrics,
 }
 
