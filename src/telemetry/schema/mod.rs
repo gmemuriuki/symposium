@@ -14,13 +14,15 @@ mod name;
 mod plugin_hook;
 mod resolution;
 
-#[expect(
-    unused_imports,
-    reason = "the aggregate key is built before its storage producer uses it"
-)]
-pub(in crate::telemetry) use hook::HookMetricsKey;
+#[cfg(test)]
+pub(in crate::telemetry) use agent::HookAgent;
 pub(in crate::telemetry) use hook::HookOutcome;
+#[cfg(test)]
+pub(in crate::telemetry) use hook::HookSurface;
 pub(in crate::telemetry) use metrics::MAX_IDENTIFIED_SESSIONS;
+#[cfg(test)]
+pub(in crate::telemetry) use plugin_hook::PluginBucket;
+pub(in crate::telemetry) use plugin_hook::PluginHookMetricsKey;
 
 use std::{fmt, num::NonZeroU64, sync::LazyLock};
 
@@ -31,6 +33,9 @@ use serde::{
     de::{DeserializeOwned, Error as _},
 };
 use uuid::Uuid;
+
+#[cfg(test)]
+use crate::telemetry::state::{IDENTIFIER_WINDOW_TEST_STATE, recording_observation};
 
 use agent::{AgentConfigurationV1, SessionStartV1};
 use command::CommandV1;
@@ -451,28 +456,6 @@ where
 #[cfg(test)]
 const RECORDED_DATA_CONTRACT: &str =
     include_str!("../../../md/rfds/telemetry-recording/contract/recorded-data.md");
-
-#[cfg(test)]
-const IDENTIFIER_WINDOW_TEST_STATE: &str = r#"version = 1
-
-[identity]
-key = "4242424242424242424242424242424242424242424242424242424242424242"
-identifier-window-anchor = "2026-08-03"
-"#;
-
-/// Build a recording context that remains inside the fixture's identifier
-/// window, so schema tests do not depend on separate timestamp choices.
-#[cfg(test)]
-fn recording_observation(
-    state: &mut crate::telemetry::state::TelemetryStateV1,
-) -> crate::telemetry::state::BoundRecordingObservation<'_> {
-    use chrono::TimeZone as _;
-
-    let completed_at =
-        UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 3, 10, 2, 11).unwrap());
-    let observation = state.observe_recording(completed_at).unwrap();
-    state.bind_recording_observation(observation).unwrap()
-}
 
 #[cfg(test)]
 fn recorded_data_example_block(section_heading: &str, opening_fence: &str) -> &'static str {
