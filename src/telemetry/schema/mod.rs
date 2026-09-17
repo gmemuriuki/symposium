@@ -11,6 +11,7 @@ mod hook;
 mod macros;
 mod metrics;
 mod name;
+mod plugin_hook;
 mod resolution;
 
 #[expect(

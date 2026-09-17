@@ -308,7 +308,7 @@ This cumulative row combines plugin-hook observations for one UTC day, agent, ho
 
 `attempts` counts terminal results. `executions` counts the subset that started child execution. A preparation failure is terminal `error` with no execution. `outcomes` and `prepare_ms` each sum to `attempts`; `execute_ms` sums to `executions`. Across every epoch and bucket for one agent, hook, and day, plugin `attempts` sum to the corresponding top-level `plugins_completed`.
 
-`blocked` means the plugin requested a block. `error` covers a closed preparation or execution failure. `ok` is every other completed attempt. The same 256-id all-or-nothing session rule used by `hook_metrics` applies.
+`blocked` records exit code 2 or a block decision in successfully parsed output. `error` records input serialization, preparation, spawn, wait, or output-parsing failure; termination by signal; or any other non-zero exit. When both signals apply, `error` takes precedence over `blocked`. `ok` is every other completed attempt. The same 256-id all-or-nothing session rule used by `hook_metrics` applies.
 
 #### Plugin identity and row limits
 
