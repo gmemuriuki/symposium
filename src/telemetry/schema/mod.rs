@@ -16,13 +16,13 @@ mod resolution;
 
 #[cfg(test)]
 pub(in crate::telemetry) use agent::HookAgent;
-pub(in crate::telemetry) use hook::HookOutcome;
 #[cfg(test)]
 pub(in crate::telemetry) use hook::HookSurface;
+pub(in crate::telemetry) use hook::{HookMetricsKey, HookOutcome};
 pub(in crate::telemetry) use metrics::MAX_IDENTIFIED_SESSIONS;
 #[cfg(test)]
 pub(in crate::telemetry) use plugin_hook::PluginBucket;
-pub(in crate::telemetry) use plugin_hook::PluginHookMetricsKey;
+pub(in crate::telemetry) use plugin_hook::{PluginHookMetricsKey, PluginHookOutcome};
 
 use std::{fmt, num::NonZeroU64, sync::LazyLock};
 

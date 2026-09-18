@@ -10,7 +10,7 @@ use crate::telemetry::schema::{EventId, PluginHookMetricsKey};
 /// The stable event identifier and session tracker live together so a row
 /// update cannot select them independently. The eventual persisted aggregate
 /// map will own these entries and decide when a new one is admitted.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::telemetry) struct PluginHookAggregateState {
     event_id: EventId,
     session_counts: HookSessionCountTracker<PluginHookMetricsKey>,
@@ -27,6 +27,13 @@ impl PluginHookAggregateState {
             event_id: EventId::new(),
             session_counts: HookSessionCountTracker::new(key),
         }
+    }
+
+    /// Start an entry without bypassing production admission outside tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(in crate::telemetry) fn for_test(key: PluginHookMetricsKey) -> Self {
+        Self::new(key)
     }
 
     /// Select the event identifier and session tracker for `key` together.
@@ -63,6 +70,12 @@ impl SelectedPluginHookAggregate<'_> {
         self.event_id
     }
 
+    /// Return the aggregate key selected with the row identifier.
+    #[must_use]
+    pub(in crate::telemetry) const fn key(&self) -> &PluginHookMetricsKey {
+        self.session_counts.key()
+    }
+
     /// Borrow the session tracker selected with the row identifier.
     #[must_use]
     pub(in crate::telemetry) fn session_counts(
@@ -91,7 +104,7 @@ mod tests {
     use super::*;
     use crate::telemetry::{
         identity::SessionId,
-        schema::{HookAgent, HookOutcome, HookSurface, PluginBucket, UtcDay},
+        schema::{HookAgent, HookSurface, PluginBucket, PluginHookOutcome, UtcDay},
         state::{IDENTIFIER_WINDOW_TEST_STATE, TelemetryStateV1, recording_observation},
     };
 
@@ -165,7 +178,7 @@ mod tests {
             .select(&key)
             .unwrap()
             .session_counts()
-            .checked_record(0, Some(session_id), HookOutcome::Ok)
+            .checked_record(0, Some(session_id), PluginHookOutcome::Ok)
             .unwrap();
 
         let debug = format!("{aggregate:?}");

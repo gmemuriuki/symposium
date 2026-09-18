@@ -19,9 +19,13 @@ mod plugin_hook;
 mod session_counts;
 
 pub(in crate::telemetry) use lifecycle::{BoundRecordingObservation, BoundSessionObservation};
+pub(in crate::telemetry) use plugin_hook::SelectedPluginHookAggregate;
 pub(in crate::telemetry) use session_counts::{
     HookSessionCountSnapshot, HookSessionCountTracker, HookSessionCountUpdateError,
 };
+
+#[cfg(test)]
+pub(in crate::telemetry) use plugin_hook::PluginHookAggregateState;
 
 #[cfg(test)]
 pub(in crate::telemetry) const IDENTIFIER_WINDOW_TEST_STATE: &str = r#"version = 1
