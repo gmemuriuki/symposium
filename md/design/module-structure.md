@@ -173,6 +173,13 @@ recorder must remove the legacy `record` and `roll_off` paths in the same
 change, so two schemas and retention policies never share the telemetry
 directory.
 
+`LockedStorage` owns both the canonical paths and `TelemetryLock`, so private
+state cannot be loaded or replaced outside the lock. Its `private_state.rs`
+child performs a bounded byte read, distinguishes TOML syntax errors, invalid
+state content, and unsupported versions without retaining parser source text,
+serializes the complete state before replacement, and requires mutable access
+to replace it.
+
 ### `report.rs` — structured report layer
 
 Provides user-facing output for all commands via a custom tracing layer. Commands emit `tracing::info!` or `tracing::debug!` events with a `report = %ReportEvent::Variant { ... }` field; the `ReportLayer` intercepts these and renders them based on mode:

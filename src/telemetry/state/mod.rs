@@ -16,6 +16,9 @@ use super::{
     schema::UtcDay,
 };
 
+/// The only private-state schema version understood by this binary.
+pub(super) const STATE_VERSION: u64 = 1;
+
 mod extension_invocation;
 mod hook;
 mod lifecycle;
@@ -80,7 +83,7 @@ impl Serialize for StateVersion {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(1)
+        serializer.serialize_u64(STATE_VERSION)
     }
 }
 
@@ -90,9 +93,9 @@ impl<'de> Deserialize<'de> for StateVersion {
         D: Deserializer<'de>,
     {
         let version = u64::deserialize(deserializer)?;
-        if version != 1 {
+        if version != STATE_VERSION {
             return Err(D::Error::custom(format_args!(
-                "expected telemetry state version 1, found {version}"
+                "expected telemetry state version {STATE_VERSION}, found {version}"
             )));
         }
 
