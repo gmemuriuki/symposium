@@ -42,7 +42,8 @@ pub(in crate::telemetry) use session_counts::{
 #[cfg(test)]
 pub(in crate::telemetry) use {
     extension_invocation::ExtensionInvocationAggregateStore, hook::HookAggregateStore,
-    plugin_hook::PluginHookAggregateStore, public_row_budget::MAX_PUBLIC_ROWS_PER_DAY,
+    lifecycle::RecordingObservationError, plugin_hook::PluginHookAggregateStore,
+    public_row_budget::MAX_PUBLIC_ROWS_PER_DAY,
 };
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub(in crate::telemetry) const IDENTIFIER_WINDOW_TEST_STATE: &str = r#"version =
 [identity]
 key = "4242424242424242424242424242424242424242424242424242424242424242"
 identifier-window-anchor = "2026-08-03"
+latest-opened-day = "2026-08-03"
 "#;
 
 /// Build a recording context inside the shared test state's identifier window.
@@ -121,7 +123,9 @@ impl TelemetryStateV1 {
     /// # Errors
     ///
     /// Returns an error when the operating system cannot generate a secret key.
-    fn new(identifier_window_anchor: UtcDay) -> Result<Self, getrandom::Error> {
+    pub(in crate::telemetry) fn new(
+        identifier_window_anchor: UtcDay,
+    ) -> Result<Self, getrandom::Error> {
         let key = IdentityKey::generate()?;
         Ok(Self::with_key(identifier_window_anchor, key))
     }
@@ -135,8 +139,15 @@ impl TelemetryStateV1 {
                 key,
                 identifier_window_anchor,
                 return_cohort_anchor: None,
+                latest_opened_day: identifier_window_anchor,
             },
         }
+    }
+
+    /// Return the newest UTC day this state permits storage to modify.
+    #[must_use]
+    pub(in crate::telemetry) fn latest_opened_day(&self) -> UtcDay {
+        self.identity.latest_opened_day
     }
 
     /// Bind the stored key to the active identifier-window anchor.
@@ -176,6 +187,7 @@ struct IdentityState {
     identifier_window_anchor: UtcDay,
     #[serde(skip_serializing_if = "Option::is_none")]
     return_cohort_anchor: Option<UtcDay>,
+    latest_opened_day: UtcDay,
 }
 
 #[cfg(test)]
@@ -206,13 +218,13 @@ mod tests {
         return_cohort_anchor: &str,
     ) -> String {
         format!(
-            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"{identifier_window_anchor}\"\nreturn-cohort-anchor = \"{return_cohort_anchor}\"\n"
+            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"{identifier_window_anchor}\"\nreturn-cohort-anchor = \"{return_cohort_anchor}\"\nlatest-opened-day = \"{identifier_window_anchor}\"\n"
         )
     }
 
     fn state_without_return_cohort(key: &str) -> String {
         format!(
-            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\n"
+            "version = 1\n\n[identity]\nkey = \"{key}\"\nidentifier-window-anchor = \"2026-09-10\"\nlatest-opened-day = \"2026-09-10\"\n"
         )
     }
 
@@ -246,6 +258,7 @@ mod tests {
 
         assert_eq!(state.identity.identifier_window_anchor, day);
         assert!(state.identity.return_cohort_anchor.is_none());
+        assert_eq!(state.latest_opened_day(), day);
     }
 
     #[test]
@@ -331,6 +344,19 @@ mod tests {
 
         assert!(
             message.contains("unknown field `unexpected`"),
+            "unexpected rejection reason: {message}"
+        );
+    }
+
+    #[test]
+    fn latest_opened_day_is_required() {
+        let source =
+            state_without_return_cohort(KEY).replace("latest-opened-day = \"2026-09-10\"\n", "");
+
+        let message = rejection_message(&source);
+
+        assert!(
+            message.contains("missing field `latest-opened-day`"),
             "unexpected rejection reason: {message}"
         );
     }
