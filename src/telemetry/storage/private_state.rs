@@ -6,16 +6,15 @@ use std::{
     fs::File,
     io::{self, Read as _},
     path::Path,
-    str,
 };
-
-use serde::Deserialize;
 
 use super::{
     LockedStorage,
     atomic::{self, AtomicReplaceError},
 };
-use crate::telemetry::state::{STATE_VERSION, TelemetryStateV1};
+use crate::telemetry::state::{
+    StateContentError, StateDecodeError, TelemetryStateV1, decode, encode,
+};
 
 /// Safety ceiling for private state read into one recorder process.
 ///
@@ -24,71 +23,12 @@ use crate::telemetry::state::{STATE_VERSION, TelemetryStateV1};
 /// than twice its expected headroom while bounding corrupt input now.
 const MAX_PRIVATE_STATE_BYTES: usize = 16 * 1024 * 1024;
 
-/// A content-free reason that private state could not be decoded.
-///
-/// This type deliberately retains neither the state bytes nor parser errors:
-/// TOML diagnostics may contain the identity key in their source line or debug
-/// representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::telemetry) enum MalformedStateError {
-    TooLarge {
-        maximum: usize,
-    },
-    InvalidUtf8 {
-        valid_up_to: usize,
-    },
-    InvalidToml {
-        line: Option<usize>,
-        column: Option<usize>,
-    },
-    InvalidState {
-        line: Option<usize>,
-        column: Option<usize>,
-    },
-}
-
-impl fmt::Display for MalformedStateError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLarge { maximum } => write!(
-                formatter,
-                "telemetry private state exceeds the {maximum}-byte safety limit"
-            ),
-            Self::InvalidUtf8 { valid_up_to } => write!(
-                formatter,
-                "telemetry private state is not valid UTF-8 near byte {valid_up_to}"
-            ),
-            Self::InvalidToml {
-                line: Some(line),
-                column: Some(column),
-            } => write!(
-                formatter,
-                "telemetry private state contains invalid TOML at line {line}, column {column}"
-            ),
-            Self::InvalidToml { .. } => {
-                formatter.write_str("telemetry private state contains invalid TOML")
-            }
-            Self::InvalidState {
-                line: Some(line),
-                column: Some(column),
-            } => write!(
-                formatter,
-                "telemetry private state violates its schema at line {line}, column {column}"
-            ),
-            Self::InvalidState { .. } => {
-                formatter.write_str("telemetry private state violates its schema")
-            }
-        }
-    }
-}
-
-impl Error for MalformedStateError {}
-
 /// Failure to load private telemetry state while holding its lock.
 #[derive(Debug)]
 pub(in crate::telemetry) enum LoadStateError {
     Io(io::Error),
-    Malformed(MalformedStateError),
+    TooLarge { maximum: usize },
+    Content(StateContentError),
     UnsupportedVersion(u64),
 }
 
@@ -96,12 +36,14 @@ impl fmt::Display for LoadStateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(_) => formatter.write_str("failed to read telemetry private state"),
-            Self::Malformed(error) => error.fmt(formatter),
-            Self::UnsupportedVersion(version) => write!(
+            Self::TooLarge { maximum } => write!(
                 formatter,
-                "telemetry private state version {version} is unsupported; \
-                 this build supports version {STATE_VERSION}"
+                "telemetry private state exceeds the {maximum}-byte safety limit"
             ),
+            Self::Content(error) => error.fmt(formatter),
+            Self::UnsupportedVersion(version) => {
+                StateDecodeError::UnsupportedVersion(*version).fmt(formatter)
+            }
         }
     }
 }
@@ -110,7 +52,7 @@ impl Error for LoadStateError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Malformed(_) | Self::UnsupportedVersion(_) => None,
+            Self::TooLarge { .. } | Self::Content(_) | Self::UnsupportedVersion(_) => None,
         }
     }
 }
@@ -121,9 +63,12 @@ impl From<io::Error> for LoadStateError {
     }
 }
 
-impl From<MalformedStateError> for LoadStateError {
-    fn from(error: MalformedStateError) -> Self {
-        Self::Malformed(error)
+impl From<StateDecodeError> for LoadStateError {
+    fn from(error: StateDecodeError) -> Self {
+        match error {
+            StateDecodeError::Malformed(error) => Self::Content(error),
+            StateDecodeError::UnsupportedVersion(version) => Self::UnsupportedVersion(version),
+        }
     }
 }
 
@@ -154,11 +99,6 @@ impl Error for ReplaceStateError {
     }
 }
 
-#[derive(Deserialize)]
-struct StateEnvelope {
-    version: u64,
-}
-
 impl LockedStorage {
     /// Load and validate private state without retaining sensitive diagnostics.
     ///
@@ -172,15 +112,8 @@ impl LockedStorage {
         let Some(bytes) = read_bounded(self.paths.state_file())? else {
             return Ok(None);
         };
-        let source = str::from_utf8(&bytes).map_err(|error| MalformedStateError::InvalidUtf8 {
-            valid_up_to: error.valid_up_to(),
-        })?;
-        let envelope: StateEnvelope = parse_toml(source, ParseStage::Envelope)?;
-        if envelope.version != STATE_VERSION {
-            return Err(LoadStateError::UnsupportedVersion(envelope.version));
-        }
 
-        parse_toml(source, ParseStage::State).map(Some)
+        decode(&bytes).map(Some).map_err(Into::into)
     }
 
     /// Serialize completely, then atomically replace private state.
@@ -195,7 +128,7 @@ impl LockedStorage {
         &mut self,
         state: &TelemetryStateV1,
     ) -> Result<(), ReplaceStateError> {
-        let serialized = toml::to_string_pretty(state).map_err(ReplaceStateError::Serialize)?;
+        let serialized = encode(state).map_err(ReplaceStateError::Serialize)?;
         atomic::replace(self.paths.state_file(), serialized.as_bytes())
             .map_err(ReplaceStateError::Replace)
     }
@@ -212,60 +145,21 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, LoadStateError> {
     let mut bytes = Vec::new();
     file.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() > MAX_PRIVATE_STATE_BYTES {
-        return Err(MalformedStateError::TooLarge {
+        return Err(LoadStateError::TooLarge {
             maximum: MAX_PRIVATE_STATE_BYTES,
-        }
-        .into());
+        });
     }
 
     Ok(Some(bytes))
-}
-
-#[derive(Clone, Copy)]
-enum ParseStage {
-    Envelope,
-    State,
-}
-
-impl ParseStage {
-    fn malformed(self, line: Option<usize>, column: Option<usize>) -> MalformedStateError {
-        match self {
-            Self::Envelope => MalformedStateError::InvalidToml { line, column },
-            Self::State => MalformedStateError::InvalidState { line, column },
-        }
-    }
-}
-
-fn parse_toml<T>(source: &str, stage: ParseStage) -> Result<T, LoadStateError>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    toml::from_str(source).map_err(|error| malformed_toml(source, &error, stage).into())
-}
-
-fn malformed_toml(source: &str, error: &toml::de::Error, stage: ParseStage) -> MalformedStateError {
-    let (line, column) = error
-        .span()
-        .and_then(|span| source_position(source, span.start))
-        .map_or((None, None), |(line, column)| (Some(line), Some(column)));
-
-    stage.malformed(line, column)
-}
-
-fn source_position(source: &str, offset: usize) -> Option<(usize, usize)> {
-    let prefix = source.get(..offset)?;
-    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let column = prefix.rsplit('\n').next()?.chars().count() + 1;
-    Some((line, column))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{error::Error as _, fs};
 
-    use super::{LoadStateError, MAX_PRIVATE_STATE_BYTES, MalformedStateError, StateEnvelope};
+    use super::{LoadStateError, MAX_PRIVATE_STATE_BYTES};
     use crate::telemetry::{
-        state::{IDENTIFIER_WINDOW_TEST_STATE, TelemetryStateV1},
+        state::{IDENTIFIER_WINDOW_TEST_STATE, StateContentError, TelemetryStateV1},
         storage::LockedStorage,
     };
 
@@ -302,7 +196,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            LoadStateError::Malformed(MalformedStateError::InvalidUtf8 { .. })
+            LoadStateError::Content(StateContentError::InvalidUtf8 { .. })
         ));
     }
 
@@ -320,7 +214,7 @@ mod tests {
         };
         assert!(matches!(
             &error,
-            LoadStateError::Malformed(MalformedStateError::InvalidToml {
+            LoadStateError::Content(StateContentError::InvalidToml {
                 line: Some(_),
                 column: Some(_)
             })
@@ -346,7 +240,7 @@ mod tests {
 
         assert!(matches!(
             &error,
-            LoadStateError::Malformed(MalformedStateError::InvalidState {
+            LoadStateError::Content(StateContentError::InvalidState {
                 line: Some(_),
                 column: Some(_)
             })
@@ -400,9 +294,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            LoadStateError::Malformed(MalformedStateError::TooLarge {
+            LoadStateError::TooLarge {
                 maximum: MAX_PRIVATE_STATE_BYTES
-            })
+            }
         ));
     }
 
@@ -422,12 +316,5 @@ mod tests {
 
         assert_eq!(on_disk, IDENTIFIER_WINDOW_TEST_STATE.as_bytes());
         assert_eq!(reserialized, on_disk);
-    }
-
-    #[test]
-    fn version_envelope_ignores_fields_owned_by_the_selected_schema() {
-        let envelope: StateEnvelope = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
-
-        assert_eq!(envelope.version, 1);
     }
 }

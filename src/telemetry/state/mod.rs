@@ -27,6 +27,7 @@ mod public_row_budget;
 mod session_counts;
 mod session_pair;
 
+pub(in crate::telemetry) use codec::{StateContentError, StateDecodeError, decode, encode};
 pub(in crate::telemetry) use extension_invocation::{
     ExtensionSessionCountBaseline, ExtensionSessionCountSnapshot, ExtensionSessionCountUpdateError,
     SelectedExtensionInvocationAggregate,
