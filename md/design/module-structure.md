@@ -179,7 +179,10 @@ child performs a bounded byte read, distinguishes TOML syntax errors, invalid
 state content, and unsupported versions without retaining parser source text,
 serializes the complete state before replacement, and requires mutable access
 to replace it. Its `daily_files.rs` sibling recognizes only canonical event
-and metric filenames. When private state is absent, storage initializes the
+and metric filenames. Its `events.rs` sibling validates one-day low-volume
+batches, serializes every row before filesystem access, and appends them in one
+write after closing any partial final line left by an earlier failure. When
+private state is absent, storage initializes the
 high-water mark and identifier-window anchor from the later of the current UTC
 day and the newest surviving daily filename; malformed and unsupported state
 remain errors rather than entering this path.
