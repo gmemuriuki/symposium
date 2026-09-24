@@ -205,6 +205,8 @@ On load, Symposium rebuilds each daily public-row allowance from every surviving
 
 Management commands can wait for the lock. A crash can still lose the last batch or metric update, or leave a partial final event line; `status` reports that line as malformed and `show` preserves it.
 
+Before appending another batch, Symposium closes a nonempty partial final line with one newline. The new batch therefore remains independently readable, and that repair byte counts toward the daily allowance.
+
 Hook and extension-invocation counts are lower bounds. There is no durable all-cause dropped-update counter because contention, termination, and I/O failure can also prevent writing that counter.
 
 ## Size and expiry

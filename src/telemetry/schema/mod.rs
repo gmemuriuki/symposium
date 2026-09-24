@@ -89,6 +89,11 @@ pub(super) enum RowKind {
     StorageLimit,
 }
 
+/// Common daily-file ownership exposed by every strict versioned row.
+pub(super) trait VersionedRow {
+    fn day(&self) -> UtcDay;
+}
+
 /// Result of interpreting one physical telemetry line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowClassification {
@@ -101,20 +106,45 @@ pub(super) enum RowClassification {
 /// Telemetry row understood by this version of Symposium.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TelemetryRow {
+    LowVolume(LowVolumeRow),
+    // Box large aggregate rows so every enum value does not inherit their size.
+    HookMetrics(Box<HookMetricsV1>),
+    PluginHookMetrics(Box<PluginHookMetricsV1>),
+    ExtensionInvocationMetrics(Box<ExtensionInvocationMetricsV1>),
+}
+
+/// Append-only telemetry row understood by this version of Symposium.
+///
+/// Aggregate rows are deliberately absent, so they cannot enter the event-file
+/// append path by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LowVolumeRow {
     SessionStart(SessionStartV1),
     AgentConfiguration(AgentConfigurationV1),
     ResolutionSummary(ResolutionSummaryV1),
     PackageResolution(PackageResolutionV1),
     ExtensionResolution(ExtensionResolutionV1),
-    // Box large aggregate rows so every enum value does not inherit their size.
-    HookMetrics(Box<HookMetricsV1>),
-    PluginHookMetrics(Box<PluginHookMetricsV1>),
-    ExtensionInvocationMetrics(Box<ExtensionInvocationMetricsV1>),
     Command(CommandV1),
     StorageLimit(StorageLimitV1),
 }
 
-impl Serialize for TelemetryRow {
+impl LowVolumeRow {
+    /// Return the UTC day whose event file owns this row.
+    #[must_use]
+    pub(super) fn day(&self) -> UtcDay {
+        match self {
+            Self::SessionStart(row) => row.day(),
+            Self::AgentConfiguration(row) => row.day(),
+            Self::ResolutionSummary(row) => row.day(),
+            Self::PackageResolution(row) => row.day(),
+            Self::ExtensionResolution(row) => row.day(),
+            Self::Command(row) => row.day(),
+            Self::StorageLimit(row) => row.day(),
+        }
+    }
+}
+
+impl Serialize for LowVolumeRow {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -125,11 +155,22 @@ impl Serialize for TelemetryRow {
             Self::ResolutionSummary(row) => row.serialize(serializer),
             Self::PackageResolution(row) => row.serialize(serializer),
             Self::ExtensionResolution(row) => row.serialize(serializer),
+            Self::Command(row) => row.serialize(serializer),
+            Self::StorageLimit(row) => row.serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for TelemetryRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::LowVolume(row) => row.serialize(serializer),
             Self::HookMetrics(row) => row.serialize(serializer),
             Self::PluginHookMetrics(row) => row.serialize(serializer),
             Self::ExtensionInvocationMetrics(row) => row.serialize(serializer),
-            Self::Command(row) => row.serialize(serializer),
-            Self::StorageLimit(row) => row.serialize(serializer),
         }
     }
 }
@@ -446,19 +487,21 @@ pub(super) fn classify_row(line: &str) -> RowClassification {
     };
 
     match (envelope.kind.as_str(), envelope.version) {
-        ("session_start", 1) => deserialize_supported_row(line, TelemetryRow::SessionStart),
-        ("agent_configuration", 1) => {
-            deserialize_supported_row(line, TelemetryRow::AgentConfiguration)
-        }
-        ("resolution_summary", 1) => {
-            deserialize_supported_row(line, TelemetryRow::ResolutionSummary)
-        }
-        ("package_resolution", 1) => {
-            deserialize_supported_row(line, TelemetryRow::PackageResolution)
-        }
-        ("extension_resolution", 1) => {
-            deserialize_supported_row(line, TelemetryRow::ExtensionResolution)
-        }
+        ("session_start", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::SessionStart(row))
+        }),
+        ("agent_configuration", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::AgentConfiguration(row))
+        }),
+        ("resolution_summary", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::ResolutionSummary(row))
+        }),
+        ("package_resolution", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::PackageResolution(row))
+        }),
+        ("extension_resolution", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::ExtensionResolution(row))
+        }),
         ("hook_metrics", 1) => {
             deserialize_supported_row(line, |row| TelemetryRow::HookMetrics(Box::new(row)))
         }
@@ -468,8 +511,12 @@ pub(super) fn classify_row(line: &str) -> RowClassification {
         ("extension_invocation_metrics", 1) => deserialize_supported_row(line, |row| {
             TelemetryRow::ExtensionInvocationMetrics(Box::new(row))
         }),
-        ("command", 1) => deserialize_supported_row(line, TelemetryRow::Command),
-        ("storage_limit", 1) => deserialize_supported_row(line, TelemetryRow::StorageLimit),
+        ("command", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::Command(row))
+        }),
+        ("storage_limit", 1) => deserialize_supported_row(line, |row| {
+            TelemetryRow::LowVolume(LowVolumeRow::StorageLimit(row))
+        }),
         _ => RowClassification::UnknownSchema,
     }
 }
