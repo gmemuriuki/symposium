@@ -10,6 +10,7 @@
 mod atomic;
 mod daily_files;
 pub(in crate::telemetry) mod events;
+pub(in crate::telemetry) mod limits;
 mod lock;
 mod paths;
 mod private_state;

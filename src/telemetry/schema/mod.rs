@@ -128,6 +128,12 @@ pub(super) enum LowVolumeRow {
     StorageLimit(StorageLimitV1),
 }
 
+/// Maximum physical size of a version 1 `storage_limit` JSONL line.
+///
+/// The bound includes the terminating line feed. Readers use this wire-format
+/// limit to inspect the final event-file line without an unbounded read.
+pub(in crate::telemetry) const MAX_STORAGE_LIMIT_LINE_BYTES: usize = 2 * 1024;
+
 impl LowVolumeRow {
     /// Return the UTC day whose event file owns this row.
     #[must_use]
@@ -452,12 +458,22 @@ impl StorageLimitV1 {
     /// Create a marker for an operation rejected by the daily storage limit.
     #[must_use]
     pub(super) fn new(day: UtcDay, dropped_operation: DroppedOperation) -> Self {
+        Self::with_version(day, dropped_operation, SymposiumVersion::current())
+    }
+
+    /// Create a marker with an explicit producer version for size validation.
+    #[must_use]
+    fn with_version(
+        day: UtcDay,
+        dropped_operation: DroppedOperation,
+        symposium: SymposiumVersion,
+    ) -> Self {
         Self {
             version: SchemaVersion::V1,
             kind: Self::KIND,
             event_id: EventId::new(),
             day,
-            symposium: SymposiumVersion::current(),
+            symposium,
             dropped_operation,
         }
     }
@@ -474,6 +490,19 @@ pub(super) enum DroppedOperation {
     Init,
     Configuration,
     Command,
+}
+
+impl DroppedOperation {
+    /// Complete consent-version 1 vocabulary in contract order.
+    pub(in crate::telemetry) const ALL: [Self; 7] = [
+        Self::SessionStart,
+        Self::ManualSync,
+        Self::Use,
+        Self::Remove,
+        Self::Init,
+        Self::Configuration,
+        Self::Command,
+    ];
 }
 
 /// Classify a physical JSONL line and return typed data only for a known schema.
@@ -1154,6 +1183,17 @@ mod tests {
     }
 
     #[test]
+    fn prerelease_storage_limit_marker_has_v1_line_headroom() {
+        let day = UtcDay(NaiveDate::from_ymd_opt(2026, 8, 3).unwrap());
+        let version = format!("0.4.0-alpha.1+{}", "a".repeat(128));
+        let version = SymposiumVersion(Version::parse(&version).unwrap());
+        let row = StorageLimitV1::with_version(day, DroppedOperation::Configuration, version);
+        let physical_line_bytes = serde_json::to_vec(&row).unwrap().len() + 1;
+
+        assert!(physical_line_bytes <= MAX_STORAGE_LIMIT_LINE_BYTES / 2);
+    }
+
+    #[test]
     fn structurally_strict_row_rejects_future_version_when_deserialized_directly() {
         let example = example_row("storage_limit");
         let json = example.replacen(r#""v":1"#, r#""v":2"#, 1);
@@ -1185,6 +1225,8 @@ mod tests {
             (DroppedOperation::Command, "command"),
         ];
 
+        assert_eq!(DroppedOperation::ALL.len(), 7);
+        assert_eq!(cases.map(|(operation, _)| operation), DroppedOperation::ALL);
         assert_contract_names(&cases);
     }
 
