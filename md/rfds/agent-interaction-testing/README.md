@@ -1,226 +1,184 @@
 # Agent interaction testing
 
-## TL;DR
+## Summary
 
-- Add an experimental `cargo xtask agent-test` command for scripted journeys through real Symposium processes, terminals, isolated environments, and selected coding agents.
-- Reuse the existing fixture infrastructure. Ordinary `cargo test` remains the fast, exhaustive layer for Symposium logic.
-- Prove one tracer: accept or decline a dependency suggestion, repeat it in a fresh Linux container, and use one bounded Claude query to prove skill delivery.
-- Keep scenarios agent-neutral, treat paid runs as explicit and non-gating, and defer broader registry coverage and release policy until the tracer provides implementation evidence.
+Add an experimental `cargo xtask agent-test` orchestration command alongside the existing bimodal test harness for scripted journeys through real Symposium processes, native terminals, isolated environments, and selected coding-agent binaries.
+
+The first tracer tests dependency consent and skill delivery. A scripted user drives the real Symposium CLI, and a real pinned Claude binary talks to a local scripted model. The provider-free path is deterministic and can become a CI lane after its runtime and reliability are measured. Existing simulation and live-agent tests remain valid.
+
+## Decision sought
+
+This RFD asks for agreement on three decisions:
+
+1. Add an orchestration runner alongside the bimodal harness introduced in [PR #178](https://github.com/symposium-dev/symposium/pull/178) for interactions that require a compiled process, PTY, isolated user profile, container, or fixture-backed real agent binary.
+2. Test agent integration deterministically by placing a local fixture model beneath the real agent, rather than faking the agent or requiring a paid provider.
+3. Prove the architecture with accept and decline consent journeys before expanding to the rest of the registry contract.
+
+Acceptance does not commit Symposium to release gating, every agent, every registry behavior, or an effectiveness benchmark.
+
+The shared architecture is capability-based. Claude is the first implementation, not the definition of an agent. Adding a later adapter must not require changing existing scenario bodies, the runner's result vocabulary, or the meanings of advertised, loaded, and, when applicable, hook-completed evidence.
 
 ## Motivation
 
-The current integration suite has strong fixture and in-process coverage, but it cannot exercise every production boundary. `symposium-testlib::with_fixture` runs agent tests only when `SYMPOSIUM_ENABLE_AGENT_TESTING` is set, and the current agent path does not provide a fresh agent home, a real terminal conversation, or container isolation.
+The current integration suite has strong fixture and in-process coverage, but some production boundaries remain untested. `symposium-testlib::with_fixture` can simulate hooks or ask a configured live model to trigger them. It does not provide a fresh agent home, a real consent interaction, or container isolation.
 
-The discovery prompt is a concrete unreachable branch. `Output::is_interactive` requires terminal stdin and stdout, and `discovery::prompt_for_consent` returns without asking when that condition is false. Existing tests can verify discovery and noninteractive behavior, but they cannot select Enable or No through the interface a user sees.
+The discovery prompt is one concrete blind spot. `Output::is_interactive` requires terminal stdin and stdout, so captured tests cannot choose the options a user sees. The compiled process has another blind spot: report output can contaminate hook stdout before the hook protocol response is written. Calling `execute_hook` in-process cannot observe that binary-level failure.
 
-The compiled process also has behavior that an in-process assertion cannot observe. `src/bin/cargo-agents.rs` installs the normal report layer before identifying a hook command, so report output can precede the hook protocol payload on stdout even though the hook later uses `Output::quiet()`. A black-box process test is required to expose that failure.
+The missing evidence is not more coverage of internal functions. We need to start from controlled files and configuration, execute the checkout binary, provide user input, start a supported agent binary, and inspect the terminal, events, requests, and final state.
 
-The missing evidence is therefore not more unit coverage. We need to start from controlled directories and configuration, execute the production command, provide user input, and inspect the visible output, structured decisions, and resulting state. A selected real agent is needed only to prove that Symposium-delivered capability crosses into the agent.
+This RFD does not evaluate whether an agent writes better Rust. Effectiveness evaluation needs baselines, repeated samples, and quality judgments. This harness tests whether specified Symposium interactions and delivery boundaries work.
 
-This RFD does not evaluate whether an agent writes better Rust. Effectiveness evaluation requires a baseline, repeated samples, and statistical analysis. The tracer proves integration behavior, not causal improvement.
+## Guide-level walkthrough
 
-## Change in a nutshell
-
-The first accepted journey starts with an empty Symposium home, an empty agent configuration, and a Rust project whose dependency embeds a plugin awaiting consent:
+The tracer starts with a Rust project whose dependency offers a fixture skill. The runner creates controlled Symposium, user-profile, Cargo, and agent roots, disables external updates and public registries, and then acts like a user:
 
 ```text
-run cargo agents init --add-agent claude
+run cargo agents init for the selected agent over pipes
 run cargo agents sync under a PTY
-wait for the dependency suggestion
-choose Enable
-assert the visible prompt, structured events, exit status, config, and files
-repeat the journey in a fresh Linux container
-run one bounded query through the Claude adapter
-assert the scenario nonce from the installed fixture skill
+wait for the consent prompt
+select Enable
+wait for the process to exit
+assert the decision, configuration, and installed files
 ```
 
-A separate decline scenario starts from fresh state, selects "No, don't ask again," restarts the CLI, and proves that the decision persists and the prompt does not return.
+The decline journey selects the persistent decline option. It runs `sync` again, waits for completion, and verifies that the prompt did not return. The [tracer chapter](./tracer/README.md) owns the exact prompt and key sequences.
 
-The design follows these invariants:
+The fixture-agent variants continue the journey. The first adapter starts the real pinned Claude CLI against a local Anthropic-compatible endpoint. A project-scoped control skill proves that the adapter can still observe skill advertisement and loading. Because Symposium registers hooks for Claude, an independent control hook also proves that Claude loaded and executed the configured `SessionStart` hooks. The accepted Symposium skill must then be advertised and loaded; the declined skill must remain absent before and after Symposium's hook.
 
-- Authoritative CLI assertions execute the compiled `cargo-agents` binary. Interactive commands use a PTY; hooks use pipes.
-- Scenario registration metadata declares fixtures, capabilities, permissions, contracts, and budgets before execution. An asynchronous Rust body drives the journey through a constrained context.
-- Host and container backends run the same scenario body. A requested environment never silently falls back to another.
-- A real agent is used only when delivery into that agent is the behavior under test. Every paid query has a narrow capability witness and hard resource limits.
-- Visible terminal output, structured events, and final state must agree. No one observation channel substitutes for the others.
+No provider key or paid model is involved in this conformance path. Existing live-provider tests remain available through their current explicit gate; the new runner does not add another live path.
 
-## Detailed plans
+## Design principles
 
-### Behavioral contract
+### Preserve the existing suite
 
-The harness is intended to prove that Symposium:
+The new runner reuses `symposium-testlib` fixtures and assertions. It does not replace `TestContext`, `TestMode`, the `cargo test-agent` alias, or existing tests from [PR #178](https://github.com/symposium-dev/symposium/pull/178).
 
-- discovers extensions relevant to the current project;
-- respects trust and explicit user choices;
-- installs and removes the expected configuration and files;
-- delivers selected skills, hooks, MCP servers, and subcommands across the agent boundary; and
-- reports failures without leaking host state or credentials.
+Existing `AgentOnly` tests and the agent half of `Any` remain the sole live-provider path. Their natural-language prompts depend on model judgment and cannot run against a scripted fixture unchanged. New fixture-agent scenarios declare their scripted model responses explicitly.
 
-Accepted RFDs and reference documentation define the expected behavior when the implementation disagrees. For example, the [accepted discovery contract](../registry-centric-plugins/discovery-sync/README.md#enablement-configuration) gives `disable` precedence over `use` and `auto-enable`. The [coverage table](./coverage-and-ci/README.md#contract-table) records an implementation discrepancy as a gap or follow-up instead of treating current behavior as the contract.
+### Test the production boundary that matters
 
-### Reference-level design
+Library logic stays in library tests. Pipes-only binary regressions stay under `cargo test`. Interactive journeys use a native PTY through `cargo xtask agent-test`. Agent delivery is tested only when the behavior can fail inside the agent.
 
-The new engine is additive. Existing fixtures, `TestContext`, simulations, and deterministic tests remain. `cargo test` owns fast coverage, including deterministic black-box process regressions. `cargo xtask agent-test` orchestrates explicit environments, credentials, containers, filtering, artifacts, and real-agent execution.
+### Make negative evidence meaningful
 
-The supporting chapters are the authoritative homes for the detailed contracts:
+The fixture-agent journey always proves that a project-scoped control skill works before interpreting Symposium evidence. When Symposium supports hooks for the selected agent, an independent control hook must work as well; skills-only integrations report the hook assertion as unsupported instead of failing or weakening the skill witness. A decline cannot pass merely because the agent started with skills disabled, used a different configuration scope, or changed its request protocol.
 
-- [Scenario model](./scenario-model/README.md) defines registration metadata, imperative Rust bodies, the production process boundary, PTY scripting, and controlled time-dependent state.
-- [Agent adapters](./agent-adapters/README.md) defines the provisional driver, Claude, later ACP and fake adapters, capability witnesses, permissions, and runtime pinning.
-- [Execution environments](./environments/README.md) defines host and container isolation, native operating-system coverage, binary provenance, networking, fixture trust, and authentication.
-- [Evidence and results](./evidence/README.md) defines observation channels, the event journal, assertions, result classification, retries, cleanup, and artifact safety.
-- [Coverage and CI](./coverage-and-ci/README.md) defines the contract table, coverage layers, tracer obligations, command interface, cost controls, and CI boundaries.
-- [Proposed guide](./proposed-guide/README.md) shows the intended developer-facing workflow.
+### Separate profiles from environments
 
-### Scope and compatibility
+Simulation, real-process, and fixture-agent are the profiles relevant to the new runner. Existing live-agent tests retain their current frontend and configuration. Host and Linux container are environments. A scenario declares its profile; selecting another command-line option never changes the meaning of that scenario.
+
+### Keep agent protocols behind adapters
+
+Scenarios request semantic capabilities such as project-skill installation, fixture-model execution, skill advertisement, skill loading, and, where Symposium supports it, hook completion. An adapter owns the config name, inventory paths, environment variables, lifecycle events, and protocol fields that prove those outcomes. Claude's `Skill` tool, `hook_response`, and configuration files are therefore adapter details, not shared scenario concepts.
+
+### Prefer evidence over prose
+
+The runner checks the rendered screen, structured events, process identity, exact files, hook lifecycle, and model requests. Model prose is diagnostic rather than a product assertion.
+
+## Scope
 
 This RFD is complete when:
 
-- the accept and decline journeys execute as real native processes through a parsed PTY;
-- visible output, structured events, exit status, configuration, and filesystem state agree;
-- the same journeys pass in a fresh Linux container;
-- the accepted branch produces one bounded Claude capability witness containing its scenario nonce; and
-- failures produce sanitized, useful artifacts with measured phase timing and provider usage.
+- hook stdout contains only the selected agent protocol;
+- accept and decline run through parsed PTYs on Windows and Linux hosts;
+- structured consent evidence does not change normal human output;
+- every process proves that it ran the planned checkout binary;
+- host execution cannot resolve agent configuration through the developer's real user profile;
+- Claude global hooks follow `CLAUDE_CONFIG_DIR`, including cleanup of the legacy location;
+- pinned Claude completes against the local fixture without public network access;
+- the project-scoped control skill is advertised and loaded;
+- the independent control hook survives Symposium configuration writes and completes successfully;
+- the accepted Symposium skill is advertised and loaded;
+- the declined Symposium skill remains absent before and after `SessionStart`; and
+- the fixture-agent journey passes in a fresh Linux container.
 
-The tracer also fixes the known hook stdout contamination and adds its process-level regression. This provides an immediately useful result before the larger harness is complete.
+This RFD does not commit to every consent branch, exhaustive registry scenarios, persistent conversations, fixture support for ACP or other agents, native Windows agent conformance, native macOS coverage, scheduled live-provider execution, or release gating.
 
-This RFD does not commit to every consent branch, exhaustive registry scenarios, persistent agent conversations, fake or ACP conformance, native Windows and macOS agent runs, hook and MCP delivery witnesses, scheduled real-agent execution, or release gating. Those remain [post-tracer direction](./coverage-and-ci/README.md#post-tracer-direction).
+## Reading guide
 
-The new command does not replace or reinterpret existing test results. Existing `cargo test` fixtures and assertions remain valid, and deterministic regressions continue to belong there when they can observe the production boundary. The agent-test runner adds a second, explicitly selected frontend for journeys that require a real terminal, controlled home, container, or agent.
+The RFD is organized in the order a reviewer should read it:
 
-### Safety and interpretation boundaries
+1. **[The first tracer](./tracer/README.md)** defines the exact interactions and evidence this RFD commits to.
+2. **[Harness architecture](./architecture/README.md)** generalizes the reusable profiles, scenario model, adapters, environments, and result contract.
+3. **[Implementation plan](./implementation/README.md)** divides the work into independently mergeable packages with explicit verification.
+4. **[Proposed guide](./proposed-guide/README.md)** shows the developer-facing workflow after implementation.
 
-Scenario fixtures are repository-owned and reviewed. An extension awaiting user consent is not treated as hostile code. The container improves reproducibility and least privilege; it is not a sandbox for testing malicious plugins, hooks, MCP servers, or agents.
+The root document owns the decision and scope. The tracer owns concrete behavior. The architecture owns reusable interfaces. The implementation chapter owns sequencing and rollout.
 
-The isolation canary proves that a named decoy capability did not enter the controlled agent state. The scenario nonce proves that the selected fixture capability did enter the agent. Neither witness proves that the agent followed general instructions or produced high-quality code.
+## Drawbacks
 
-Claude is the first production adapter because it is available to current developers. The scenario and driver contracts use agent-neutral concepts, but one adapter does not prove behavioral consistency across agents. The driver remains provisional until later fake and ACP implementations test the boundary.
+The runner creates a second test frontend that must remain aligned with ordinary fixtures and assertions.
 
-### Drawbacks
+The fixture-model adapter depends on Claude behavior that is not a stable public request-shape contract. A feasibility spike, version pin, project-scoped control skill, and independent control hook contain that risk, but every pin update still requires adapter maintenance.
 
-The runner creates a second test frontend with its own scenario registration, preflight, artifact, and result code. Even though it reuses fixtures and assertions, maintainers must keep its behavior aligned with `cargo test` and the production CLI.
+Docker, pinned agent artifacts, and native PTYs increase setup and runtime compared with `cargo test`. The Linux fixture-agent lane is therefore only a CI candidate until measured.
 
-Docker and provider credentials raise the contribution barrier. Most contributors can run the host, agent-free journeys, but reproducing Linux isolation or the Claude witness requires additional software, credentials, and provider access.
+The tracer is narrow. Passing it proves consent, `SessionStart`, and skill delivery for the named journey, not broad registry conformance or improved agent output.
 
-Real-agent execution is nondeterministic, slower, and paid. Narrow witnesses and hard budgets limit those risks; they do not eliminate provider outages, model changes, or occasional inconclusive runs.
+## Rationale and alternatives
 
-The tracer covers only consent and skill delivery. A passing tracer could create false confidence if it is presented as broad registry or agent conformance. Reports must identify the exact contracts and evidence each journey proves.
+### Extend only the existing bimodal harness
 
-PTY behavior differs across operating systems, so Linux container success cannot satisfy native Windows or macOS requirements. The tracer proves Linux container behavior and the host platform used during development; native expansion remains separate work.
+[PR #178](https://github.com/symposium-dev/symposium/pull/178) established a useful model: the same hook-oriented test can simulate an agent with `execute_hook` or ask a configured live agent to cause the hook. Adding a fixture-agent mode there would improve hook tests, and remains a future option.
 
-Container preparation adds runtime beyond the current in-process suite. The runner reports checkout build or image preparation separately from warm startup, agent execution, and evidence processing so the team can decide which agent-free scenarios are suitable for pull-request CI.
+It is not sufficient for this tracer. Consent is an interactive process that occurs before the agent starts, and process identity, PTY state, isolated user profiles, and containers are run-wide concerns. Putting those responsibilities inside `with_fixture` would make library-oriented tests own external orchestration. The new frontend therefore complements the bimodal harness instead of replacing it.
 
-### Rationale and alternatives
+### Fake the agent instead of the model
 
-The selected design keeps exhaustive deterministic coverage in `cargo test` and adds an opt-in orchestrator only for evidence that the existing frontend cannot obtain. This separates inexpensive product logic from process, terminal, isolation, and provider costs.
+A fake agent can test a driver interface but cannot prove that a supported agent binary discovers Symposium hooks and skills. Running the real agent over a scripted model preserves that boundary while controlling the nondeterministic part.
 
-#### Extend only the existing test harness
+### Stop at process and PTY tests
 
-One test command and one fixture API would be simpler. The existing harness should continue to gain deterministic process regressions where practical, including the hook stdout test. It cannot make provider credentials, Docker, PTY interaction, and paid execution safe defaults for ordinary `cargo test`, however. Keeping those concerns in an explicit command preserves the current suite's speed and accessibility.
+This would prove consent and installed files without proving that an agent can advertise or load the installed skill. The fixture-agent profile crosses that final boundary without a provider call.
 
-#### Stop at black-box process and PTY tests
+### Generalize every agent now
 
-This would prove discovery, consent, hook output, and persisted state without provider cost. It would not prove that a capability installed by Symposium is visible inside a supported agent. One bounded nonce query is retained because crossing that final boundary is a central claim of the integration.
+Agent CLIs use different configuration and model protocols. Generalizing before one adapter works would design an abstraction without implementation evidence. Claude is the first adapter; a later second adapter will test whether the boundary is portable.
 
-#### Describe complete journeys as data
+If that second adapter requires changes to existing scenario bodies or result meanings, the adapter boundary was wrong and must be revised. Agent-specific implementation work, such as a new protocol fixture, version pin, configuration resolver, and evidence parser, is expected.
 
-A fully declarative format could be serialized and generated by external tools. It would also require a scenario interpreter and concentrate errors from an entire journey at the interpreter boundary. Declarative registration metadata is retained for preflight and discovery, while an imperative asynchronous Rust body provides normal control flow and local `?` failure sites.
+## Prior art
 
-#### Add persistent agent sessions immediately
+[`cli-testing-library`](https://github.com/crutchcorn/cli-testing-library) supplies the useful vocabulary of waiting for rendered screen state and sending user input. This RFD adopts that interaction model with a native Rust PTY implementation.
 
-Persistent sessions will be useful for confirmation and restart journeys that span multiple agent turns. The tracer uses one query, so a session abstraction would be designed without an exercising scenario. The adapter begins with a bounded single-query capability and grows only when a committed journey requires persistence.
+[Symposium PR #178](https://github.com/symposium-dev/symposium/pull/178) introduced the existing simulation-or-live-agent harness. This RFD preserves that boundary and adds orchestration only for journeys it cannot express.
 
-#### Make the container conditional on host leakage
+[Codex response fixtures](https://github.com/openai/codex/blob/main/codex-rs/core/tests/common/responses.rs) run agent logic against scripted model responses and retain outbound requests for structured assertions. They are a direct precedent for putting a deterministic model fixture beneath real agent behavior.
 
-The host canary can show whether a named decoy entered the controlled agent home. It cannot control installed tools, networking, system libraries, or operating-system behavior. The Linux container is therefore retained as a reproducibility boundary even when the host canary passes.
+[Claude plugin evals](https://code.claude.com/docs/en/plugin-evals) use fresh isolated sessions, with and without arms, tool-use graders, fixtures, and bounded runs. Symposium adopts the positive-control and negative-probe ideas while avoiding provider calls in its conformance path.
 
-#### Do nothing
+[SWE-bench](https://github.com/SWE-bench/SWE-bench/blob/main/swebench/harness/constants/__init__.py) distinguishes a failed test from an errored execution. The runner similarly separates Symposium contract failures from infrastructure errors.
 
-The current suite would remain unable to select both consent outcomes through the terminal, detect some compiled-process output failures, or prove that an installed capability reaches a real agent. Those are the specific blind spots this RFD exists to close.
+[agent-rules issue #19](https://github.com/yasuyuki/agent-rules/issues/19) separates installed files, native advertisement, loaded content, and rollback-time absence, and uses per-run witnesses plus negative controls to prevent vacuous success. The tracer applies the same evidentiary pattern to Symposium delivery.
 
-### Prior art
+Rust's experimental [libtest JSON output RFC](https://rust-lang.github.io/rfcs/3558-libtest-json.html) separates structured events from presentation and stages a new harness before stabilization. This RFD similarly keeps the runner experimental and preserves existing test behavior.
 
-[`cli-testing-library`](https://github.com/crutchcorn/cli-testing-library) provides a useful interaction vocabulary based on querying visible screen state and sending user events. This RFD adopts that model for parsed PTY interaction, but not its Node implementation or platform limitations.
+Claude documents its supported [LLM gateway](https://code.claude.com/docs/en/llm-gateway), [configuration directory](https://code.claude.com/docs/en/claude-directory), and [CLI](https://code.claude.com/docs/en/cli-reference) surfaces. Exact skill request placement remains a pinned adapter assumption established by the first implementation step.
 
-[`cli-testing-specialist`](https://github.com/sanae-abe/cli-testing-specialist) demonstrates generated tests for general CLI behavior. Symposium journeys need product-specific fixtures, discovery contracts, persisted consent, hook protocols, MCP evidence, and agent delivery, so generic command validation is not the central abstraction here.
+## Unresolved questions
 
-The existing Symposium integration harness supplies the fixture composition and deterministic assertions that the new runner reuses. Its strengths argue for an additive frontend rather than replacement; its inability to provide controlled interactive and agent boundaries identifies where the addition begins.
+No policy question blocks implementation. Two implementation checkpoints remain.
 
-Rust's experimental [libtest JSON output RFC](https://rust-lang.github.io/rfcs/3558-libtest-json.html) separates structured test events from presentation and validates a new harness interface before stabilization. This RFD follows the same lessons through a structured evidence channel and an experimental runner, without adopting libtest's event protocol.
+### Claude fixture checkpoint
 
-### Unresolved questions
+Package 1 must establish:
 
-No design question currently blocks acceptance. The tracer contract, scope, evidence layers, and ownership boundaries are defined.
+- the request shapes that advertise and load skills for the pinned Claude version;
+- how the local fixture completes every request without public network access;
+- whether Claude passes the Symposium event-directory variable to hook subprocesses or requires the controlled settings `env` fallback;
+- whether `hook_response` exposes hook-output parsing or only lifecycle success; and
+- which agent settings suppress unrelated traffic and persistence.
 
-Implementation must still establish:
+If the checkpoint cannot satisfy those requirements, fixture-agent implementation stops and the RFD returns to discussion. The runner must not substitute a paid provider or weaken the witness.
 
-- which PTY implementation satisfies the parsed-terminal contract on the initial host platform;
-- whether the Claude adapter can report trustworthy usage and expose the controlled custom-skill inventory without agent-specific behavior leaking into scenarios; and
-- the measured cold preparation, warm startup, provider usage, and total cost of the container-backed witness.
+### Windows PTY checkpoint
 
-These measurements may refine internal interfaces and limits. If an implementation result makes a required witness or isolation guarantee infeasible, the contract returns to discussion rather than being weakened silently.
+Before package 3 commits to Windows consent journeys, a focused experiment must establish that `portable-pty` can inject the current `dialoguer` arrow and Enter inputs through ConPTY and that `vt100` observes the rendered selection. Failure returns the Windows PTY design to discussion; it does not silently skip the platform.
 
-Scheduling, release gating, persistent sessions, additional adapters, and native operating-system coverage are deliberately deferred. They are future design questions, not acceptance blockers for the tracer.
+## Future possibilities
 
-### Future possibilities
+Existing `HookStep` values could later compile into scripted model tool calls, giving selected live-only tests deterministic real-agent coverage.
 
-Additional registry journeys can register new metadata and bodies against the same `ScenarioContext`. New agents can implement the adapter contract without adding agent-specific paths to scenarios. Persistent conversations can become an adapter capability when the first multi-turn journey supplies a concrete test. CI and release policy can be designed from measured reliability, runtime, and cost instead of estimates.
+Further registry, cache, predicate, hook, and MCP journeys can reuse the harness. Additional agents can implement the semantic adapter capabilities after Claude establishes the boundary. A second adapter should be added before the interface is treated as stable. CI and release policy can be designed from measured reliability and runtime.
 
-These extensions build on the process, scenario, environment, adapter, and evidence boundaries established here; none requires replacing the tracer architecture. They are not commitments of this RFD and are not independent reasons to accept it.
-
-### Proposed documentation
-
-The [agent interaction test guide](./proposed-guide/README.md) is written as the developer documentation should read once the experimental command exists. It explains scenario discovery, host and container execution, paid-run confirmation, budgets, results, artifacts, scenario authoring, and the initial CI boundary.
-
-## Frequently asked questions
-
-### What does a passing real-agent journey prove?
-
-It proves the contracts named by that journey and only those contracts. For the tracer, matching terminal, event, exit, and state evidence proves the consent behavior; an exact controlled inventory plus the scenario nonce proves that the fixture skill crossed into the selected agent. It does not prove general response quality or all registry behavior.
-
-### Is this an agent-effectiveness evaluation?
-
-No. Effectiveness evaluation compares outcomes, needs a baseline and repeated samples, and may judge code quality. This harness verifies that specified Symposium interactions and delivery boundaries work. Effectiveness studies may later use the harness as execution infrastructure, but their claims and methodology remain separate.
-
-## Implementation plan and status
-
-Implementation has not begun. Each step leaves the repository with an independently useful, passing result.
-
-### Step 1: Fix hook stdout at the process boundary
-
-Change hook execution so stdout contains only the selected agent's protocol payload. Add a deterministic black-box regression that spawns the compiled hook command with piped stdin, stdout, and stderr.
-
-The new agent-test runner, PTY support, containers, and agent adapters remain absent.
-
-- [ ] Verify that stdout parses as the expected hook protocol and that human report output is absent.
-- [ ] Run the existing hook and integration tests.
-
-### Step 2: Run the host consent journeys
-
-Add scenario registration metadata, the constrained asynchronous `ScenarioContext`, the `cargo xtask agent-test` frontend, the structured side channel, and the minimum PTY driver needed for dependency-consent accept and decline. Reuse the current fixture composition and assertion helpers.
-
-Containers and real-agent execution remain absent. Reconcile the contract table with the executable scenario names after the journeys pass; do not add catalog code generation.
-
-- [ ] Verify accept and decline against terminal anchors, structured events, exit status, configuration, filesystem state, the host-state canary, and exact fixture-controlled custom-skill inventory.
-- [ ] Verify every `Covered` contract row names an executable scenario and every `Gap(issue)` row names an issue and failing reproducer.
-
-### Step 3: Run the same journeys in Linux
-
-Add Docker execution, a content-addressed Linux Symposium binary, least-privilege container rules, disabled scenario networking, cleanup, and infrastructure diagnostics. Run the Step 2 scenario bodies unchanged.
-
-Provider egress, credentials, and real-agent execution remain absent.
-
-- [ ] Verify cold preparation and warm startup separately.
-- [ ] Verify the host-state canary, custom-skill inventory, cleanup, and parity with the remaining host assertions.
-
-### Step 4: Add one real-agent delivery witness
-
-Add the bounded Claude adapter and extend the container-backed accepted branch with one fixture-skill query. Pin the runtime and add only the allowlisted provider egress and restricted API-key handling required by that query.
-
-Persistent conversations, other agents, scheduled execution, and release gating remain absent.
-
-- [ ] Verify the capability nonce, exact pre-query custom-skill inventory, installation and hook-registration evidence, usage limits, redaction, cleanup, and error classification.
-- [ ] Record phase timing, provider usage, and conservative cost from an explicitly confirmed manual run without automatic paid retries.
-
-Before closing the RFD, correct `md/design/running-tests.md` so it documents the `SYMPOSIUM_ENABLE_AGENT_TESTING` gate. Keep `TestMode::AgentOnly`, `test-agents.toml`, and `tests/agent_harness/run_scenario.py` temporarily for existing Claude and ACP coverage, but mark that path as superseded and add no new scenarios to it. File its removal with the ACP follow-up after the remaining scenarios migrate.
-
-Closing the RFD also requires follow-up issues or RFDs for catalog automation, fake and ACP conformance, remaining scenario families, native operating-system expansion, and release CI graduation.
+These are directions, not commitments of this RFD.
