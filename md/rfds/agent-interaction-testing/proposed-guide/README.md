@@ -1,8 +1,8 @@
 # Agent interaction tests
 
-Agent interaction tests exercise Symposium with scripted users, real processes, and selected real coding agents. They complement ordinary tests: use deterministic tests for exhaustive Symposium logic and these journeys when the process, terminal, user, or agent boundary is itself under test.
+Agent interaction tests script user input through real Symposium processes and, when needed, run a real coding-agent binary against a local model fixture. They complement ordinary tests; they do not replace them.
 
-The feature is experimental. Real-agent runs consume provider capacity and are opt-in.
+The feature is experimental.
 
 ## Discover scenarios
 
@@ -10,106 +10,162 @@ The feature is experimental. Real-agent runs consume provider capacity and are o
 cargo xtask agent-test --list
 ```
 
-The scenario list reports required agent, environment, operating-system, and witness capabilities. The contract table maps the tracer's Symposium promises to executable scenarios and linked product gaps.
+The list reports each scenario's execution profile, supported environments, agent capabilities, available adapters, and contract IDs. Running the command without `--scenario` prints an execution plan and exits without starting a process.
 
-Running `cargo xtask agent-test` without a scenario prints an execution plan and does not start an agent.
-
-Repeat `--scenario` to select more than one journey:
+`--scenario` is repeatable:
 
 ```console
-cargo xtask agent-test --agent claude --environment container --auth api-key --confirm-paid-run --scenario dependency-consent-accept --scenario dependency-consent-decline
+cargo xtask agent-test \
+  --agent claude \
+  --scenario dependency-consent-accept \
+  --scenario dependency-consent-decline
 ```
 
-## Run on the host
+## Run the host consent journeys
 
 ```console
-cargo xtask agent-test --agent claude --environment host --auth local --confirm-paid-run --scenario dependency-consent-accept
+cargo xtask agent-test \
+  --environment host \
+  --agent claude \
+  --scenario dependency-consent-accept
 ```
 
-The host runner creates fresh project, Symposium, agent, cache, and temporary directories. Local authentication is used only when explicitly requested. If the adapter cannot separate credentials from normal agent configuration, the result is marked non-authoritative. Local authentication also cannot claim the tracer key's $5 provider cap; the execution plan reports that limitation while retaining the scenario's hard token and operation limits.
+The runner creates fresh project, Symposium, agent, cache, event, and artifact directories. Before the first command it writes only harness policy, including disabled auto-update, telemetry, and public built-in registries.
 
-Host runs are useful for debugging but may still be affected by installed tools and the operating system.
+Initialization runs over pipes. Consent sync runs under a native PTY. The runner verifies that the PTY was actually created, waits for the rendered prompt, sends explicit keys, waits for exit, and compares the terminal, events, configuration, and files.
+
+The runner waits for the rendered consent prompt and selects the scenario's declared answer. It does not send input before the prompt is observable.
+
+## Run with a real agent and fixture model
+
+```console
+cargo xtask agent-test \
+  --environment host \
+  --agent claude \
+  --scenario dependency-consent-accept-agent-fixture
+```
+
+This selects the first fixture adapter, which starts the pinned real Claude CLI but sends its model requests to a local scripted endpoint. It uses no provider credentials and incurs no model charge.
+
+The runner checks the Claude version before starting. The selected adapter installs a control skill beside Symposium's skill in the same project scope and, because Symposium supports Claude hooks, installs an independent control hook in the isolated Claude profile. Both controls must work before the Symposium result is interpreted.
+
+Scenario names are agent-neutral. `--agent claude` chooses the adapter that translates shared evidence such as advertised, loaded, and hook completed into Claude-specific request and lifecycle observations. A later adapter can run the same scenario without changing its behavior or result meanings.
+
+The host fixture-agent path is supported on the development platforms established by the adapter spike. Windows fixture-agent execution is best effort during the tracer; Windows agent-free PTY execution is required.
 
 ## Run Linux conformance
 
 ```console
-$env:ANTHROPIC_API_KEY = "..."
-cargo xtask agent-test --agent claude --environment container --auth api-key --confirm-paid-run --scenario dependency-consent-accept
+cargo xtask agent-test \
+  --environment container \
+  --agent claude \
+  --scenario dependency-consent-accept-agent-fixture
 ```
 
-The runner prepares a pinned base image and one content-addressed Linux `cargo-agents` build from the checkout. Each scenario receives a fresh restricted container. Scenario runtime is hermetic except for the selected agent provider.
+The runner prepares pinned Symposium and Claude artifacts and starts a fresh restricted Linux container. The scenario has no public egress and no provider credentials. Its only network connection is to the local model fixture and any scenario-declared local service.
 
-To test an existing compatible Linux artifact:
+To test an existing compatible Symposium artifact:
 
 ```console
-cargo xtask agent-test --agent claude --environment container --auth api-key --confirm-paid-run --symposium-bin ./artifacts/cargo-agents-linux-x86_64 --scenario dependency-consent-accept
+cargo xtask agent-test \
+  --environment container \
+  --agent claude \
+  --symposium-bin ./artifacts/cargo-agents-linux-x86_64 \
+  --scenario dependency-consent-accept-agent-fixture
 ```
 
-The override is checked for operating system, architecture, executable format, and available version metadata. The runner never substitutes a released package, PATH binary, host environment, or different execution backend silently.
+The runner validates the override's platform, version metadata, and digest, stages it first on the controlled `PATH`, and proves which binary Cargo and agent-spawned hooks selected. It never silently uses an ambient released binary.
 
 ## Read the execution plan
 
-Before a paid run, the plan reports information such as:
+A fixture-agent plan includes information such as:
 
 ```text
-Selected scenarios:       2
-CLI-only scenarios:       1
-Real-agent scenarios:     1
-Maximum agent turns:      1
-Maximum provider requests: 4
-Maximum tool calls:       3
-Input-side token guard:   25,000
-Output-token guard:       1,000
-Per-run cost allowance:   $0.20
-Monthly provider cap:     $5.00
-Environment:              Linux container
-Agent/runtime:            Claude, pinned
+Scenarios:                 dependency-consent-accept-agent-fixture
+Profile:                   agent fixture
+Environment:               Linux container
+Symposium artifact:        checkout build, sha256:...
+Agent:                     Claude 2.1.283, pinned
+Provider credentials:      none
+Public network:            disabled
+Maximum captured bytes:    2 MiB
+Scenario deadline:         90 seconds
 ```
 
-The [cost and runtime controls](../coverage-and-ci/README.md#cost-and-runtime-controls) are authoritative. The values above are the initial experimental tracer defaults.
-
-Real-agent scenarios enforce cumulative input, cache-read, cache-write, and output tokens as well as provider-request, turn, tool-call, deadline, and run-wide limits. Cached tokens still count even when they cost less. A paid run requires explicit selection, an agent name, and `--confirm-paid-run`.
-
-The initial tracer permits one user turn, at most four provider requests, three tool calls, 25,000 total input-side tokens, and 1,000 output tokens. At the standard post-introductory Sonnet 5 price, its base-token ceiling is approximately $0.09 per run. Its conservative allowance including cache-price differences is $0.20, and its dedicated provider key has a $5 monthly cap. Initial manual runs record usage so the limits can be reduced. The prompt and fixture are reduced before a limit is raised.
+The exact limits are scenario metadata derived from the pinned-adapter spike. The plan reports main-loop, recognized auxiliary, and total request ceilings before starting the container or agent.
 
 ## Read a result
 
 Each run ends as:
 
-- `Passed`: the journey and assertions succeeded.
-- `Failed`: the environment worked, but the behavior violated the contract.
-- `InfrastructureError`: setup, authentication, provider, runtime, harness, or an operator-imposed budget stopped the run.
-- `Unavailable`: the selected combination lacks a required capability.
+- `Passed`: the journey and required controls succeeded.
+- `Failed`: the environment and controls worked, but Symposium violated its contract.
+- `InfrastructureError`: the runner, environment, fixture, or matching pinned adapter failed.
+- `Unavailable`: preflight found that a required executable, version, or capability was absent.
 
-Results may carry modifiers. `non-authoritative(contaminated-auth-context)` means local authentication could not be isolated from agent configuration. `stability-warning(recovered-infrastructure-error)` means a complete fresh-state retry recovered from a recognized infrastructure failure. A modifier cannot turn a product failure into a pass or satisfy a conformance requirement with non-authoritative evidence.
+Examples:
 
-A scenario that cannot produce its witness within its own token budget is `Failed`. Oversized harness context or a lower operator limit is `InfrastructureError` owned by `runner.budget`. Paid execution is `Unavailable` when the adapter cannot report trustworthy usage.
+```text
+Unavailable
+  claude version 2.1.284 does not match pinned 2.1.283
 
-The summary also names the owning phase. An agent-free scenario may retry once from fresh state after a recognized transient infrastructure error. A scenario that contacted a paid provider is never retried automatically. Product failures and individual steps are never retried. A known-gap reproducer still returns `Failed` when run directly.
+InfrastructureError(adapter.claude.fixture)
+  project-scoped control skill was not advertised
 
-Artifacts are under `target/agent-tests/<run-id>/`. Failure artifacts contain only allowlisted, sanitized evidence and a redaction report. Complete homes, authentication directories, and process environments are never archived. Use `--keep-artifacts` to retain rich evidence for a passing run.
+InfrastructureError(adapter.claude.hooks)
+  independent SessionStart control hook did not complete
 
-## Write a scenario
+Failed(delivery.skill.accept)
+  control skill loaded, but Symposium skill was not advertised
 
-Each scenario registers declarative metadata and an asynchronous Rust body returning `Result`. The metadata names fixtures, requirements, contract IDs, permissions, budgets, and external endpoints so the runner can preflight without executing the body. The body uses a constrained `ScenarioContext`; it cannot reach undeclared host state, credentials, or agent-specific APIs. Every behavioral branch is a separate fresh-state scenario.
+Failed(delivery.hook.session-start)
+  control hook succeeded, but Symposium hook failed
 
-A typical consent journey:
+InfrastructureError(environment.provenance)
+  cargo agents did not execute the planned checkout artifact
 
-1. Compose a Rust fixture whose dependency embeds a plugin awaiting consent.
-2. Start with empty Symposium and agent configuration.
-3. Run real `cargo agents init --add-agent <agent>` and assert setup.
-4. Run real `cargo agents sync` under a parsed PTY.
-5. Select the intended prompt option with explicit keys.
-6. Assert terminal anchors, structured events, exit status, and final state.
-7. Run one bounded agent query when delivery is under test.
-8. Assert a narrow capability witness such as a fixture nonce, hook trace, or MCP server log.
+Failed(settings.preserve-foreign)
+  Symposium removed an agent setting it did not own
+```
 
-Scenarios declare contract IDs, required capabilities, permissions, scenario-owned token and operation budgets, and external endpoints. They do not contain Claude-specific paths or judge general response quality. An operator-supplied lower budget is shown separately and cannot manufacture a Symposium failure.
+The summary records process identity, agent version, phase timing, PTY backend, hook evidence, skill witnesses, and artifact location.
 
-Time-dependent scenarios mutate controlled persisted inputs instead of sleeping or changing the production clock. They may set a cache expiry into the past, write a fixture `state.toml`, set a file mtime, or disable the sync debounce. Process and agent deadlines always use real monotonic time.
+## How consent is scripted
 
-## CI operation
+The scenario waits for the actual rendered prompt and then sends the input associated with its declared choice. It never assumes the default means Enable, and it never synchronizes with fixed sleeps.
 
-Fast ordinary tests block pull requests. Stable agent-free process, PTY, and small Linux-container scenarios may graduate after meeting runtime and reliability criteria. Real-agent tracer journeys are manually selected and non-gating while the command is experimental.
+To prove a declined prompt does not return, the runner waits for the second sync process to exit and searches its completed rendered screen. A period of silence is not evidence.
 
-Scheduled execution, triage ownership, quarantine, pass-rate targets, and release gating are not part of the experimental command. They require a separate policy informed by measured reliability, runtime, and cost.
+## How skill delivery is proved
+
+The fixture creates two skills:
+
+```text
+control skill:    installed directly by the harness
+Symposium skill:  installed or withheld by Symposium
+```
+
+Both use the same project skill scope. The control lacks Symposium's ownership marker, so sync must preserve it. Each skill has a unique frontmatter advertisement token and a unique body token. Tokens occur only inside `SKILL.md`.
+
+For accept with the first Claude adapter, the runner proves:
+
+1. explicit sync installed the Symposium skill before Claude started;
+2. sync preserved the independent control hook;
+3. Claude successfully invoked both the control and Symposium SessionStart hooks;
+4. Claude advertised and loaded the control skill;
+5. Claude advertised and loaded the Symposium skill; and
+6. the exact skill inventory remains correct after Claude exits.
+
+For decline, both controls must still work, while the Symposium tokens must appear in no request and the skill must remain absent after Claude exits.
+
+For a later skills-only adapter, the same scenario retains the inventory, advertisement, loading, and absence proofs. Its hook assertion is reported as `Skipped(not-supported-by-agent)` because Symposium does not register a hook for that integration.
+
+## Existing agent tests
+
+Existing `AgentOnly` tests and the agent half of `Any` continue to run under `cargo test` with their current live-model gate. The `cargo test-agent` alias is a convenience for that targeted invocation, not a second frontend. These tests are the only live-provider path in this design. They are not fixture-model scenarios because their natural-language prompts rely on model judgment.
+
+Ordinary simulation and pipes-only black-box tests continue to run under `cargo test`. Interactive PTY and agent journeys use `cargo xtask agent-test`, including when a stable journey later runs in CI.
+
+## Artifacts
+
+Results live under `target/agent-tests/<run-id>/`. Fixture runs may retain terminal output, per-process Symposium events, local model requests and responses, fixture logs, and controlled workspace diffs. Complete homes and process environments are never archived.
