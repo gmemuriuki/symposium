@@ -274,6 +274,7 @@ mod tests {
             classify_row, extension::PublicExtensionSource, recording_observation,
         },
         state::{PluginHookAggregateStore, TelemetryStateV1},
+        storage::metrics::MetricSnapshot,
     };
     use chrono::{TimeZone as _, Utc};
 
@@ -312,8 +313,9 @@ mod tests {
         attribution: PluginHookAttribution,
         hook: HookSurface,
     ) -> SelectedPluginHookAggregate<'a> {
+        let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
         store
-            .select(recording, HookAgent::Claude, hook, attribution)
+            .select(&recovery, recording, HookAgent::Claude, hook, attribution)
             .unwrap()
     }
 

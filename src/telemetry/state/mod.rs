@@ -35,6 +35,8 @@ pub(in crate::telemetry) use extension_invocation::{
 pub(in crate::telemetry) use lifecycle::{BoundRecordingObservation, BoundSessionObservation};
 pub(in crate::telemetry) use open_day::DayBeforeCurrent;
 pub(in crate::telemetry) use plugin_hook::SelectedPluginHookAggregate;
+#[cfg(test)]
+pub(in crate::telemetry) use public_row_budget::MAX_PUBLIC_ROWS_PER_DAY;
 pub(in crate::telemetry) use session_counts::{
     HookSessionCountSnapshot, HookSessionCountTracker, HookSessionCountUpdateError,
 };
@@ -43,7 +45,6 @@ pub(in crate::telemetry) use session_counts::{
 pub(in crate::telemetry) use {
     extension_invocation::ExtensionInvocationAggregateStore, hook::HookAggregateStore,
     lifecycle::RecordingObservationError, plugin_hook::PluginHookAggregateStore,
-    public_row_budget::MAX_PUBLIC_ROWS_PER_DAY,
 };
 
 #[cfg(test)]

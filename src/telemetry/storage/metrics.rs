@@ -36,6 +36,10 @@ use super::{
     },
 };
 
+mod recovery;
+
+pub(in crate::telemetry) use recovery::PublicAggregateRecoveryIndex;
+
 /// Maximum physical size of one aggregate snapshot.
 pub(super) const MAX_METRIC_SNAPSHOT_BYTES: usize = 512 * 1024;
 

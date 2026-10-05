@@ -49,9 +49,31 @@ impl DailyPublicRowBudget {
         Ok(update)
     }
 
+    /// Reconcile the current allowance with public rows surviving on disk.
+    ///
+    /// Day advancement happens first so a closed day's admissions never
+    /// consume the new day's allowance. The larger count is retained because
+    /// private state covers rows lost from the snapshot, while the snapshot
+    /// covers private state lost after its rows were published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DayBeforeCurrent`] if `day` precedes the current open day.
+    pub(super) fn reconcile(
+        &mut self,
+        day: UtcDay,
+        surviving_public_rows: u64,
+    ) -> Result<OpenDayUpdate, DayBeforeCurrent> {
+        let update = self.select_day(day)?;
+        self.admitted = self
+            .admitted
+            .max(surviving_public_rows.min(MAX_PUBLIC_ROWS_PER_DAY));
+        Ok(update)
+    }
+
     /// Consume one allowance slot for a new public aggregate.
     #[must_use]
-    pub(super) fn admit_new(&mut self) -> PublicRowAdmission {
+    pub(super) const fn admit_new(&mut self) -> PublicRowAdmission {
         if self.admitted >= MAX_PUBLIC_ROWS_PER_DAY {
             return PublicRowAdmission::Overflow;
         }
@@ -70,7 +92,7 @@ impl DailyPublicRowBudget {
     }
 
     /// Restore the current day's allowance after telemetry clear.
-    pub(super) fn clear(&mut self) {
+    pub(super) const fn clear(&mut self) {
         self.admitted = 0;
     }
 
@@ -143,5 +165,54 @@ mod tests {
 
         assert_eq!(budget.admitted(), 0);
         assert_eq!(budget.select_day(day(3)), Ok(OpenDayUpdate::Current));
+    }
+
+    #[test]
+    fn reconciliation_keeps_the_larger_private_or_surviving_count() {
+        let mut private_ahead = DailyPublicRowBudget::new(day(3));
+        for _ in 0..3 {
+            assert_eq!(private_ahead.admit_new(), PublicRowAdmission::Public);
+        }
+        private_ahead.reconcile(day(3), 2).unwrap();
+
+        let mut snapshot_ahead = DailyPublicRowBudget::new(day(3));
+        assert_eq!(snapshot_ahead.admit_new(), PublicRowAdmission::Public);
+        snapshot_ahead.reconcile(day(3), 3).unwrap();
+
+        assert_eq!(private_ahead.admitted(), 3);
+        assert_eq!(snapshot_ahead.admitted(), 3);
+    }
+
+    #[test]
+    fn reconciling_the_same_surviving_rows_is_idempotent() {
+        let mut budget = DailyPublicRowBudget::new(day(3));
+
+        budget.reconcile(day(3), 3).unwrap();
+        budget.reconcile(day(3), 3).unwrap();
+
+        assert_eq!(budget.admitted(), 3);
+    }
+
+    #[test]
+    fn reconciliation_advances_the_day_before_applying_surviving_rows() {
+        let mut budget = DailyPublicRowBudget::new(day(3));
+        for _ in 0..MAX_PUBLIC_ROWS_PER_DAY {
+            assert_eq!(budget.admit_new(), PublicRowAdmission::Public);
+        }
+
+        assert_eq!(budget.reconcile(day(4), 1), Ok(OpenDayUpdate::Advanced));
+
+        assert_eq!(budget.admitted(), 1);
+        assert_eq!(budget.admit_new(), PublicRowAdmission::Public);
+    }
+
+    #[test]
+    fn reconciliation_saturates_surviving_rows_at_the_daily_limit() {
+        let mut budget = DailyPublicRowBudget::new(day(3));
+
+        budget.reconcile(day(3), u64::MAX).unwrap();
+
+        assert_eq!(budget.admitted(), MAX_PUBLIC_ROWS_PER_DAY);
+        assert_eq!(budget.admit_new(), PublicRowAdmission::Overflow);
     }
 }

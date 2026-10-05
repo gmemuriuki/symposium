@@ -20,6 +20,7 @@ use crate::telemetry::{
         open_day::OpenDayUpdate,
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
     },
+    storage::metrics::PublicAggregateRecoveryIndex,
 };
 
 /// Identity fields admitted for one extension-invocation aggregate row.
@@ -95,8 +96,13 @@ impl AdmittedExtensionBucket {
         }
     }
 
-    const fn is_public(&self) -> bool {
-        matches!(self.0, AdmittedExtensionBucketKind::Public { .. })
+    /// Return the target and derived subject of a public bucket together.
+    #[must_use]
+    const fn public_identity(&self) -> Option<(&PublicSkillCoordinate, ExtensionSubject)> {
+        match &self.0 {
+            AdmittedExtensionBucketKind::Public { target, subject } => Some((target, *subject)),
+            AdmittedExtensionBucketKind::Unnamed(_) | AdmittedExtensionBucketKind::Overflow => None,
+        }
     }
 
     const fn key(&self) -> ExtensionInvocationBucketKey {
@@ -158,8 +164,29 @@ struct ExtensionInvocationAggregateState {
 
 impl ExtensionInvocationAggregateState {
     fn new(key: &ExtensionInvocationAggregateKey, bucket: AdmittedExtensionBucket) -> Self {
+        Self::with_event_id(key, bucket, EventId::new())
+    }
+
+    /// Recover private state for a surviving public snapshot row.
+    ///
+    /// The fresh tracker deliberately disagrees with a non-empty row's
+    /// contribution baseline. Its first later update therefore marks both
+    /// session sets incomplete while aggregate totals continue from the row.
+    fn recovered(
+        key: &ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+        event_id: EventId,
+    ) -> Self {
+        Self::with_event_id(key, bucket, event_id)
+    }
+
+    fn with_event_id(
+        key: &ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+        event_id: EventId,
+    ) -> Self {
         Self {
-            event_id: EventId::new(),
+            event_id,
             bucket,
             session_counts: ExtensionSessionCountTracker::new(key.clone()),
         }
@@ -235,7 +262,7 @@ impl SelectedExtensionInvocationAggregate<'_> {
     }
 
     #[must_use]
-    pub(in crate::telemetry) fn session_counts(
+    pub(in crate::telemetry) const fn session_counts(
         &mut self,
     ) -> &mut ExtensionSessionCountTracker<ExtensionInvocationAggregateKey> {
         self.session_counts
@@ -260,55 +287,83 @@ impl ExtensionInvocationAggregateStore {
 
     /// Select or admit the aggregate for one attributed observation.
     ///
-    /// Existing public keys do not consume the daily allowance again. A new
-    /// public key beyond the allowance joins the epoch's overflow aggregate.
-    /// A forward UTC-day transition clears the previous entries and restores
-    /// the allowance.
+    /// The required recovery index proves that the day's snapshot loaded
+    /// successfully. Every surviving public row contributes to the reconciled
+    /// allowance, while only a complete current-epoch identity can restore a
+    /// missing entry's event identifier. Adoption happens before overflow and
+    /// does not spend another slot. A forward UTC-day transition clears the
+    /// previous entries before applying the new day's surviving count.
     ///
     /// # Errors
     ///
-    /// Returns an admission error if the observation day moves backward or
-    /// stored private state does not match its map key.
+    /// Returns an admission error if snapshot and observation days disagree,
+    /// the observation day moves backward, or stored private state does not
+    /// match its map key.
     pub(in crate::telemetry) fn select(
         &mut self,
+        recovery: &PublicAggregateRecoveryIndex,
         recording: &BoundRecordingObservation<'_>,
         agent: ExtensionInvocationAgent,
         attribution: ExtensionInvocationAttribution,
     ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        if self.public_rows.select_day(recording.day())? == OpenDayUpdate::Advanced {
+        if recovery.day() != recording.day() {
+            return Err(ExtensionInvocationAdmissionError::SnapshotDayMismatch {
+                snapshot_day: recovery.day(),
+                observation_day: recording.day(),
+            });
+        }
+        if self
+            .public_rows
+            .reconcile(recording.day(), recovery.extension_invocation_public_rows())?
+            == OpenDayUpdate::Advanced
+        {
             self.entries.clear();
         }
 
         let bucket = AdmittedExtensionBucket::from_attribution(recording, attribution);
         let key = ExtensionInvocationAggregateKey::new(recording, agent, &bucket);
-        if bucket.is_public() && self.public_rows.is_exhausted() {
-            return Self::select_public_at_capacity(&mut self.entries, key);
+        // Returning a selection keeps the mutable map borrow alive. Check
+        // first, then perform the borrowing lookup in a separate helper so
+        // the absent path can still insert on stable Rust.
+        if self.entries.contains_key(&key) {
+            return Self::select_existing(&mut self.entries, &key);
         }
 
-        match self.entries.entry(key) {
-            Entry::Occupied(entry) => Self::select_occupied(entry),
-            Entry::Vacant(entry) => {
-                if bucket.is_public() {
-                    let PublicRowAdmission::Public = self.public_rows.admit_new() else {
-                        unreachable!("BUG: a non-exhausted public-row budget must admit a row");
-                    };
-                }
-                Self::insert_vacant(entry, bucket)
+        if let Some((target, subject)) = bucket.public_identity() {
+            if let Some(event_id) = recovery.extension_invocation_event_id(agent, target, subject) {
+                return Self::insert_recovered(&mut self.entries, key, bucket, event_id);
             }
+
+            if self.public_rows.is_exhausted() {
+                return Self::select_public_at_capacity(&mut self.entries, key);
+            }
+
+            let PublicRowAdmission::Public = self.public_rows.admit_new() else {
+                unreachable!("BUG: a non-exhausted public-row budget must admit a row");
+            };
         }
+
+        Self::insert_new(&mut self.entries, key, bucket)
     }
 
     fn select_public_at_capacity(
         entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
         mut key: ExtensionInvocationAggregateKey,
     ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        if entries.contains_key(&key) {
-            return Self::select_existing(entries, &key);
-        }
-
         let bucket = AdmittedExtensionBucket::overflow();
         key.bucket = bucket.key();
         Self::select_or_insert(entries, key, bucket)
+    }
+
+    fn select_or_insert(
+        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
+        key: ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
+        match entries.entry(key) {
+            Entry::Occupied(entry) => Self::select_occupied(entry),
+            Entry::Vacant(entry) => Self::insert_vacant(entry, bucket),
+        }
     }
 
     fn select_existing<'a>(
@@ -323,21 +378,42 @@ impl ExtensionInvocationAggregateStore {
                 ExtensionAggregateSelectionError,
             ));
         };
-
         entry
             .select(key)
             .map_err(ExtensionInvocationAdmissionError::PrivateState)
     }
 
-    fn select_or_insert(
+    fn insert_new(
         entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
         key: ExtensionInvocationAggregateKey,
         bucket: AdmittedExtensionBucket,
     ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        match entries.entry(key) {
-            Entry::Occupied(entry) => Self::select_occupied(entry),
-            Entry::Vacant(entry) => Self::insert_vacant(entry, bucket),
-        }
+        let Entry::Vacant(entry) = entries.entry(key) else {
+            return Err(ExtensionInvocationAdmissionError::PrivateState(
+                ExtensionAggregateSelectionError,
+            ));
+        };
+        Self::insert_vacant(entry, bucket)
+    }
+
+    fn insert_recovered(
+        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
+        key: ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+        event_id: EventId,
+    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
+        let Entry::Vacant(entry) = entries.entry(key) else {
+            return Err(ExtensionInvocationAdmissionError::PrivateState(
+                ExtensionAggregateSelectionError,
+            ));
+        };
+        let key = entry.key().clone();
+        entry
+            .insert(ExtensionInvocationAggregateState::recovered(
+                &key, bucket, event_id,
+            ))
+            .select(&key)
+            .map_err(ExtensionInvocationAdmissionError::PrivateState)
     }
 
     fn select_occupied(
@@ -396,6 +472,10 @@ impl ExtensionInvocationAggregateStore {
 /// Failure while selecting private extension-invocation aggregate state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::telemetry) enum ExtensionInvocationAdmissionError {
+    SnapshotDayMismatch {
+        snapshot_day: UtcDay,
+        observation_day: UtcDay,
+    },
     DayBeforeCurrent(DayBeforeCurrent),
     PrivateState(ExtensionAggregateSelectionError),
 }
@@ -409,6 +489,13 @@ impl From<DayBeforeCurrent> for ExtensionInvocationAdmissionError {
 impl fmt::Display for ExtensionInvocationAdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SnapshotDayMismatch {
+                snapshot_day,
+                observation_day,
+            } => write!(
+                formatter,
+                "extension-invocation snapshot belongs to {snapshot_day}, not observation day {observation_day}"
+            ),
             Self::DayBeforeCurrent(error) => {
                 write!(formatter, "extension-invocation budget {error}")
             }

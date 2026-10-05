@@ -79,16 +79,21 @@ impl AdmittedPluginBucket {
         }
     }
 
+    /// Return the coordinate and derived subject of a public bucket together.
+    #[must_use]
+    const fn public_identity(&self) -> Option<(&PublicPluginCoordinate, PluginSubject)> {
+        match &self.0 {
+            AdmittedPluginBucketKind::Public { plugin, subject } => Some((plugin, *subject)),
+            AdmittedPluginBucketKind::Unnamed | AdmittedPluginBucketKind::Overflow => None,
+        }
+    }
+
     const fn key(&self) -> PluginBucketKey {
         match self.0 {
             AdmittedPluginBucketKind::Public { subject, .. } => PluginBucketKey::Public(subject),
             AdmittedPluginBucketKind::Unnamed => PluginBucketKey::Unnamed,
             AdmittedPluginBucketKind::Overflow => PluginBucketKey::Overflow,
         }
-    }
-
-    const fn is_public(&self) -> bool {
-        matches!(self.0, AdmittedPluginBucketKind::Public { .. })
     }
 }
 
@@ -139,8 +144,30 @@ impl PluginHookAggregateState {
     /// Start private state for a newly admitted aggregate key.
     #[must_use]
     fn new(key: &PluginHookMetricsKey, bucket: AdmittedPluginBucket) -> Self {
+        Self::with_event_id(key, bucket, EventId::new())
+    }
+
+    /// Recover private state for a surviving public snapshot row.
+    ///
+    /// The fresh tracker deliberately disagrees with a non-empty row's
+    /// contribution baseline. Its first later update therefore marks session
+    /// counts incomplete while aggregate totals continue from the row.
+    #[must_use]
+    fn recovered(
+        key: &PluginHookMetricsKey,
+        bucket: AdmittedPluginBucket,
+        event_id: EventId,
+    ) -> Self {
+        Self::with_event_id(key, bucket, event_id)
+    }
+
+    fn with_event_id(
+        key: &PluginHookMetricsKey,
+        bucket: AdmittedPluginBucket,
+        event_id: EventId,
+    ) -> Self {
         Self {
-            event_id: EventId::new(),
+            event_id,
             bucket,
             session_counts: HookSessionCountTracker::new(key.clone()),
         }

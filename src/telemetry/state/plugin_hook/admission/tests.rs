@@ -3,8 +3,12 @@ use chrono::{TimeZone as _, Utc};
 use super::*;
 use crate::telemetry::{
     identity::PluginSubject,
-    schema::{PluginScope, PublicPluginCoordinate, UtcSecond},
+    schema::{
+        AggregateRow, EventId, PluginScope, PublicPluginCoordinate, RowClassification,
+        TelemetryRow, UtcSecond, classify_row, recorded_data_example_row,
+    },
     state::{IDENTIFIER_WINDOW_TEST_STATE, MAX_PUBLIC_ROWS_PER_DAY, TelemetryStateV1},
+    storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
 };
 
 fn state() -> TelemetryStateV1 {
@@ -30,13 +34,58 @@ fn public_plugin(name: &str) -> PublicPluginCoordinate {
     .unwrap()
 }
 
+fn empty_recovery(day: UtcDay) -> PublicAggregateRecoveryIndex {
+    MetricSnapshot::empty(day).public_recovery_index()
+}
+
+fn event_id(value: u128) -> EventId {
+    serde_json::from_value(serde_json::Value::String(
+        uuid::Uuid::from_u128(value).to_string(),
+    ))
+    .unwrap()
+}
+
+fn plugin_row(
+    plugin: &PublicPluginCoordinate,
+    subject: PluginSubject,
+    event_id: EventId,
+) -> AggregateRow {
+    let mut value: serde_json::Value =
+        serde_json::from_str(recorded_data_example_row("plugin_hook_metrics")).unwrap();
+    value["event_id"] = serde_json::to_value(event_id).unwrap();
+    value["plugin"] = serde_json::to_value(plugin).unwrap();
+    value["plugin_subject"] = serde_json::to_value(subject).unwrap();
+    let json = serde_json::to_string(&value).unwrap();
+    let RowClassification::Supported(TelemetryRow::Aggregate(row)) = classify_row(&json) else {
+        panic!("test fixture did not produce a supported plugin-hook row")
+    };
+    row
+}
+
+fn plugin_recovery(
+    day: UtcDay,
+    plugin: &PublicPluginCoordinate,
+    subject: PluginSubject,
+    event_ids: impl IntoIterator<Item = EventId>,
+) -> PublicAggregateRecoveryIndex {
+    let mut snapshot = MetricSnapshot::empty(day);
+    for event_id in event_ids {
+        snapshot
+            .insert(plugin_row(plugin, subject, event_id))
+            .unwrap();
+    }
+    snapshot.public_recovery_index()
+}
+
 fn select<'a>(
     store: &'a mut PluginHookAggregateStore,
     recording: &BoundRecordingObservation<'_>,
     attribution: PluginHookAttribution,
 ) -> SelectedPluginHookAggregate<'a> {
+    let recovery = empty_recovery(recording.day());
     store
         .select(
+            &recovery,
             recording,
             HookAgent::Claude,
             HookSurface::PreToolUse,
@@ -71,8 +120,94 @@ fn public_admission_keeps_plugin_and_derived_subject_together() {
     );
 
     assert_eq!(selected.bucket().scope(), PluginScope::Public);
+    assert_eq!(
+        selected.bucket().public_identity(),
+        Some((&plugin, expected_subject))
+    );
     assert_eq!(selected.bucket().plugin(), Some(&plugin));
     assert_eq!(selected.bucket().plugin_subject(), Some(expected_subject));
+}
+
+#[test]
+fn surviving_public_plugin_is_adopted_before_capacity_overflow() {
+    let mut state = state();
+    let recording = recording_at(&mut state, 3, 10);
+    let plugin = public_plugin("example-tools");
+    let subject = recording.identifier_window_scope().derive(&plugin);
+    let surviving_event_id = event_id(1);
+    let recovery = plugin_recovery(
+        recording.day(),
+        &plugin,
+        subject,
+        (1..=MAX_PUBLIC_ROWS_PER_DAY).map(u128::from).map(event_id),
+    );
+    let mut store = PluginHookAggregateStore::new(recording.day());
+
+    let selected = store
+        .select(
+            &recovery,
+            &recording,
+            HookAgent::Claude,
+            HookSurface::PreToolUse,
+            PluginHookAttribution::Public(plugin),
+        )
+        .unwrap();
+
+    assert_eq!(selected.event_id(), surviving_event_id);
+    assert_eq!(selected.bucket().scope(), PluginScope::Public);
+    assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
+}
+
+#[test]
+fn old_epoch_public_plugin_counts_but_is_not_adopted() {
+    let mut state = state();
+    let recording = recording_at(&mut state, 3, 10);
+    let plugin = public_plugin("example-tools");
+    let old_subject: PluginSubject = "plg_00000000000000000000000000000000".parse().unwrap();
+    let old_event_id = event_id(1);
+    let recovery = plugin_recovery(recording.day(), &plugin, old_subject, [old_event_id]);
+    let mut store = PluginHookAggregateStore::new(recording.day());
+
+    let selected = store
+        .select(
+            &recovery,
+            &recording,
+            HookAgent::Claude,
+            HookSurface::PreToolUse,
+            PluginHookAttribution::Public(plugin),
+        )
+        .unwrap();
+
+    assert_ne!(selected.event_id(), old_event_id);
+    assert_eq!(selected.bucket().scope(), PluginScope::Public);
+    assert_eq!(store.admitted_public_rows(), 2);
+}
+
+#[test]
+fn snapshot_from_another_day_is_rejected_without_changing_the_store() {
+    let mut state = state();
+    let recording = recording_at(&mut state, 3, 10);
+    let mut store = PluginHookAggregateStore::new(recording.day());
+    let before = store.clone();
+
+    let result = store.select(
+        &empty_recovery(UtcDay::from_date(
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+        )),
+        &recording,
+        HookAgent::Claude,
+        HookSurface::PreToolUse,
+        PluginHookAttribution::Unnamed,
+    );
+
+    assert_eq!(
+        result.err(),
+        Some(PluginHookAdmissionError::SnapshotDayMismatch {
+            snapshot_day: UtcDay::from_date(chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),),
+            observation_day: recording.day(),
+        })
+    );
+    assert_eq!(store, before);
 }
 
 #[test]
@@ -248,6 +383,7 @@ fn an_older_observation_is_rejected_without_changing_the_store() {
     let mut older_state = state();
     let older_recording = recording_at(&mut older_state, 3, 11);
     let result = store.select(
+        &empty_recovery(older_recording.day()),
         &older_recording,
         HookAgent::Claude,
         HookSurface::PreToolUse,

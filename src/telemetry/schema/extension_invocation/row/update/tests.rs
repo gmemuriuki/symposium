@@ -15,10 +15,15 @@ use crate::telemetry::{
         ExtensionInvocationAggregateStore, IDENTIFIER_WINDOW_TEST_STATE, MAX_PUBLIC_ROWS_PER_DAY,
         TelemetryStateV1, recording_observation,
     },
+    storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
 };
 
 fn state() -> TelemetryStateV1 {
     toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap()
+}
+
+fn empty_recovery(day: UtcDay) -> PublicAggregateRecoveryIndex {
+    MetricSnapshot::empty(day).public_recovery_index()
 }
 
 fn public(name: &str) -> ExtensionInvocationAttribution {
@@ -63,7 +68,12 @@ fn new_row(
     observation: ExtensionInvocationMetricObservation<'_>,
 ) -> ExtensionInvocationMetricsV1 {
     let selected = store
-        .select(recording, ExtensionInvocationAgent::Claude, attribution)
+        .select(
+            &empty_recovery(recording.day()),
+            recording,
+            ExtensionInvocationAgent::Claude,
+            attribution,
+        )
         .unwrap();
 
     ExtensionInvocationMetricsV1::new(recording, observation, selected).unwrap()
@@ -77,6 +87,7 @@ fn first_public_attempt_builds_identity_and_complete_session_counts_from_selecti
     let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -136,6 +147,7 @@ fn missing_snapshot_row_recovers_existing_private_state_with_incomplete_counts()
     );
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -179,6 +191,7 @@ fn failed_observation_reconciles_private_state_after_a_lost_snapshot_row() {
     );
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -263,6 +276,7 @@ fn unnamed_and_overflow_rows_take_their_complete_identity_from_admission() {
     for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
         let _selected = overflow_store
             .select(
+                &empty_recovery(recording.day()),
                 &recording,
                 ExtensionInvocationAgent::Claude,
                 public(&format!("skill-{index}")),
@@ -311,6 +325,7 @@ fn later_phases_accumulate_and_round_trip_as_one_supported_row() {
     ] {
         let selected = store
             .select(
+                &empty_recovery(recording.day()),
                 &recording,
                 ExtensionInvocationAgent::Claude,
                 public("example-debugging"),
@@ -374,6 +389,7 @@ fn failed_observation_changes_only_the_row_counter() {
     let store_before = store.clone();
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -411,6 +427,7 @@ fn baseline_mismatch_marks_both_session_counts_incomplete() {
     row.attempted = 5;
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -460,6 +477,7 @@ fn every_phase_counter_overflow_rejects_without_mutating_row_or_private_state() 
         let store_before = store.clone();
         let selected = store
             .select(
+                &empty_recovery(recording.day()),
                 &recording,
                 ExtensionInvocationAgent::Claude,
                 public("example-debugging"),
@@ -491,6 +509,7 @@ fn update_rejects_another_target_without_mutation() {
     );
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("second-skill"),
@@ -532,6 +551,7 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
     let second_store_before = second_store.clone();
     let selected = second_store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
@@ -572,6 +592,7 @@ fn update_rejects_a_selection_from_another_identifier_epoch() {
         let recording = recording_observation(&mut state);
         store
             .select(
+                &empty_recovery(recording.day()),
                 &recording,
                 ExtensionInvocationAgent::Claude,
                 public("example-debugging"),
@@ -614,6 +635,7 @@ fn day_rollover_rejects_the_previous_days_row_from_the_same_store() {
     let recording = recording_at(&mut state, 4);
     let selected = store
         .select(
+            &empty_recovery(recording.day()),
             &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),

@@ -205,7 +205,7 @@ Snapshot order compares the kind, agent, optional hook, optional scope, optional
 
 Session-count state is atomically replaced first and carries the snapshot contribution count. After a failed snapshot write, a mismatch discards the sets and makes the row's session counts incomplete for that day.
 
-On load, Symposium rebuilds each daily public-row allowance from every surviving public row for that family and day, saturating the count at 128. When selecting a public aggregate with no private entry, it adopts a matching surviving row without spending another slot only when the row's recorded subject equals the subject derived from the observation. Adoption runs before overflow selection. An unnamed or overflow row with no private entry starts a separate row.
+On load, Symposium advances each aggregate store to the snapshot day, then sets its daily public-row allowance to the greater of the persisted count and the number of surviving public rows for that family and day, including earlier identifier epochs, saturating at 128. When selecting a public aggregate with no private entry, it adopts a matching surviving row without spending another slot only when the row's recorded subject equals the subject derived from the observation. Adoption runs before overflow selection; duplicate matches choose the lowest `event_id` and leave the other rows untouched. The adopted row continues with incomplete session counts after its first later update. An unnamed or overflow row with no private entry starts a separate row.
 
 Management commands can wait for the lock. A crash can still lose the last batch or metric update, or leave a partial final event line; `status` reports that line as malformed and `show` preserves it.
 
