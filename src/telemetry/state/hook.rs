@@ -1,13 +1,11 @@
 //! Daily private state for top-level hook aggregate rows.
 
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
 
 use super::{
     BoundRecordingObservation, DayBeforeCurrent, HookSessionCountTracker,
     open_day::{OpenDay, OpenDayUpdate},
+    staged_entries::StagedEntries,
 };
 use crate::telemetry::schema::{HookAgent, HookMetricsKey, HookSurface, UtcDay};
 
@@ -31,11 +29,12 @@ impl HookAggregateStore {
         }
     }
 
-    /// Select private state for one hook aggregate.
+    /// Stage private-state edits for one hook recording operation.
     ///
-    /// A later day drops the closed day's entries before selecting the new
-    /// key. Repeated selections for the same day and identifier epoch reuse
-    /// the existing tracker.
+    /// Day selection is applied to a copy. Dropping the returned stage leaves
+    /// both the open day and every stored tracker unchanged. The invocation
+    /// coordinator will become the sole caller and committer once it lands;
+    /// this per-store entry point remains only for the staged rollout.
     ///
     /// # Errors
     ///
@@ -43,35 +42,21 @@ impl HookAggregateStore {
     /// recording belongs to a closed day, or
     /// [`HookAggregateStoreError::PrivateState`] when a stored tracker does
     /// not match its map key.
-    pub(in crate::telemetry) fn select(
-        &mut self,
-        recording: &BoundRecordingObservation<'_>,
-        agent: HookAgent,
-        hook: HookSurface,
-    ) -> Result<&mut HookSessionCountTracker<HookMetricsKey>, HookAggregateStoreError> {
-        let day_update = self
-            .day
+    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+        &'store mut self,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<HookAggregateStage<'store, 'context, 'identity>, HookAggregateStoreError> {
+        let mut staged_day = self.day;
+        let day_update = staged_day
             .select(recording.day())
             .map_err(HookAggregateStoreError::DayBeforeCurrent)?;
-        if day_update == OpenDayUpdate::Advanced {
-            self.entries.clear();
-        }
 
-        let key = HookMetricsKey::new(recording, agent, hook);
-        let session_counts = match self.entries.entry(key) {
-            Entry::Occupied(entry) => {
-                if entry.get().key() != entry.key() {
-                    return Err(HookAggregateStoreError::PrivateState(
-                        HookAggregateSelectionError,
-                    ));
-                }
-
-                entry.into_mut()
-            }
-            Entry::Vacant(entry) => entry.insert(HookSessionCountTracker::new(key)),
-        };
-
-        Ok(session_counts)
+        Ok(HookAggregateStage {
+            destination_day: &mut self.day,
+            staged_day,
+            entries: StagedEntries::new(&mut self.entries, day_update == OpenDayUpdate::Advanced),
+            recording,
+        })
     }
 
     /// Remove entries derived under the previous identifier epoch.
@@ -87,6 +72,60 @@ impl HookAggregateStore {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Copy-on-write private hook state for one recording operation.
+///
+/// Selections borrow this stage one at a time. A coordinator must therefore
+/// derive cross-plugin facts from its immutable observations before entering
+/// the sequential selection loop.
+#[must_use = "dropping a hook aggregate stage rolls back its private-state edits"]
+pub(in crate::telemetry) struct HookAggregateStage<'store, 'context, 'identity> {
+    destination_day: &'store mut OpenDay,
+    staged_day: OpenDay,
+    entries: StagedEntries<'store, HookMetricsKey, HookSessionCountTracker<HookMetricsKey>>,
+    recording: &'context BoundRecordingObservation<'identity>,
+}
+
+impl HookAggregateStage<'_, '_, '_> {
+    /// Select a staged tracker for one hook aggregate.
+    ///
+    /// Repeated selections reuse the same staged value. After day rollover,
+    /// the overlay never reads from the closed day's map, even if a future key
+    /// type could otherwise collide with an old entry.
+    pub(in crate::telemetry) fn select(
+        &mut self,
+        agent: HookAgent,
+        hook: HookSurface,
+    ) -> Result<&mut HookSessionCountTracker<HookMetricsKey>, HookAggregateStoreError> {
+        let key = HookMetricsKey::new(self.recording, agent, hook);
+        let session_counts = self
+            .entries
+            .get_or_insert_with(key, |key| HookSessionCountTracker::new(*key));
+        if session_counts.key() != &key {
+            return Err(HookAggregateStoreError::PrivateState(
+                HookAggregateSelectionError,
+            ));
+        }
+
+        Ok(session_counts)
+    }
+
+    /// Apply the staged day and entry edits without a recoverable failure.
+    ///
+    /// Hook-invocation recording commits this alongside the plugin-hook and
+    /// extension-invocation stages. This method must remain infallible so that
+    /// sequence cannot stop after committing only part of the private state.
+    pub(in crate::telemetry) fn commit(self) {
+        let Self {
+            destination_day,
+            staged_day,
+            entries,
+            recording: _,
+        } = self;
+        *destination_day = staged_day;
+        entries.commit();
     }
 }
 
@@ -151,20 +190,22 @@ mod tests {
         let mut state = state();
         let mut store = HookAggregateStore::new(day(3));
         let recording = recording_at(&mut state, 3);
+        let mut staged = store.stage(&recording).unwrap();
         let first_key = {
-            let tracker = store
-                .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+            let tracker = staged
+                .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap();
             tracker.checked_record(0, None, HookOutcome::Ok).unwrap();
             *tracker.key()
         };
 
-        let tracker = store
-            .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+        let tracker = staged
+            .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap();
 
         assert_eq!(tracker.key(), &first_key);
         assert_eq!(tracker.snapshot(), HookSessionCountSnapshot::Incomplete);
+        staged.commit();
         assert_eq!(store.len(), 1);
     }
 
@@ -173,44 +214,59 @@ mod tests {
         let mut state = state();
         let mut store = HookAggregateStore::new(day(3));
         let recording = recording_at(&mut state, 3);
-        let pre_tool_key = *store
-            .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+        let mut staged = store.stage(&recording).unwrap();
+        let pre_tool_key = *staged
+            .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap()
             .key();
 
-        let post_tool_key = *store
-            .select(&recording, HookAgent::Claude, HookSurface::PostToolUse)
+        let post_tool_key = *staged
+            .select(HookAgent::Claude, HookSurface::PostToolUse)
             .unwrap()
             .key();
 
         assert_ne!(post_tool_key, pre_tool_key);
+        staged.commit();
         assert_eq!(store.len(), 2);
     }
 
     #[test]
-    fn later_day_drops_closed_day_trackers() {
+    fn later_day_stages_a_fresh_tracker_and_drops_closed_day_only_on_commit() {
         let mut state = state();
         let mut store = HookAggregateStore::new(day(3));
         {
             let recording = recording_at(&mut state, 3);
-            let tracker = store
-                .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+            let mut staged = store.stage(&recording).unwrap();
+            let tracker = staged
+                .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap();
             tracker.checked_record(0, None, HookOutcome::Ok).unwrap();
+            staged.commit();
         }
         let later = recording_at(&mut state, 4);
+        let before = store.clone();
 
-        let tracker = store
-            .select(&later, HookAgent::Claude, HookSurface::PreToolUse)
+        {
+            let mut staged = store.stage(&later).unwrap();
+            let tracker = staged
+                .select(HookAgent::Claude, HookSurface::PreToolUse)
+                .unwrap();
+
+            assert_eq!(
+                tracker.snapshot(),
+                HookSessionCountSnapshot::Complete {
+                    identified_sessions: 0,
+                    identified_sessions_non_ok: 0,
+                }
+            );
+        }
+        assert_eq!(store, before);
+
+        let mut staged = store.stage(&later).unwrap();
+        staged
+            .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap();
-
-        assert_eq!(
-            tracker.snapshot(),
-            HookSessionCountSnapshot::Complete {
-                identified_sessions: 0,
-                identified_sessions_non_ok: 0,
-            }
-        );
+        staged.commit();
         assert_eq!(store.len(), 1);
     }
 
@@ -221,7 +277,7 @@ mod tests {
         let recording = recording_at(&mut state, 3);
         let before = store.clone();
 
-        let result = store.select(&recording, HookAgent::Claude, HookSurface::PreToolUse);
+        let result = store.stage(&recording);
 
         let Err(error) = result else {
             panic!("accepted a recording from a closed day");
@@ -250,7 +306,8 @@ mod tests {
             .insert(selected_key, HookSessionCountTracker::new(other_key));
         let before = store.clone();
 
-        let result = store.select(&recording, HookAgent::Claude, HookSurface::PreToolUse);
+        let mut staged = store.stage(&recording).unwrap();
+        let result = staged.select(HookAgent::Claude, HookSurface::PreToolUse);
 
         let Err(error) = result else {
             panic!("accepted a tracker stored under another aggregate key");
@@ -268,10 +325,12 @@ mod tests {
         let mut store = HookAggregateStore::new(day(3));
         let (old_key, completed_at) = {
             let recording = recording_at(&mut state, 3);
-            let key = *store
-                .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+            let mut staged = store.stage(&recording).unwrap();
+            let key = *staged
+                .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap()
                 .key();
+            staged.commit();
             (key, recording.completed_at())
         };
 
@@ -279,10 +338,12 @@ mod tests {
         state.reset_identifiers(day(3)).unwrap();
         let observation = state.observe_recording(completed_at).unwrap();
         let recording = state.bind_recording_observation(observation).unwrap();
-        let new_key = *store
-            .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+        let mut staged = store.stage(&recording).unwrap();
+        let new_key = *staged
+            .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap()
             .key();
+        staged.commit();
 
         assert_ne!(new_key, old_key);
         assert_eq!(store.len(), 1);
@@ -293,9 +354,11 @@ mod tests {
         let mut state = state();
         let mut store = HookAggregateStore::new(day(3));
         let recording = recording_at(&mut state, 3);
-        store
-            .select(&recording, HookAgent::Claude, HookSurface::PreToolUse)
+        let mut staged = store.stage(&recording).unwrap();
+        staged
+            .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap();
+        staged.commit();
 
         store.clear();
 

@@ -1,12 +1,6 @@
 //! Daily admission and lookup for plugin-hook aggregates.
 
-use std::{
-    collections::{
-        BTreeMap,
-        btree_map::{Entry, OccupiedEntry, VacantEntry},
-    },
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
 
 use super::{
     AdmittedPluginBucket, PluginHookAggregateSelectionError, PluginHookAggregateState,
@@ -18,6 +12,7 @@ use crate::telemetry::{
         BoundRecordingObservation, DayBeforeCurrent,
         open_day::OpenDayUpdate,
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
+        staged_entries::StagedEntries,
     },
     storage::metrics::PublicAggregateRecoveryIndex,
 };
@@ -38,153 +33,43 @@ impl PluginHookAggregateStore {
         }
     }
 
-    /// Select or admit the aggregate for one plugin-hook attempt.
+    /// Stage private-state edits for one hook recording operation.
     ///
     /// The required recovery index proves that the day's snapshot loaded
     /// successfully. Every surviving public row contributes to the reconciled
-    /// allowance, while only a complete current-epoch identity can restore a
-    /// missing entry's event identifier. Adoption happens before overflow and
-    /// does not spend another slot. A forward UTC-day transition clears the
-    /// previous entries before applying the new day's surviving count.
+    /// allowance. Day selection and allowance reconciliation happen on a copy,
+    /// so dropping the returned stage leaves this store unchanged. The
+    /// invocation coordinator will become the sole caller and committer once
+    /// it lands; this per-store entry point remains only for the staged rollout.
     ///
     /// # Errors
     ///
     /// Returns an admission error if snapshot and observation days disagree,
     /// the observation day moves backward, or stored private state does not
     /// match its map key.
-    pub(in crate::telemetry) fn select(
-        &mut self,
-        recovery: &PublicAggregateRecoveryIndex,
-        recording: &BoundRecordingObservation<'_>,
-        agent: HookAgent,
-        surface: HookSurface,
-        attribution: PluginHookAttribution,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
+    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+        &'store mut self,
+        recovery: &'context PublicAggregateRecoveryIndex,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<PluginHookAggregateStage<'store, 'context, 'identity>, PluginHookAdmissionError>
+    {
         if recovery.day() != recording.day() {
             return Err(PluginHookAdmissionError::SnapshotDayMismatch {
                 snapshot_day: recovery.day(),
                 observation_day: recording.day(),
             });
         }
-        if self
-            .public_rows
-            .reconcile(recording.day(), recovery.plugin_hook_public_rows())?
-            == OpenDayUpdate::Advanced
-        {
-            self.entries.clear();
-        }
+        let mut staged_budget = self.public_rows;
+        let day_update =
+            staged_budget.reconcile(recording.day(), recovery.plugin_hook_public_rows())?;
 
-        let bucket = AdmittedPluginBucket::from_attribution(recording, attribution);
-        let key = PluginHookMetricsKey::new(recording, agent, surface, &bucket);
-        // Returning a selection keeps the mutable map borrow alive. Check
-        // first, then perform the borrowing lookup in a separate helper so
-        // the absent path can still insert on stable Rust.
-        if self.entries.contains_key(&key) {
-            return Self::select_existing(&mut self.entries, &key);
-        }
-
-        if let Some((plugin, subject)) = bucket.public_identity() {
-            if let Some(event_id) = recovery.plugin_hook_event_id(agent, surface, plugin, subject) {
-                return Self::insert_recovered(&mut self.entries, key, bucket, event_id);
-            }
-
-            if self.public_rows.is_exhausted() {
-                return Self::select_public_at_capacity(&mut self.entries, key);
-            }
-
-            let PublicRowAdmission::Public = self.public_rows.admit_new() else {
-                unreachable!("BUG: a non-exhausted public-row budget must admit a row");
-            };
-        }
-
-        Self::insert_new(&mut self.entries, key, bucket)
-    }
-
-    fn select_public_at_capacity(
-        entries: &mut BTreeMap<PluginHookMetricsKey, PluginHookAggregateState>,
-        mut key: PluginHookMetricsKey,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let bucket = AdmittedPluginBucket::overflow();
-        key.bucket = bucket.key();
-        Self::select_or_insert(entries, key, bucket)
-    }
-
-    fn select_or_insert(
-        entries: &mut BTreeMap<PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
-        bucket: AdmittedPluginBucket,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        match entries.entry(key) {
-            Entry::Occupied(entry) => Self::select_occupied(entry),
-            Entry::Vacant(entry) => Self::insert_vacant(entry, bucket),
-        }
-    }
-
-    fn select_existing<'a>(
-        entries: &'a mut BTreeMap<PluginHookMetricsKey, PluginHookAggregateState>,
-        key: &PluginHookMetricsKey,
-    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
-        let Some(entry) = entries.get_mut(key) else {
-            return Err(PluginHookAdmissionError::PrivateState(
-                PluginHookAggregateSelectionError,
-            ));
-        };
-        entry
-            .select(key)
-            .map_err(PluginHookAdmissionError::PrivateState)
-    }
-
-    fn insert_new(
-        entries: &mut BTreeMap<PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
-        bucket: AdmittedPluginBucket,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let Entry::Vacant(entry) = entries.entry(key) else {
-            return Err(PluginHookAdmissionError::PrivateState(
-                PluginHookAggregateSelectionError,
-            ));
-        };
-        Self::insert_vacant(entry, bucket)
-    }
-
-    fn insert_recovered(
-        entries: &mut BTreeMap<PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
-        bucket: AdmittedPluginBucket,
-        event_id: crate::telemetry::schema::EventId,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let Entry::Vacant(entry) = entries.entry(key) else {
-            return Err(PluginHookAdmissionError::PrivateState(
-                PluginHookAggregateSelectionError,
-            ));
-        };
-        let key = entry.key().clone();
-        entry
-            .insert(PluginHookAggregateState::recovered(&key, bucket, event_id))
-            .select(&key)
-            .map_err(PluginHookAdmissionError::PrivateState)
-    }
-
-    fn select_occupied(
-        entry: OccupiedEntry<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let key = entry.key().clone();
-        entry
-            .into_mut()
-            .select(&key)
-            .map_err(PluginHookAdmissionError::PrivateState)
-    }
-
-    fn insert_vacant(
-        entry: VacantEntry<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-        bucket: AdmittedPluginBucket,
-    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let state = PluginHookAggregateState::new(entry.key(), bucket);
-        let key = entry.key().clone();
-        entry
-            .insert(state)
-            .select(&key)
-            .map_err(PluginHookAdmissionError::PrivateState)
+        Ok(PluginHookAggregateStage {
+            destination_budget: &mut self.public_rows,
+            staged_budget,
+            entries: StagedEntries::new(&mut self.entries, day_update == OpenDayUpdate::Advanced),
+            recovery,
+            recording,
+        })
     }
 
     /// Remove entries from the previous identifier epoch without restoring
@@ -207,6 +92,139 @@ impl PluginHookAggregateStore {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Copy-on-write plugin-hook admission for one recording operation.
+///
+/// Each selection's borrow ends before the next selection begins. The caller
+/// must derive invocation-wide facts from its observations rather than from
+/// several simultaneously borrowed private entries.
+#[must_use = "dropping a plugin-hook aggregate stage rolls back its private-state edits"]
+pub(in crate::telemetry) struct PluginHookAggregateStage<'store, 'context, 'identity> {
+    destination_budget: &'store mut DailyPublicRowBudget,
+    staged_budget: DailyPublicRowBudget,
+    entries: StagedEntries<'store, PluginHookMetricsKey, PluginHookAggregateState>,
+    recovery: &'context PublicAggregateRecoveryIndex,
+    recording: &'context BoundRecordingObservation<'identity>,
+}
+
+impl PluginHookAggregateStage<'_, '_, '_> {
+    /// Select or admit the aggregate for one plugin-hook terminal result.
+    ///
+    /// Adoption happens before overflow and does not spend another public-row
+    /// slot. Repeated selections reuse the same staged entry.
+    pub(in crate::telemetry) fn select(
+        &mut self,
+        agent: HookAgent,
+        surface: HookSurface,
+        attribution: PluginHookAttribution,
+    ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
+        let bucket = AdmittedPluginBucket::from_attribution(self.recording, attribution);
+        let key = PluginHookMetricsKey::new(self.recording, agent, surface, &bucket);
+
+        if self.entries.contains_key(&key) {
+            return Self::select_existing(&mut self.entries, &key);
+        }
+
+        if let Some((plugin, subject)) = bucket.public_identity() {
+            if let Some(event_id) = self
+                .recovery
+                .plugin_hook_event_id(agent, surface, plugin, subject)
+            {
+                return Self::insert_recovered(&mut self.entries, key, bucket, event_id);
+            }
+
+            if self.staged_budget.is_exhausted() {
+                return Self::select_public_at_capacity(&mut self.entries, key);
+            }
+
+            let PublicRowAdmission::Public = self.staged_budget.admit_new() else {
+                unreachable!("BUG: a non-exhausted public-row budget must admit a row");
+            };
+        }
+
+        Self::insert_new(&mut self.entries, key, bucket)
+    }
+
+    fn select_public_at_capacity<'a>(
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        mut key: PluginHookMetricsKey,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let bucket = AdmittedPluginBucket::overflow();
+        key.bucket = bucket.key();
+        Self::select_or_insert(entries, key, bucket)
+    }
+
+    fn select_or_insert<'a>(
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        key: PluginHookMetricsKey,
+        bucket: AdmittedPluginBucket,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            PluginHookAggregateState::new(key, bucket)
+        });
+        state
+            .select(&key)
+            .map_err(PluginHookAdmissionError::PrivateState)
+    }
+
+    fn select_existing<'a>(
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        key: &PluginHookMetricsKey,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let Some(entry) = entries.get_mut(key) else {
+            return Err(PluginHookAdmissionError::PrivateState(
+                PluginHookAggregateSelectionError,
+            ));
+        };
+        entry
+            .select(key)
+            .map_err(PluginHookAdmissionError::PrivateState)
+    }
+
+    fn insert_new<'a>(
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        key: PluginHookMetricsKey,
+        bucket: AdmittedPluginBucket,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            PluginHookAggregateState::new(key, bucket)
+        });
+        state
+            .select(&key)
+            .map_err(PluginHookAdmissionError::PrivateState)
+    }
+
+    fn insert_recovered<'a>(
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        key: PluginHookMetricsKey,
+        bucket: AdmittedPluginBucket,
+        event_id: crate::telemetry::schema::EventId,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            PluginHookAggregateState::recovered(key, bucket, event_id)
+        });
+        state
+            .select(&key)
+            .map_err(PluginHookAdmissionError::PrivateState)
+    }
+
+    /// Apply the staged allowance and entries without a recoverable failure.
+    ///
+    /// Hook-invocation recording commits this alongside the hook and
+    /// extension-invocation stages. This method must remain infallible so that
+    /// sequence cannot stop after committing only part of the private state.
+    pub(in crate::telemetry) fn commit(self) {
+        let Self {
+            destination_budget,
+            staged_budget,
+            entries,
+            recovery: _,
+            recording: _,
+        } = self;
+        *destination_budget = staged_budget;
+        entries.commit();
     }
 }
 

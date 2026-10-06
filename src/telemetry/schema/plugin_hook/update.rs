@@ -307,16 +307,32 @@ mod tests {
         PluginHookAggregateStore::new(recording.day())
     }
 
-    fn select_private<'a>(
-        store: &'a mut PluginHookAggregateStore,
+    fn with_committed_selection<R>(
+        store: &mut PluginHookAggregateStore,
         recording: &BoundRecordingObservation<'_>,
         attribution: PluginHookAttribution,
         hook: HookSurface,
-    ) -> SelectedPluginHookAggregate<'a> {
+        use_selection: impl FnOnce(SelectedPluginHookAggregate<'_>) -> R,
+    ) -> R {
         let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
-        store
-            .select(&recovery, recording, HookAgent::Claude, hook, attribution)
-            .unwrap()
+        let mut staged = store.stage(&recovery, recording).unwrap();
+        let selected = staged.select(HookAgent::Claude, hook, attribution).unwrap();
+        let result = use_selection(selected);
+        staged.commit();
+        result
+    }
+
+    fn with_uncommitted_selection<R>(
+        store: &mut PluginHookAggregateStore,
+        recording: &BoundRecordingObservation<'_>,
+        attribution: PluginHookAttribution,
+        hook: HookSurface,
+        use_selection: impl FnOnce(SelectedPluginHookAggregate<'_>) -> R,
+    ) -> R {
+        let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
+        let mut staged = store.stage(&recovery, recording).unwrap();
+        let selected = staged.select(HookAgent::Claude, hook, attribution).unwrap();
+        use_selection(selected)
     }
 
     fn initialized_aggregate(
@@ -325,8 +341,13 @@ mod tests {
     ) -> (PluginHookMetricsV1, PluginHookAggregateStore) {
         let observation = metric_observation(successful_attempt(), None);
         let mut store = aggregate_store(recording);
-        let selected = select_private(&mut store, recording, attribution, HookSurface::PreToolUse);
-        let row = PluginHookMetricsV1::new(recording, observation, selected).unwrap();
+        let row = with_committed_selection(
+            &mut store,
+            recording,
+            attribution,
+            HookSurface::PreToolUse,
+            |selected| PluginHookMetricsV1::new(recording, observation, selected).unwrap(),
+        );
 
         (row, store)
     }
@@ -341,13 +362,11 @@ mod tests {
         expected: PluginHookMetricsUpdateError,
     ) {
         let row_before = row.clone();
-        {
-            let _selection = select_private(store, recording, attribution.clone(), hook);
-        }
+        with_committed_selection(store, recording, attribution.clone(), hook, |_| ());
         let store_before = store.clone();
-        let selected = select_private(store, recording, attribution, hook);
-
-        let result = row.checked_record(recording, observation, selected);
+        let result = with_uncommitted_selection(store, recording, attribution, hook, |selected| {
+            row.checked_record(recording, observation, selected)
+        });
 
         assert_eq!(result, Err(expected));
         assert_eq!(*row, row_before);
@@ -371,16 +390,14 @@ mod tests {
             Some(&vendor_session_id),
         );
         let mut store = aggregate_store(&recording);
-        let event_id = select_private(
+        let row = with_committed_selection(
             &mut store,
             &recording,
-            attribution.clone(),
+            attribution,
             HookSurface::PreToolUse,
-        )
-        .event_id();
-        let selected = select_private(&mut store, &recording, attribution, HookSurface::PreToolUse);
-
-        let row = PluginHookMetricsV1::new(&recording, observation, selected).unwrap();
+            |selected| PluginHookMetricsV1::new(&recording, observation, selected).unwrap(),
+        );
+        let event_id = row.event_id;
         let json = serde_json::to_string(&row).unwrap();
         let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
@@ -437,13 +454,13 @@ mod tests {
             Some(&first_session),
         );
         let mut store = aggregate_store(&recording);
-        let selected = select_private(
+        let mut row = with_committed_selection(
             &mut store,
             &recording,
             attribution.clone(),
             HookSurface::PreToolUse,
+            |selected| PluginHookMetricsV1::new(&recording, first, selected).unwrap(),
         );
-        let mut row = PluginHookMetricsV1::new(&recording, first, selected).unwrap();
         let event_id = row.event_id;
         let second = metric_observation(
             PluginHookAttempt::Executed {
@@ -457,8 +474,13 @@ mod tests {
             Some(&second_session),
         );
 
-        let selected = select_private(&mut store, &recording, attribution, HookSurface::PreToolUse);
-        row.checked_record(&recording, second, selected).unwrap();
+        with_committed_selection(
+            &mut store,
+            &recording,
+            attribution,
+            HookSurface::PreToolUse,
+            |selected| row.checked_record(&recording, second, selected).unwrap(),
+        );
         let json = serde_json::to_string(&row).unwrap();
         let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
 
@@ -507,9 +529,13 @@ mod tests {
         );
         let attribution = PluginHookAttribution::Unnamed;
         let mut store = aggregate_store(&recording);
-        let selected = select_private(&mut store, &recording, attribution, HookSurface::PreToolUse);
-
-        let row = PluginHookMetricsV1::new(&recording, observation, selected).unwrap();
+        let row = with_committed_selection(
+            &mut store,
+            &recording,
+            attribution,
+            HookSurface::PreToolUse,
+            |selected| PluginHookMetricsV1::new(&recording, observation, selected).unwrap(),
+        );
 
         assert!(!row.session_counts_complete);
         assert_eq!(row.identified_sessions, None);
@@ -608,17 +634,15 @@ mod tests {
                 None,
             );
             let mut store = aggregate_store(&recording);
-            let selected = select_private(
+            let row = with_committed_selection(
                 &mut store,
                 &recording,
                 PluginHookAttribution::Unnamed,
                 HookSurface::PreToolUse,
+                |selected| PluginHookMetricsV1::new(&recording, observation, selected).unwrap(),
             );
 
-            (
-                PluginHookMetricsV1::new(&recording, observation, selected).unwrap(),
-                store,
-            )
+            (row, store)
         };
         state.reset_identifiers(row.day).unwrap();
         store.reset_identifier_epoch();
@@ -635,23 +659,21 @@ mod tests {
             None,
         );
         let row_before = row.clone();
-        {
-            let _selection = select_private(
-                &mut store,
-                &recording,
-                PluginHookAttribution::Unnamed,
-                HookSurface::PreToolUse,
-            );
-        }
-        let store_before = store.clone();
-        let selected = select_private(
+        with_committed_selection(
             &mut store,
             &recording,
             PluginHookAttribution::Unnamed,
             HookSurface::PreToolUse,
+            |_| (),
         );
-
-        let result = row.checked_record(&recording, observation, selected);
+        let store_before = store.clone();
+        let result = with_uncommitted_selection(
+            &mut store,
+            &recording,
+            PluginHookAttribution::Unnamed,
+            HookSurface::PreToolUse,
+            |selected| row.checked_record(&recording, observation, selected),
+        );
 
         assert_eq!(
             result,
@@ -675,14 +697,13 @@ mod tests {
         let observation = metric_observation(successful_attempt(), None);
         let row_before = row.clone();
         let store_before = store.clone();
-        let selected = select_private(
+        let result = with_uncommitted_selection(
             &mut store,
             &old_recording,
             PluginHookAttribution::Unnamed,
             HookSurface::PreToolUse,
+            |selected| row.checked_record(&reset_recording, observation, selected),
         );
-
-        let result = row.checked_record(&reset_recording, observation, selected);
 
         assert_eq!(
             result,
@@ -709,13 +730,13 @@ mod tests {
             Some(&vendor_session_id),
         );
         let mut store = aggregate_store(&recording);
-        let selected = select_private(
+        let mut row = with_committed_selection(
             &mut store,
             &recording,
             PluginHookAttribution::Unnamed,
             HookSurface::PreToolUse,
+            |selected| PluginHookMetricsV1::new(&recording, first, selected).unwrap(),
         );
-        let mut row = PluginHookMetricsV1::new(&recording, first, selected).unwrap();
         row.prepare_ms = serde_json::from_value(serde_json::json!({
             "bounds": [5, 10, 25, 50, 100, 250, 500, 1000],
             "counts": [u64::MAX, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -729,14 +750,13 @@ mod tests {
             },
             Some(&vendor_session_id),
         );
-        let selected = select_private(
+        let result = with_uncommitted_selection(
             &mut store,
             &recording,
             PluginHookAttribution::Unnamed,
             HookSurface::PreToolUse,
+            |selected| row.checked_record(&recording, second, selected),
         );
-
-        let result = row.checked_record(&recording, second, selected);
 
         assert_eq!(
             result,

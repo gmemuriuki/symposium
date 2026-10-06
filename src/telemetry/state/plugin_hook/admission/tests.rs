@@ -77,21 +77,47 @@ fn plugin_recovery(
     snapshot.public_recovery_index()
 }
 
-fn select<'a>(
-    store: &'a mut PluginHookAggregateStore,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionSnapshot {
+    event_id: EventId,
+    bucket: AdmittedPluginBucket,
+}
+
+impl SelectionSnapshot {
+    const fn event_id(&self) -> EventId {
+        self.event_id
+    }
+
+    const fn bucket(&self) -> &AdmittedPluginBucket {
+        &self.bucket
+    }
+}
+
+fn select(
+    store: &mut PluginHookAggregateStore,
     recording: &BoundRecordingObservation<'_>,
     attribution: PluginHookAttribution,
-) -> SelectedPluginHookAggregate<'a> {
+) -> SelectionSnapshot {
     let recovery = empty_recovery(recording.day());
-    store
-        .select(
-            &recovery,
-            recording,
-            HookAgent::Claude,
-            HookSurface::PreToolUse,
-            attribution,
-        )
-        .unwrap()
+    select_with_recovery(store, &recovery, recording, attribution)
+}
+
+fn select_with_recovery(
+    store: &mut PluginHookAggregateStore,
+    recovery: &PublicAggregateRecoveryIndex,
+    recording: &BoundRecordingObservation<'_>,
+    attribution: PluginHookAttribution,
+) -> SelectionSnapshot {
+    let mut staged = store.stage(recovery, recording).unwrap();
+    let selected = staged
+        .select(HookAgent::Claude, HookSurface::PreToolUse, attribution)
+        .unwrap();
+    let snapshot = SelectionSnapshot {
+        event_id: selected.event_id(),
+        bucket: selected.bucket().clone(),
+    };
+    staged.commit();
+    snapshot
 }
 
 fn fill_public_allowance(
@@ -143,15 +169,12 @@ fn surviving_public_plugin_is_adopted_before_capacity_overflow() {
     );
     let mut store = PluginHookAggregateStore::new(recording.day());
 
-    let selected = store
-        .select(
-            &recovery,
-            &recording,
-            HookAgent::Claude,
-            HookSurface::PreToolUse,
-            PluginHookAttribution::Public(plugin),
-        )
-        .unwrap();
+    let selected = select_with_recovery(
+        &mut store,
+        &recovery,
+        &recording,
+        PluginHookAttribution::Public(plugin),
+    );
 
     assert_eq!(selected.event_id(), surviving_event_id);
     assert_eq!(selected.bucket().scope(), PluginScope::Public);
@@ -168,15 +191,12 @@ fn old_epoch_public_plugin_counts_but_is_not_adopted() {
     let recovery = plugin_recovery(recording.day(), &plugin, old_subject, [old_event_id]);
     let mut store = PluginHookAggregateStore::new(recording.day());
 
-    let selected = store
-        .select(
-            &recovery,
-            &recording,
-            HookAgent::Claude,
-            HookSurface::PreToolUse,
-            PluginHookAttribution::Public(plugin),
-        )
-        .unwrap();
+    let selected = select_with_recovery(
+        &mut store,
+        &recovery,
+        &recording,
+        PluginHookAttribution::Public(plugin),
+    );
 
     assert_ne!(selected.event_id(), old_event_id);
     assert_eq!(selected.bucket().scope(), PluginScope::Public);
@@ -189,16 +209,11 @@ fn snapshot_from_another_day_is_rejected_without_changing_the_store() {
     let recording = recording_at(&mut state, 3, 10);
     let mut store = PluginHookAggregateStore::new(recording.day());
     let before = store.clone();
+    let recovery = empty_recovery(UtcDay::from_date(
+        chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
+    ));
 
-    let result = store.select(
-        &empty_recovery(UtcDay::from_date(
-            chrono::NaiveDate::from_ymd_opt(2026, 8, 4).unwrap(),
-        )),
-        &recording,
-        HookAgent::Claude,
-        HookSurface::PreToolUse,
-        PluginHookAttribution::Unnamed,
-    );
+    let result = store.stage(&recovery, &recording);
 
     assert_eq!(
         result.err(),
@@ -254,25 +269,65 @@ fn the_129th_public_plugin_joins_one_overflow_row() {
     let mut state = state();
     let recording = recording_at(&mut state, 3, 10);
     let mut store = PluginHookAggregateStore::new(recording.day());
-    fill_public_allowance(&mut store, &recording);
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+    for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
+        let plugin = public_plugin(&format!("plugin-{index}"));
+        let selected = staged
+            .select(
+                HookAgent::Claude,
+                HookSurface::PreToolUse,
+                PluginHookAttribution::Public(plugin),
+            )
+            .unwrap();
+        assert_eq!(selected.bucket().scope(), PluginScope::Public);
+    }
 
-    let overflow_event_id = select(
-        &mut store,
-        &recording,
-        PluginHookAttribution::Public(public_plugin("overflow-a")),
-    )
-    .event_id();
-    let overflow = select(
-        &mut store,
-        &recording,
-        PluginHookAttribution::Public(public_plugin("overflow-b")),
-    );
+    let overflow_event_id = staged
+        .select(
+            HookAgent::Claude,
+            HookSurface::PreToolUse,
+            PluginHookAttribution::Public(public_plugin("overflow-a")),
+        )
+        .unwrap()
+        .event_id();
+    let overflow = staged
+        .select(
+            HookAgent::Claude,
+            HookSurface::PreToolUse,
+            PluginHookAttribution::Public(public_plugin("overflow-b")),
+        )
+        .unwrap();
 
     assert_eq!(overflow.event_id(), overflow_event_id);
     assert_eq!(overflow.bucket().scope(), PluginScope::Overflow);
     assert_eq!(overflow.bucket().plugin(), None);
     assert_eq!(overflow.bucket().plugin_subject(), None);
+    staged.commit();
     assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
+}
+
+#[test]
+fn dropping_a_stage_rolls_back_admission_and_allowance_changes() {
+    let mut state = state();
+    let recording = recording_at(&mut state, 3, 10);
+    let mut store = PluginHookAggregateStore::new(recording.day());
+    let before = store.clone();
+    let recovery = empty_recovery(recording.day());
+
+    {
+        let mut staged = store.stage(&recovery, &recording).unwrap();
+        let selected = staged
+            .select(
+                HookAgent::Claude,
+                HookSurface::PreToolUse,
+                PluginHookAttribution::Public(public_plugin("rolled-back")),
+            )
+            .unwrap();
+        assert_eq!(selected.bucket().scope(), PluginScope::Public);
+    }
+
+    assert_eq!(store, before);
 }
 
 #[test]
@@ -382,13 +437,8 @@ fn an_older_observation_is_rejected_without_changing_the_store() {
 
     let mut older_state = state();
     let older_recording = recording_at(&mut older_state, 3, 11);
-    let result = store.select(
-        &empty_recovery(older_recording.day()),
-        &older_recording,
-        HookAgent::Claude,
-        HookSurface::PreToolUse,
-        PluginHookAttribution::Unnamed,
-    );
+    let recovery = empty_recovery(older_recording.day());
+    let result = store.stage(&recovery, &older_recording);
 
     assert_eq!(
         result.err(),

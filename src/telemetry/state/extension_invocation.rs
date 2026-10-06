@@ -2,10 +2,9 @@
 
 mod admission;
 
-pub(in crate::telemetry) use admission::SelectedExtensionInvocationAggregate;
-
-#[cfg(test)]
-pub(in crate::telemetry) use admission::ExtensionInvocationAggregateStore;
+pub(in crate::telemetry) use admission::{
+    ExtensionInvocationAggregateStore, SelectedExtensionInvocationAggregate,
+};
 
 use std::fmt;
 
