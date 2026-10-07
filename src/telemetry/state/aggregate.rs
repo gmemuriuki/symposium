@@ -6,15 +6,36 @@ use super::{
 };
 use crate::telemetry::schema::UtcDay;
 
+/// Result of consuming one aggregate private-state stage.
+///
+/// Committing remains infallible because one recording operation applies
+/// several stores sequentially. A stage poisoned by failed selection instead
+/// reports that it discarded every staged edit.
+#[must_use = "aggregate stage commit outcomes must be observed"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::telemetry) enum StageCommit {
+    /// Every staged edit was applied to its destination store.
+    Applied,
+    /// A selection failed, so every staged edit was discarded.
+    DiscardedPoisoned,
+}
+
 /// Private state owned by the three aggregate row families.
 ///
 /// One Claude skill-hook observation can update hook, plugin-hook, and
 /// extension-invocation rows. Keeping their stores as separate fields and
 /// returning all three borrows together gives the coordinator the complete
 /// private-state atomic unit without borrowing a parent object repeatedly.
-/// Once that coordinator lands, it becomes the only code allowed to create
-/// and commit per-store stages; dropping the coordinator rolls all of them
-/// back together.
+/// That coordinator creates all three stages on every recording, including
+/// operations with no aggregate observations, so their days advance together.
+/// It becomes the only code allowed to commit them: success applies all three,
+/// while any staging or row-update failure drops all three. Row-update failure
+/// is safe because touched trackers live in the overlays and each row mutates
+/// its tracker only after its other checked updates succeed.
+///
+/// When these stores join the persisted schema, decoding must validate each
+/// store day against the identity high-water day in `state/codec.rs`. A
+/// disagreement is invalid state rather than a day to reconcile silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::telemetry) struct AggregateState {
     hook: HookAggregateStore,
@@ -67,9 +88,10 @@ mod tests {
         let (hook, plugin_hook, extension_invocation) = aggregates.hook_invocation_stores();
         let hook_stage = hook.stage(&recording).unwrap();
         let plugin_hook_stage = plugin_hook.stage(&recovery, &recording).unwrap();
-        extension_invocation.clear();
+        let extension_invocation_stage = extension_invocation.stage(&recovery, &recording).unwrap();
 
-        hook_stage.commit();
-        plugin_hook_stage.commit();
+        assert_eq!(hook_stage.commit(), StageCommit::Applied);
+        assert_eq!(plugin_hook_stage.commit(), StageCommit::Applied);
+        assert_eq!(extension_invocation_stage.commit(), StageCommit::Applied);
     }
 }

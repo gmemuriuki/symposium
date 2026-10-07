@@ -109,6 +109,49 @@ fn public(name: &str) -> ExtensionInvocationAttribution {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectionSnapshot {
+    event_id: EventId,
+    day: UtcDay,
+    agent: ExtensionInvocationAgent,
+    bucket: AdmittedExtensionBucket,
+    session_counts: ExtensionSessionCountSnapshot,
+}
+
+fn select(
+    store: &mut ExtensionInvocationAggregateStore,
+    recording: &BoundRecordingObservation<'_>,
+    attribution: ExtensionInvocationAttribution,
+) -> SelectionSnapshot {
+    select_with_recovery(
+        store,
+        &empty_recovery(recording.day()),
+        recording,
+        attribution,
+    )
+}
+
+fn select_with_recovery(
+    store: &mut ExtensionInvocationAggregateStore,
+    recovery: &PublicAggregateRecoveryIndex,
+    recording: &BoundRecordingObservation<'_>,
+    attribution: ExtensionInvocationAttribution,
+) -> SelectionSnapshot {
+    let mut staged = store.stage(recovery, recording).unwrap();
+    let mut selected = staged
+        .select(ExtensionInvocationAgent::Claude, attribution)
+        .unwrap();
+    let snapshot = SelectionSnapshot {
+        event_id: selected.event_id(),
+        day: selected.day(),
+        agent: selected.agent(),
+        bucket: selected.bucket().clone(),
+        session_counts: selected.session_counts().snapshot(),
+    };
+    assert_eq!(staged.commit(), StageCommit::Applied);
+    snapshot
+}
+
 #[test]
 fn public_admission_keeps_target_and_subject_together() {
     let mut state = state();
@@ -121,30 +164,20 @@ fn public_admission_keeps_target_and_subject_together() {
     let expected_subject = safe_attribution.derive_subject(recording.identifier_window_scope());
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
 
-    let mut selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            attribution,
-        )
-        .unwrap();
+    let selected = select(&mut store, &recording, attribution);
 
-    assert_eq!(selected.day(), recording.day());
-    assert_eq!(selected.agent(), ExtensionInvocationAgent::Claude);
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    assert_eq!(selected.day, recording.day());
+    assert_eq!(selected.agent, ExtensionInvocationAgent::Claude);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Public);
     assert_eq!(
-        selected.bucket().public_identity(),
+        selected.bucket.public_identity(),
         Some((&expected_target, expected_subject))
     );
-    assert_eq!(selected.bucket().target(), Some(&expected_target));
-    assert_eq!(selected.bucket().unnamed_reason(), None);
+    assert_eq!(selected.bucket.target(), Some(&expected_target));
+    assert_eq!(selected.bucket.unnamed_reason(), None);
+    assert_eq!(selected.bucket.extension_subject(), Some(expected_subject));
     assert_eq!(
-        selected.bucket().extension_subject(),
-        Some(expected_subject)
-    );
-    assert_eq!(
-        selected.session_counts().snapshot(),
+        selected.session_counts,
         ExtensionSessionCountSnapshot::Complete {
             identified_sessions: 0,
             identified_sessions_completed: 0,
@@ -161,17 +194,10 @@ fn surviving_public_target_is_adopted_without_spending_another_slot() {
     let recovery = extension_recovery(recording.day(), &target, subject, [surviving_event_id]);
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
 
-    let selected = store
-        .select(
-            &recovery,
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            attribution,
-        )
-        .unwrap();
+    let selected = select_with_recovery(&mut store, &recovery, &recording, attribution);
 
-    assert_eq!(selected.event_id(), surviving_event_id);
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    assert_eq!(selected.event_id, surviving_event_id);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Public);
     assert_eq!(store.admitted_public_rows(), 1);
 }
 
@@ -189,17 +215,10 @@ fn extension_adoption_precedes_an_exhausted_allowance() {
     );
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
 
-    let selected = store
-        .select(
-            &recovery,
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            attribution,
-        )
-        .unwrap();
+    let selected = select_with_recovery(&mut store, &recovery, &recording, attribution);
 
-    assert_eq!(selected.event_id(), surviving_event_id);
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    assert_eq!(selected.event_id, surviving_event_id);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Public);
     assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
 }
 
@@ -210,12 +229,8 @@ fn extension_snapshot_from_another_day_is_rejected_without_mutation() {
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
     let before = store.clone();
 
-    let result = store.select(
-        &empty_recovery(day(4)),
-        &recording,
-        ExtensionInvocationAgent::Claude,
-        ExtensionInvocationAttribution::Unnamed(UnnamedExtensionReason::Ineligible),
-    );
+    let recovery = empty_recovery(day(4));
+    let result = store.stage(&recovery, &recording);
 
     assert_eq!(
         result.err(),
@@ -228,27 +243,120 @@ fn extension_snapshot_from_another_day_is_rejected_without_mutation() {
 }
 
 #[test]
+fn committing_an_unused_current_day_stage_changes_nothing() {
+    let mut state = state();
+    let recording = recording_observation(&mut state);
+    let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+    select(&mut store, &recording, public("existing-skill"));
+    let before = store.clone();
+    let recovery = empty_recovery(recording.day());
+
+    let staged = store.stage(&recovery, &recording).unwrap();
+
+    assert_eq!(staged.commit(), StageCommit::Applied);
+    assert_eq!(store, before);
+}
+
+#[test]
+fn dropping_a_stage_rolls_back_admission_and_allowance_changes() {
+    let mut state = state();
+    let recording = recording_observation(&mut state);
+    let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+    let before = store.clone();
+    let recovery = empty_recovery(recording.day());
+
+    {
+        let mut staged = store.stage(&recovery, &recording).unwrap();
+        let selected = staged
+            .select(
+                ExtensionInvocationAgent::Claude,
+                public("rolled-back-skill"),
+            )
+            .unwrap();
+        assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    }
+
+    assert_eq!(store, before);
+}
+
+#[test]
+fn dropping_an_adopted_row_restores_the_persisted_allowance() {
+    let mut state = state();
+    let recording = recording_observation(&mut state);
+    let (attribution, target, subject) = public_identity(&recording, "surviving-skill");
+    let surviving_event_id = event_id(1);
+    let recovery = extension_recovery(recording.day(), &target, subject, [surviving_event_id]);
+    let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+    let before = store.clone();
+
+    {
+        let mut staged = store.stage(&recovery, &recording).unwrap();
+        let selected = staged
+            .select(ExtensionInvocationAgent::Claude, attribution)
+            .unwrap();
+        assert_eq!(selected.event_id(), surviving_event_id);
+    }
+
+    assert_eq!(store, before);
+}
+
+#[test]
+fn committing_a_poisoned_stage_discards_every_edit() {
+    let mut state = state();
+    let recording = recording_observation(&mut state);
+    let selected_attribution =
+        ExtensionInvocationAttribution::Unnamed(UnnamedExtensionReason::Ineligible);
+    let selected_bucket =
+        AdmittedExtensionBucket::from_attribution(&recording, selected_attribution.clone());
+    let selected_key = ExtensionInvocationAggregateKey::new(
+        &recording,
+        ExtensionInvocationAgent::Claude,
+        &selected_bucket,
+    );
+    let other_bucket = AdmittedExtensionBucket::from_attribution(
+        &recording,
+        ExtensionInvocationAttribution::Unnamed(UnnamedExtensionReason::Ambiguous),
+    );
+    let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+    store.entries.insert(
+        selected_key.clone(),
+        ExtensionInvocationAggregateState::new(&selected_key, other_bucket),
+    );
+    let before = store.clone();
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+
+    let result = staged.select(ExtensionInvocationAgent::Claude, selected_attribution);
+
+    assert_eq!(
+        result.err(),
+        Some(ExtensionInvocationAdmissionError::PrivateState(
+            ExtensionAggregateSelectionError,
+        ))
+    );
+    assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
+    assert_eq!(store, before);
+}
+
+#[test]
 fn unnamed_admission_exposes_only_its_fixed_reason() {
     let mut state = state();
     let recording = recording_observation(&mut state);
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
 
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            ExtensionInvocationAttribution::Unnamed(UnnamedExtensionReason::AttributionUnavailable),
-        )
-        .unwrap();
+    let selected = select(
+        &mut store,
+        &recording,
+        ExtensionInvocationAttribution::Unnamed(UnnamedExtensionReason::AttributionUnavailable),
+    );
 
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Unnamed);
-    assert_eq!(selected.bucket().target(), None);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Unnamed);
+    assert_eq!(selected.bucket.target(), None);
     assert_eq!(
-        selected.bucket().unnamed_reason(),
+        selected.bucket.unnamed_reason(),
         Some(UnnamedExtensionReason::AttributionUnavailable)
     );
-    assert_eq!(selected.bucket().extension_subject(), None);
+    assert_eq!(selected.bucket.extension_subject(), None);
 }
 
 #[test]
@@ -258,26 +366,10 @@ fn separate_recordings_reuse_the_public_event_id_without_spending_again() {
 
     let first_event_id = {
         let recording = recording_at(&mut state, 3, 10);
-        store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public("example-skill"),
-            )
-            .unwrap()
-            .event_id()
+        select(&mut store, &recording, public("example-skill")).event_id
     };
     let recording = recording_at(&mut state, 3, 11);
-    let second_event_id = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-skill"),
-        )
-        .unwrap()
-        .event_id();
+    let second_event_id = select(&mut store, &recording, public("example-skill")).event_id;
 
     assert_eq!(second_event_id, first_event_id);
     assert_eq!(store.len(), 1);
@@ -290,16 +382,13 @@ fn the_129th_public_target_joins_one_overflow_row() {
     let recording = recording_observation(&mut state);
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
     let mut first_event_id = None;
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
 
     for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
         let name = format!("skill-{index}");
-        let selected = store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public(&name),
-            )
+        let selected = staged
+            .select(ExtensionInvocationAgent::Claude, public(&name))
             .unwrap();
         assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
         if index == 0 {
@@ -307,28 +396,16 @@ fn the_129th_public_target_joins_one_overflow_row() {
         }
     }
 
-    let repeated_event_id = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("skill-0"),
-        )
+    let repeated_event_id = staged
+        .select(ExtensionInvocationAgent::Claude, public("skill-0"))
         .unwrap()
         .event_id();
-    let overflow_event_id = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("overflowed-skill"),
-        )
+    let overflow_event_id = staged
+        .select(ExtensionInvocationAgent::Claude, public("overflowed-skill"))
         .unwrap()
         .event_id();
-    let repeated_overflow = store
+    let repeated_overflow = staged
         .select(
-            &empty_recovery(recording.day()),
-            &recording,
             ExtensionInvocationAgent::Claude,
             public("another-overflowed-skill"),
         )
@@ -343,6 +420,7 @@ fn the_129th_public_target_joins_one_overflow_row() {
     assert_eq!(repeated_overflow.bucket().target(), None);
     assert_eq!(repeated_overflow.bucket().unnamed_reason(), None);
     assert_eq!(repeated_overflow.bucket().extension_subject(), None);
+    assert_eq!(staged.commit(), StageCommit::Applied);
     assert_eq!(store.len(), 129);
     assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
 }
@@ -354,14 +432,7 @@ fn identifier_reset_does_not_restore_the_daily_allowance() {
         let recording = recording_observation(&mut state);
         let mut store = ExtensionInvocationAggregateStore::new(recording.day());
         for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
-            store
-                .select(
-                    &empty_recovery(recording.day()),
-                    &recording,
-                    ExtensionInvocationAgent::Claude,
-                    public(&format!("skill-{index}")),
-                )
-                .unwrap();
+            select(&mut store, &recording, public(&format!("skill-{index}")));
         }
         store
     };
@@ -369,16 +440,9 @@ fn identifier_reset_does_not_restore_the_daily_allowance() {
     state.reset_identifiers(day(3)).unwrap();
     store.reset_identifier_epoch();
     let recording = recording_observation(&mut state);
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("after-reset"),
-        )
-        .unwrap();
+    let selected = select(&mut store, &recording, public("after-reset"));
 
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Overflow);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Overflow);
     assert_eq!(store.len(), 1);
     assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
 }
@@ -389,27 +453,13 @@ fn clear_restores_the_daily_allowance() {
     let recording = recording_observation(&mut state);
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
     for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
-        store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public(&format!("skill-{index}")),
-            )
-            .unwrap();
+        select(&mut store, &recording, public(&format!("skill-{index}")));
     }
 
     store.clear();
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("after-clear"),
-        )
-        .unwrap();
+    let selected = select(&mut store, &recording, public("after-clear"));
 
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Public);
     assert_eq!(store.len(), 1);
     assert_eq!(store.admitted_public_rows(), 1);
 }
@@ -420,31 +470,39 @@ fn day_rollover_clears_entries_and_restores_the_allowance() {
     let mut store = {
         let recording = recording_observation(&mut state);
         let mut store = ExtensionInvocationAggregateStore::new(recording.day());
-        store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public("day-three"),
-            )
-            .unwrap();
+        select(&mut store, &recording, public("day-three"));
         store
     };
     let recording = recording_at(&mut state, 4, 10);
 
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("day-four"),
-        )
-        .unwrap();
+    let selected = select(&mut store, &recording, public("day-four"));
 
-    assert_eq!(selected.day(), day(4));
-    assert_eq!(selected.bucket().scope(), ExtensionTargetScope::Public);
+    assert_eq!(selected.day, day(4));
+    assert_eq!(selected.bucket.scope(), ExtensionTargetScope::Public);
     assert_eq!(store.len(), 1);
     assert_eq!(store.admitted_public_rows(), 1);
+}
+
+#[test]
+fn unused_rollover_stage_changes_the_store_only_when_committed() {
+    let mut state = state();
+    let mut store = {
+        let recording = recording_observation(&mut state);
+        let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+        select(&mut store, &recording, public("day-three"));
+        store
+    };
+    let recording = recording_at(&mut state, 4, 10);
+    let recovery = empty_recovery(recording.day());
+    let before = store.clone();
+
+    drop(store.stage(&recovery, &recording).unwrap());
+    assert_eq!(store, before);
+
+    let staged = store.stage(&recovery, &recording).unwrap();
+    assert_eq!(staged.commit(), StageCommit::Applied);
+    assert_eq!(store.len(), 0);
+    assert_eq!(store.admitted_public_rows(), 0);
 }
 
 #[test]
@@ -454,12 +512,8 @@ fn an_older_observation_is_rejected_without_changing_the_store() {
     let mut store = ExtensionInvocationAggregateStore::new(day(4));
     let before = store.clone();
 
-    let result = store.select(
-        &empty_recovery(recording.day()),
-        &recording,
-        ExtensionInvocationAgent::Claude,
-        public("older-observation"),
-    );
+    let recovery = empty_recovery(recording.day());
+    let result = store.stage(&recovery, &recording);
 
     assert_eq!(
         result.err(),

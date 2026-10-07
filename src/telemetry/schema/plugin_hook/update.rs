@@ -318,7 +318,10 @@ mod tests {
         let mut staged = store.stage(&recovery, recording).unwrap();
         let selected = staged.select(HookAgent::Claude, hook, attribution).unwrap();
         let result = use_selection(selected);
-        staged.commit();
+        assert_eq!(
+            staged.commit(),
+            crate::telemetry::state::StageCommit::Applied
+        );
         result
     }
 

@@ -9,7 +9,7 @@ use super::{
 use crate::telemetry::{
     schema::{HookAgent, HookSurface, PluginHookAttribution, UtcDay},
     state::{
-        BoundRecordingObservation, DayBeforeCurrent,
+        BoundRecordingObservation, DayBeforeCurrent, StageCommit,
         open_day::OpenDayUpdate,
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
         staged_entries::StagedEntries,
@@ -69,6 +69,7 @@ impl PluginHookAggregateStore {
             entries: StagedEntries::new(&mut self.entries, day_update == OpenDayUpdate::Advanced),
             recovery,
             recording,
+            poisoned: false,
         })
     }
 
@@ -107,44 +108,75 @@ pub(in crate::telemetry) struct PluginHookAggregateStage<'store, 'context, 'iden
     entries: StagedEntries<'store, PluginHookMetricsKey, PluginHookAggregateState>,
     recovery: &'context PublicAggregateRecoveryIndex,
     recording: &'context BoundRecordingObservation<'identity>,
+    poisoned: bool,
 }
 
 impl PluginHookAggregateStage<'_, '_, '_> {
     /// Select or admit the aggregate for one plugin-hook terminal result.
     ///
     /// Adoption happens before overflow and does not spend another public-row
-    /// slot. Repeated selections reuse the same staged entry.
+    /// slot. Repeated selections reuse the same staged entry. A selection
+    /// error poisons the stage so commit cannot apply partial admission state.
     pub(in crate::telemetry) fn select(
         &mut self,
         agent: HookAgent,
         surface: HookSurface,
         attribution: PluginHookAttribution,
     ) -> Result<SelectedPluginHookAggregate<'_>, PluginHookAdmissionError> {
-        let bucket = AdmittedPluginBucket::from_attribution(self.recording, attribution);
-        let key = PluginHookMetricsKey::new(self.recording, agent, surface, &bucket);
+        let Self {
+            staged_budget,
+            entries,
+            recovery,
+            recording,
+            poisoned,
+            ..
+        } = self;
+        let result = Self::select_inner(
+            staged_budget,
+            entries,
+            recovery,
+            recording,
+            agent,
+            surface,
+            attribution,
+        );
+        if result.is_err() {
+            *poisoned = true;
+        }
+        result
+    }
 
-        if self.entries.contains_key(&key) {
-            return Self::select_existing(&mut self.entries, &key);
+    fn select_inner<'a>(
+        staged_budget: &mut DailyPublicRowBudget,
+        entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
+        recovery: &PublicAggregateRecoveryIndex,
+        recording: &BoundRecordingObservation<'_>,
+        agent: HookAgent,
+        surface: HookSurface,
+        attribution: PluginHookAttribution,
+    ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
+        let bucket = AdmittedPluginBucket::from_attribution(recording, attribution);
+        let key = PluginHookMetricsKey::new(recording, agent, surface, &bucket);
+
+        if entries.contains_key(&key) {
+            return Self::select_existing(entries, &key);
         }
 
         if let Some((plugin, subject)) = bucket.public_identity() {
-            if let Some(event_id) = self
-                .recovery
-                .plugin_hook_event_id(agent, surface, plugin, subject)
-            {
-                return Self::insert_recovered(&mut self.entries, key, bucket, event_id);
+            if let Some(event_id) = recovery.plugin_hook_event_id(agent, surface, plugin, subject) {
+                return Self::insert_recovered(entries, &key, bucket, event_id);
             }
 
-            if self.staged_budget.is_exhausted() {
-                return Self::select_public_at_capacity(&mut self.entries, key);
+            if staged_budget.is_exhausted() {
+                return Self::select_public_at_capacity(entries, key);
             }
 
-            let PublicRowAdmission::Public = self.staged_budget.admit_new() else {
+            let PublicRowAdmission::Public = staged_budget.admit_new() else {
                 unreachable!("BUG: a non-exhausted public-row budget must admit a row");
             };
         }
 
-        Self::insert_new(&mut self.entries, key, bucket)
+        Self::insert_new(entries, &key, bucket)
     }
 
     fn select_public_at_capacity<'a>(
@@ -153,19 +185,19 @@ impl PluginHookAggregateStage<'_, '_, '_> {
     ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
         let bucket = AdmittedPluginBucket::overflow();
         key.bucket = bucket.key();
-        Self::select_or_insert(entries, key, bucket)
+        Self::select_or_insert(entries, &key, bucket)
     }
 
     fn select_or_insert<'a>(
         entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
+        key: &PluginHookMetricsKey,
         bucket: AdmittedPluginBucket,
     ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
         let state = entries.get_or_insert_with(key.clone(), |key| {
             PluginHookAggregateState::new(key, bucket)
         });
         state
-            .select(&key)
+            .select(key)
             .map_err(PluginHookAdmissionError::PrivateState)
     }
 
@@ -185,20 +217,20 @@ impl PluginHookAggregateStage<'_, '_, '_> {
 
     fn insert_new<'a>(
         entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
+        key: &PluginHookMetricsKey,
         bucket: AdmittedPluginBucket,
     ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
         let state = entries.get_or_insert_with(key.clone(), |key| {
             PluginHookAggregateState::new(key, bucket)
         });
         state
-            .select(&key)
+            .select(key)
             .map_err(PluginHookAdmissionError::PrivateState)
     }
 
     fn insert_recovered<'a>(
         entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-        key: PluginHookMetricsKey,
+        key: &PluginHookMetricsKey,
         bucket: AdmittedPluginBucket,
         event_id: crate::telemetry::schema::EventId,
     ) -> Result<SelectedPluginHookAggregate<'a>, PluginHookAdmissionError> {
@@ -206,7 +238,7 @@ impl PluginHookAggregateStage<'_, '_, '_> {
             PluginHookAggregateState::recovered(key, bucket, event_id)
         });
         state
-            .select(&key)
+            .select(key)
             .map_err(PluginHookAdmissionError::PrivateState)
     }
 
@@ -215,16 +247,22 @@ impl PluginHookAggregateStage<'_, '_, '_> {
     /// Hook-invocation recording commits this alongside the hook and
     /// extension-invocation stages. This method must remain infallible so that
     /// sequence cannot stop after committing only part of the private state.
-    pub(in crate::telemetry) fn commit(self) {
+    /// A poisoned stage reports its discard without changing the destination.
+    pub(in crate::telemetry) fn commit(self) -> StageCommit {
         let Self {
             destination_budget,
             staged_budget,
             entries,
             recovery: _,
             recording: _,
+            poisoned,
         } = self;
+        if poisoned {
+            return StageCommit::DiscardedPoisoned;
+        }
         *destination_budget = staged_budget;
         entries.commit();
+        StageCommit::Applied
     }
 }
 

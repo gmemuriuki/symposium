@@ -1,12 +1,6 @@
 //! Bounded admission and private selection for invocation aggregates.
 
-use std::{
-    collections::{
-        BTreeMap,
-        btree_map::{Entry, OccupiedEntry, VacantEntry},
-    },
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
 
 use super::ExtensionSessionCountTracker;
 use crate::telemetry::{
@@ -16,9 +10,10 @@ use crate::telemetry::{
         PublicSkillCoordinate, SupportedAgent, UnnamedExtensionReason, UtcDay,
     },
     state::{
-        BoundRecordingObservation, DayBeforeCurrent,
+        BoundRecordingObservation, DayBeforeCurrent, StageCommit,
         open_day::OpenDayUpdate,
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
+        staged_entries::StagedEntries,
     },
     storage::metrics::PublicAggregateRecoveryIndex,
 };
@@ -285,165 +280,46 @@ impl ExtensionInvocationAggregateStore {
         }
     }
 
-    /// Select or admit the aggregate for one attributed observation.
+    /// Stage private-state edits for one recording operation.
     ///
     /// The required recovery index proves that the day's snapshot loaded
     /// successfully. Every surviving public row contributes to the reconciled
-    /// allowance, while only a complete current-epoch identity can restore a
-    /// missing entry's event identifier. Adoption happens before overflow and
-    /// does not spend another slot. A forward UTC-day transition clears the
-    /// previous entries before applying the new day's surviving count.
+    /// allowance. Day selection and allowance reconciliation happen on a copy,
+    /// so dropping the returned stage leaves this store unchanged. An unused
+    /// stage is deliberately cheap: the future invocation coordinator creates
+    /// all three aggregate-family stages on every recording so their days
+    /// advance together, even when no extension observation is present.
     ///
     /// # Errors
     ///
     /// Returns an admission error if snapshot and observation days disagree,
-    /// the observation day moves backward, or stored private state does not
-    /// match its map key.
-    pub(in crate::telemetry) fn select(
-        &mut self,
-        recovery: &PublicAggregateRecoveryIndex,
-        recording: &BoundRecordingObservation<'_>,
-        agent: ExtensionInvocationAgent,
-        attribution: ExtensionInvocationAttribution,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
+    /// or the observation day moves backward.
+    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+        &'store mut self,
+        recovery: &'context PublicAggregateRecoveryIndex,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<
+        ExtensionInvocationAggregateStage<'store, 'context, 'identity>,
+        ExtensionInvocationAdmissionError,
+    > {
         if recovery.day() != recording.day() {
             return Err(ExtensionInvocationAdmissionError::SnapshotDayMismatch {
                 snapshot_day: recovery.day(),
                 observation_day: recording.day(),
             });
         }
-        if self
-            .public_rows
-            .reconcile(recording.day(), recovery.extension_invocation_public_rows())?
-            == OpenDayUpdate::Advanced
-        {
-            self.entries.clear();
-        }
+        let mut staged_budget = self.public_rows;
+        let day_update = staged_budget
+            .reconcile(recording.day(), recovery.extension_invocation_public_rows())?;
 
-        let bucket = AdmittedExtensionBucket::from_attribution(recording, attribution);
-        let key = ExtensionInvocationAggregateKey::new(recording, agent, &bucket);
-        // Returning a selection keeps the mutable map borrow alive. Check
-        // first, then perform the borrowing lookup in a separate helper so
-        // the absent path can still insert on stable Rust.
-        if self.entries.contains_key(&key) {
-            return Self::select_existing(&mut self.entries, &key);
-        }
-
-        if let Some((target, subject)) = bucket.public_identity() {
-            if let Some(event_id) = recovery.extension_invocation_event_id(agent, target, subject) {
-                return Self::insert_recovered(&mut self.entries, key, bucket, event_id);
-            }
-
-            if self.public_rows.is_exhausted() {
-                return Self::select_public_at_capacity(&mut self.entries, key);
-            }
-
-            let PublicRowAdmission::Public = self.public_rows.admit_new() else {
-                unreachable!("BUG: a non-exhausted public-row budget must admit a row");
-            };
-        }
-
-        Self::insert_new(&mut self.entries, key, bucket)
-    }
-
-    fn select_public_at_capacity(
-        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-        mut key: ExtensionInvocationAggregateKey,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        let bucket = AdmittedExtensionBucket::overflow();
-        key.bucket = bucket.key();
-        Self::select_or_insert(entries, key, bucket)
-    }
-
-    fn select_or_insert(
-        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-        key: ExtensionInvocationAggregateKey,
-        bucket: AdmittedExtensionBucket,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        match entries.entry(key) {
-            Entry::Occupied(entry) => Self::select_occupied(entry),
-            Entry::Vacant(entry) => Self::insert_vacant(entry, bucket),
-        }
-    }
-
-    fn select_existing<'a>(
-        entries: &'a mut BTreeMap<
-            ExtensionInvocationAggregateKey,
-            ExtensionInvocationAggregateState,
-        >,
-        key: &ExtensionInvocationAggregateKey,
-    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
-        let Some(entry) = entries.get_mut(key) else {
-            return Err(ExtensionInvocationAdmissionError::PrivateState(
-                ExtensionAggregateSelectionError,
-            ));
-        };
-        entry
-            .select(key)
-            .map_err(ExtensionInvocationAdmissionError::PrivateState)
-    }
-
-    fn insert_new(
-        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-        key: ExtensionInvocationAggregateKey,
-        bucket: AdmittedExtensionBucket,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        let Entry::Vacant(entry) = entries.entry(key) else {
-            return Err(ExtensionInvocationAdmissionError::PrivateState(
-                ExtensionAggregateSelectionError,
-            ));
-        };
-        Self::insert_vacant(entry, bucket)
-    }
-
-    fn insert_recovered(
-        entries: &mut BTreeMap<ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-        key: ExtensionInvocationAggregateKey,
-        bucket: AdmittedExtensionBucket,
-        event_id: EventId,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        let Entry::Vacant(entry) = entries.entry(key) else {
-            return Err(ExtensionInvocationAdmissionError::PrivateState(
-                ExtensionAggregateSelectionError,
-            ));
-        };
-        let key = entry.key().clone();
-        entry
-            .insert(ExtensionInvocationAggregateState::recovered(
-                &key, bucket, event_id,
-            ))
-            .select(&key)
-            .map_err(ExtensionInvocationAdmissionError::PrivateState)
-    }
-
-    fn select_occupied(
-        entry: OccupiedEntry<
-            '_,
-            ExtensionInvocationAggregateKey,
-            ExtensionInvocationAggregateState,
-        >,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        if entry.get().session_counts.key() != entry.key() {
-            return Err(ExtensionInvocationAdmissionError::PrivateState(
-                ExtensionAggregateSelectionError,
-            ));
-        }
-
-        entry
-            .into_mut()
-            .select_admitted()
-            .map_err(ExtensionInvocationAdmissionError::PrivateState)
-    }
-
-    fn insert_vacant(
-        entry: VacantEntry<'_, ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-        bucket: AdmittedExtensionBucket,
-    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
-        let state = ExtensionInvocationAggregateState::new(entry.key(), bucket);
-        entry
-            .insert(state)
-            .select_admitted()
-            .map_err(ExtensionInvocationAdmissionError::PrivateState)
+        Ok(ExtensionInvocationAggregateStage {
+            destination_budget: &mut self.public_rows,
+            staged_budget,
+            entries: StagedEntries::new(&mut self.entries, day_update == OpenDayUpdate::Advanced),
+            recovery,
+            recording,
+            poisoned: false,
+        })
     }
 
     /// Remove entries from the previous identifier epoch without restoring
@@ -466,6 +342,197 @@ impl ExtensionInvocationAggregateStore {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// Copy-on-write extension-invocation admission for one recording operation.
+///
+/// A skill-hook operation selects at most one extension row. Repeated
+/// selection remains supported so this stage has the same semantics as the
+/// other aggregate families.
+#[must_use = "dropping an extension-invocation stage rolls back its private-state edits"]
+pub(in crate::telemetry) struct ExtensionInvocationAggregateStage<'store, 'context, 'identity> {
+    destination_budget: &'store mut DailyPublicRowBudget,
+    staged_budget: DailyPublicRowBudget,
+    entries:
+        StagedEntries<'store, ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
+    recovery: &'context PublicAggregateRecoveryIndex,
+    recording: &'context BoundRecordingObservation<'identity>,
+    poisoned: bool,
+}
+
+impl ExtensionInvocationAggregateStage<'_, '_, '_> {
+    /// Select or admit the aggregate for one attributed observation.
+    ///
+    /// Adoption happens before overflow and does not spend another public-row
+    /// slot. Repeated selections reuse the same staged entry. Any selection
+    /// error poisons the stage, so a later commit cannot apply partial
+    /// allowance or entry changes even if a caller ignores the error.
+    pub(in crate::telemetry) fn select(
+        &mut self,
+        agent: ExtensionInvocationAgent,
+        attribution: ExtensionInvocationAttribution,
+    ) -> Result<SelectedExtensionInvocationAggregate<'_>, ExtensionInvocationAdmissionError> {
+        let Self {
+            staged_budget,
+            entries,
+            recovery,
+            recording,
+            poisoned,
+            ..
+        } = self;
+        let result = Self::select_inner(
+            staged_budget,
+            entries,
+            recovery,
+            recording,
+            agent,
+            attribution,
+        );
+        if result.is_err() {
+            *poisoned = true;
+        }
+        result
+    }
+
+    fn select_inner<'a>(
+        staged_budget: &mut DailyPublicRowBudget,
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        recovery: &PublicAggregateRecoveryIndex,
+        recording: &BoundRecordingObservation<'_>,
+        agent: ExtensionInvocationAgent,
+        attribution: ExtensionInvocationAttribution,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let bucket = AdmittedExtensionBucket::from_attribution(recording, attribution);
+        let key = ExtensionInvocationAggregateKey::new(recording, agent, &bucket);
+        if entries.contains_key(&key) {
+            return Self::select_existing(entries, &key);
+        }
+
+        if let Some((target, subject)) = bucket.public_identity() {
+            if let Some(event_id) = recovery.extension_invocation_event_id(agent, target, subject) {
+                return Self::insert_recovered(entries, &key, bucket, event_id);
+            }
+
+            if staged_budget.is_exhausted() {
+                return Self::select_public_at_capacity(entries, key);
+            }
+
+            let PublicRowAdmission::Public = staged_budget.admit_new() else {
+                unreachable!("BUG: a non-exhausted public-row budget must admit a row");
+            };
+        }
+
+        Self::insert_new(entries, &key, bucket)
+    }
+
+    fn select_public_at_capacity<'a>(
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        mut key: ExtensionInvocationAggregateKey,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let bucket = AdmittedExtensionBucket::overflow();
+        key.bucket = bucket.key();
+        Self::select_or_insert(entries, &key, bucket)
+    }
+
+    fn select_or_insert<'a>(
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        key: &ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            ExtensionInvocationAggregateState::new(key, bucket)
+        });
+        state
+            .select(key)
+            .map_err(ExtensionInvocationAdmissionError::PrivateState)
+    }
+
+    fn select_existing<'a>(
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        key: &ExtensionInvocationAggregateKey,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let Some(entry) = entries.get_mut(key) else {
+            return Err(ExtensionInvocationAdmissionError::PrivateState(
+                ExtensionAggregateSelectionError,
+            ));
+        };
+        entry
+            .select(key)
+            .map_err(ExtensionInvocationAdmissionError::PrivateState)
+    }
+
+    fn insert_new<'a>(
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        key: &ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            ExtensionInvocationAggregateState::new(key, bucket)
+        });
+        state
+            .select(key)
+            .map_err(ExtensionInvocationAdmissionError::PrivateState)
+    }
+
+    fn insert_recovered<'a>(
+        entries: &'a mut StagedEntries<
+            '_,
+            ExtensionInvocationAggregateKey,
+            ExtensionInvocationAggregateState,
+        >,
+        key: &ExtensionInvocationAggregateKey,
+        bucket: AdmittedExtensionBucket,
+        event_id: EventId,
+    ) -> Result<SelectedExtensionInvocationAggregate<'a>, ExtensionInvocationAdmissionError> {
+        let state = entries.get_or_insert_with(key.clone(), |key| {
+            ExtensionInvocationAggregateState::recovered(key, bucket, event_id)
+        });
+        state
+            .select(key)
+            .map_err(ExtensionInvocationAdmissionError::PrivateState)
+    }
+
+    /// Apply the staged allowance and entries without a recoverable failure.
+    ///
+    /// Hook-invocation recording commits this alongside the hook and
+    /// plugin-hook stages. A poisoned stage discards all edits and reports
+    /// that outcome without making commit fallible.
+    pub(in crate::telemetry) fn commit(self) -> StageCommit {
+        let Self {
+            destination_budget,
+            staged_budget,
+            entries,
+            recovery: _,
+            recording: _,
+            poisoned,
+        } = self;
+        if poisoned {
+            return StageCommit::DiscardedPoisoned;
+        }
+        *destination_budget = staged_budget;
+        entries.commit();
+        StageCommit::Applied
     }
 }
 

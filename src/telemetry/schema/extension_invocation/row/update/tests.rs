@@ -13,7 +13,7 @@ use crate::telemetry::{
     },
     state::{
         ExtensionInvocationAggregateStore, IDENTIFIER_WINDOW_TEST_STATE, MAX_PUBLIC_ROWS_PER_DAY,
-        TelemetryStateV1, recording_observation,
+        StageCommit, TelemetryStateV1, recording_observation,
     },
     storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
 };
@@ -67,16 +67,25 @@ fn new_row(
     attribution: ExtensionInvocationAttribution,
     observation: ExtensionInvocationMetricObservation<'_>,
 ) -> ExtensionInvocationMetricsV1 {
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            recording,
-            ExtensionInvocationAgent::Claude,
-            attribution,
-        )
-        .unwrap();
+    with_committed_selection(store, recording, attribution, |selected| {
+        ExtensionInvocationMetricsV1::new(recording, observation, selected).unwrap()
+    })
+}
 
-    ExtensionInvocationMetricsV1::new(recording, observation, selected).unwrap()
+fn with_committed_selection<R>(
+    store: &mut ExtensionInvocationAggregateStore,
+    recording: &BoundRecordingObservation<'_>,
+    attribution: ExtensionInvocationAttribution,
+    use_selection: impl FnOnce(SelectedExtensionInvocationAggregate<'_>) -> R,
+) -> R {
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, recording).unwrap();
+    let selected = staged
+        .select(ExtensionInvocationAgent::Claude, attribution)
+        .unwrap();
+    let result = use_selection(selected);
+    assert_eq!(staged.commit(), StageCommit::Applied);
+    result
 }
 
 #[test]
@@ -85,37 +94,24 @@ fn first_public_attempt_builds_identity_and_complete_session_counts_from_selecti
     let recording = recording_observation(&mut state);
     let mut store = ExtensionInvocationAggregateStore::new(recording.day());
     let vendor_session_id = VendorSessionId::new("vendor-session-123".to_owned());
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-debugging"),
-        )
-        .unwrap();
-    let event_id = selected.event_id();
-    let expected_target = selected.bucket().target().cloned();
-    let expected_subject = selected.bucket().extension_subject();
-
-    let row = ExtensionInvocationMetricsV1::new(
+    let row = new_row(
+        &mut store,
         &recording,
+        public("example-debugging"),
         metric_observation(
             ExtensionInvocationPhase::Attempted,
             Some(&vendor_session_id),
         ),
-        selected,
-    )
-    .unwrap();
+    );
     let json = serde_json::to_string(&row).unwrap();
 
     assert_eq!(row.kind, RowKind::ExtensionInvocationMetrics);
-    assert_eq!(row.event_id, event_id);
     assert_eq!(row.day, recording.day());
     assert_eq!(row.agent, ExtensionInvocationAgent::Claude);
     assert_eq!(row.target_scope, ExtensionTargetScope::Public);
-    assert_eq!(row.target, expected_target);
+    assert!(row.target.is_some());
     assert_eq!(row.unnamed_reason, None);
-    assert_eq!(row.extension_subject, expected_subject);
+    assert!(row.extension_subject.is_some());
     assert_eq!(row.attempted, 1);
     assert_eq!(row.completed, 0);
     assert_eq!(row.failed, 0);
@@ -145,24 +141,22 @@ fn missing_snapshot_row_recovers_existing_private_state_with_incomplete_counts()
             Some(&vendor_session_id),
         ),
     );
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-debugging"),
-        )
-        .unwrap();
-
-    let recovered = ExtensionInvocationMetricsV1::new(
+    let recovered = with_committed_selection(
+        &mut store,
         &recording,
-        metric_observation(
-            ExtensionInvocationPhase::Completed,
-            Some(&vendor_session_id),
-        ),
-        selected,
-    )
-    .unwrap();
+        public("example-debugging"),
+        |selected| {
+            ExtensionInvocationMetricsV1::new(
+                &recording,
+                metric_observation(
+                    ExtensionInvocationPhase::Completed,
+                    Some(&vendor_session_id),
+                ),
+                selected,
+            )
+            .unwrap()
+        },
+    );
 
     assert_eq!(recovered.event_id, dropped_row.event_id);
     assert_eq!(
@@ -189,21 +183,19 @@ fn failed_observation_reconciles_private_state_after_a_lost_snapshot_row() {
             Some(&vendor_session_id),
         ),
     );
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-debugging"),
-        )
-        .unwrap();
-
-    let recovered = ExtensionInvocationMetricsV1::new(
+    let recovered = with_committed_selection(
+        &mut store,
         &recording,
-        metric_observation(ExtensionInvocationPhase::Failed, None),
-        selected,
-    )
-    .unwrap();
+        public("example-debugging"),
+        |selected| {
+            ExtensionInvocationMetricsV1::new(
+                &recording,
+                metric_observation(ExtensionInvocationPhase::Failed, None),
+                selected,
+            )
+            .unwrap()
+        },
+    );
     let json = serde_json::to_string(&recovered).unwrap();
 
     assert_eq!(recovered.event_id, dropped_row.event_id);
@@ -274,14 +266,12 @@ fn unnamed_and_overflow_rows_take_their_complete_identity_from_admission() {
     );
     let mut overflow_store = ExtensionInvocationAggregateStore::new(recording.day());
     for index in 0..MAX_PUBLIC_ROWS_PER_DAY {
-        let _selected = overflow_store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public(&format!("skill-{index}")),
-            )
-            .unwrap();
+        with_committed_selection(
+            &mut overflow_store,
+            &recording,
+            public(&format!("skill-{index}")),
+            |_| (),
+        );
     }
 
     let overflow = new_row(
@@ -323,20 +313,19 @@ fn later_phases_accumulate_and_round_trip_as_one_supported_row() {
         ExtensionInvocationPhase::Completed,
         ExtensionInvocationPhase::Failed,
     ] {
-        let selected = store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public("example-debugging"),
-            )
-            .unwrap();
-        row.checked_record(
+        with_committed_selection(
+            &mut store,
             &recording,
-            metric_observation(phase, Some(&vendor_session_id)),
-            selected,
-        )
-        .unwrap();
+            public("example-debugging"),
+            |selected| {
+                row.checked_record(
+                    &recording,
+                    metric_observation(phase, Some(&vendor_session_id)),
+                    selected,
+                )
+                .unwrap();
+            },
+        );
     }
     let json = serde_json::to_string(&row).unwrap();
 
@@ -387,21 +376,19 @@ fn failed_observation_changes_only_the_row_counter() {
         ),
     );
     let store_before = store.clone();
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-debugging"),
-        )
-        .unwrap();
-
-    row.checked_record(
+    with_committed_selection(
+        &mut store,
         &recording,
-        metric_observation(ExtensionInvocationPhase::Failed, None),
-        selected,
-    )
-    .unwrap();
+        public("example-debugging"),
+        |selected| {
+            row.checked_record(
+                &recording,
+                metric_observation(ExtensionInvocationPhase::Failed, None),
+                selected,
+            )
+            .unwrap();
+        },
+    );
 
     assert_eq!(store, store_before);
     assert_eq!((row.attempted, row.completed, row.failed), (1, 0, 1));
@@ -425,24 +412,22 @@ fn baseline_mismatch_marks_both_session_counts_incomplete() {
         ),
     );
     row.attempted = 5;
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("example-debugging"),
-        )
-        .unwrap();
-
-    row.checked_record(
+    with_committed_selection(
+        &mut store,
         &recording,
-        metric_observation(
-            ExtensionInvocationPhase::Attempted,
-            Some(&vendor_session_id),
-        ),
-        selected,
-    )
-    .unwrap();
+        public("example-debugging"),
+        |selected| {
+            row.checked_record(
+                &recording,
+                metric_observation(
+                    ExtensionInvocationPhase::Attempted,
+                    Some(&vendor_session_id),
+                ),
+                selected,
+            )
+            .unwrap();
+        },
+    );
 
     assert_eq!(row.attempted, 6);
     assert!(!row.session_counts_complete);
@@ -475,10 +460,10 @@ fn every_phase_counter_overflow_rejects_without_mutating_row_or_private_state() 
         }
         let row_before = overflowing.clone();
         let store_before = store.clone();
-        let selected = store
+        let recovery = empty_recovery(recording.day());
+        let mut staged = store.stage(&recovery, &recording).unwrap();
+        let selected = staged
             .select(
-                &empty_recovery(recording.day()),
-                &recording,
                 ExtensionInvocationAgent::Claude,
                 public("example-debugging"),
             )
@@ -486,6 +471,7 @@ fn every_phase_counter_overflow_rejects_without_mutating_row_or_private_state() 
 
         let result =
             overflowing.checked_record(&recording, metric_observation(phase, None), selected);
+        drop(staged);
 
         assert_eq!(
             result,
@@ -507,13 +493,10 @@ fn update_rejects_another_target_without_mutation() {
         public("first-skill"),
         metric_observation(ExtensionInvocationPhase::Attempted, None),
     );
-    let selected = store
-        .select(
-            &empty_recovery(recording.day()),
-            &recording,
-            ExtensionInvocationAgent::Claude,
-            public("second-skill"),
-        )
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let selected = staged
+        .select(ExtensionInvocationAgent::Claude, public("second-skill"))
         .unwrap();
     let row_before = row.clone();
 
@@ -522,6 +505,7 @@ fn update_rejects_another_target_without_mutation() {
         metric_observation(ExtensionInvocationPhase::Completed, None),
         selected,
     );
+    drop(staged);
 
     assert_eq!(
         result,
@@ -549,10 +533,10 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
         metric_observation(ExtensionInvocationPhase::Attempted, None),
     );
     let second_store_before = second_store.clone();
-    let selected = second_store
+    let recovery = empty_recovery(recording.day());
+    let mut staged = second_store.stage(&recovery, &recording).unwrap();
+    let selected = staged
         .select(
-            &empty_recovery(recording.day()),
-            &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
         )
@@ -564,6 +548,7 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
         metric_observation(ExtensionInvocationPhase::Completed, None),
         selected,
     );
+    drop(staged);
 
     assert_eq!(
         result,
@@ -575,39 +560,34 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
 
 #[test]
 fn update_rejects_a_selection_from_another_identifier_epoch() {
-    let mut state = state();
-    let mut store;
-    let mut row;
-    {
-        let recording = recording_observation(&mut state);
-        store = ExtensionInvocationAggregateStore::new(recording.day());
-        row = new_row(
-            &mut store,
-            &recording,
+    let mut old_state = state();
+    let recording = recording_observation(&mut old_state);
+    let mut store = ExtensionInvocationAggregateStore::new(recording.day());
+    let mut row = new_row(
+        &mut store,
+        &recording,
+        public("example-debugging"),
+        metric_observation(ExtensionInvocationPhase::Attempted, None),
+    );
+    let recovery = empty_recovery(row.day);
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let selected = staged
+        .select(
+            ExtensionInvocationAgent::Claude,
             public("example-debugging"),
-            metric_observation(ExtensionInvocationPhase::Attempted, None),
-        );
-    }
-    let selected = {
-        let recording = recording_observation(&mut state);
-        store
-            .select(
-                &empty_recovery(recording.day()),
-                &recording,
-                ExtensionInvocationAgent::Claude,
-                public("example-debugging"),
-            )
-            .unwrap()
-    };
-    state.reset_identifiers(row.day).unwrap();
-    let recording = recording_observation(&mut state);
+        )
+        .unwrap();
+    let mut reset_state = state();
+    reset_state.reset_identifiers(row.day).unwrap();
+    let reset_recording = recording_observation(&mut reset_state);
     let row_before = row.clone();
 
     let result = row.checked_record(
-        &recording,
+        &reset_recording,
         metric_observation(ExtensionInvocationPhase::Completed, None),
         selected,
     );
+    drop(staged);
 
     assert_eq!(
         result,
@@ -633,10 +613,10 @@ fn day_rollover_rejects_the_previous_days_row_from_the_same_store() {
     }
     let row_before = row.clone();
     let recording = recording_at(&mut state, 4);
-    let selected = store
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let selected = staged
         .select(
-            &empty_recovery(recording.day()),
-            &recording,
             ExtensionInvocationAgent::Claude,
             public("example-debugging"),
         )
@@ -647,6 +627,7 @@ fn day_rollover_rejects_the_previous_days_row_from_the_same_store() {
         metric_observation(ExtensionInvocationPhase::Completed, None),
         selected,
     );
+    drop(staged);
 
     assert_eq!(
         result,

@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, fmt};
 
 use super::{
-    BoundRecordingObservation, DayBeforeCurrent, HookSessionCountTracker,
+    BoundRecordingObservation, DayBeforeCurrent, HookSessionCountTracker, StageCommit,
     open_day::{OpenDay, OpenDayUpdate},
     staged_entries::StagedEntries,
 };
@@ -56,6 +56,7 @@ impl HookAggregateStore {
             staged_day,
             entries: StagedEntries::new(&mut self.entries, day_update == OpenDayUpdate::Advanced),
             recording,
+            poisoned: false,
         })
     }
 
@@ -86,6 +87,7 @@ pub(in crate::telemetry) struct HookAggregateStage<'store, 'context, 'identity> 
     staged_day: OpenDay,
     entries: StagedEntries<'store, HookMetricsKey, HookSessionCountTracker<HookMetricsKey>>,
     recording: &'context BoundRecordingObservation<'identity>,
+    poisoned: bool,
 }
 
 impl HookAggregateStage<'_, '_, '_> {
@@ -93,17 +95,21 @@ impl HookAggregateStage<'_, '_, '_> {
     ///
     /// Repeated selections reuse the same staged value. After day rollover,
     /// the overlay never reads from the closed day's map, even if a future key
-    /// type could otherwise collide with an old entry.
+    /// type could otherwise collide with an old entry. A selection error
+    /// poisons the stage so commit cannot apply partial edits.
     pub(in crate::telemetry) fn select(
         &mut self,
         agent: HookAgent,
         hook: HookSurface,
     ) -> Result<&mut HookSessionCountTracker<HookMetricsKey>, HookAggregateStoreError> {
         let key = HookMetricsKey::new(self.recording, agent, hook);
-        let session_counts = self
-            .entries
-            .get_or_insert_with(key, |key| HookSessionCountTracker::new(*key));
+        let Self {
+            entries, poisoned, ..
+        } = self;
+        let session_counts =
+            entries.get_or_insert_with(key, |key| HookSessionCountTracker::new(*key));
         if session_counts.key() != &key {
+            *poisoned = true;
             return Err(HookAggregateStoreError::PrivateState(
                 HookAggregateSelectionError,
             ));
@@ -117,15 +123,21 @@ impl HookAggregateStage<'_, '_, '_> {
     /// Hook-invocation recording commits this alongside the plugin-hook and
     /// extension-invocation stages. This method must remain infallible so that
     /// sequence cannot stop after committing only part of the private state.
-    pub(in crate::telemetry) fn commit(self) {
+    /// A poisoned stage reports its discard without changing the destination.
+    pub(in crate::telemetry) fn commit(self) -> StageCommit {
         let Self {
             destination_day,
             staged_day,
             entries,
             recording: _,
+            poisoned,
         } = self;
+        if poisoned {
+            return StageCommit::DiscardedPoisoned;
+        }
         *destination_day = staged_day;
         entries.commit();
+        StageCommit::Applied
     }
 }
 
@@ -205,7 +217,7 @@ mod tests {
 
         assert_eq!(tracker.key(), &first_key);
         assert_eq!(tracker.snapshot(), HookSessionCountSnapshot::Incomplete);
-        staged.commit();
+        assert_eq!(staged.commit(), StageCommit::Applied);
         assert_eq!(store.len(), 1);
     }
 
@@ -226,7 +238,7 @@ mod tests {
             .key();
 
         assert_ne!(post_tool_key, pre_tool_key);
-        staged.commit();
+        assert_eq!(staged.commit(), StageCommit::Applied);
         assert_eq!(store.len(), 2);
     }
 
@@ -241,7 +253,7 @@ mod tests {
                 .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap();
             tracker.checked_record(0, None, HookOutcome::Ok).unwrap();
-            staged.commit();
+            assert_eq!(staged.commit(), StageCommit::Applied);
         }
         let later = recording_at(&mut state, 4);
         let before = store.clone();
@@ -266,7 +278,7 @@ mod tests {
         staged
             .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap();
-        staged.commit();
+        assert_eq!(staged.commit(), StageCommit::Applied);
         assert_eq!(store.len(), 1);
     }
 
@@ -316,6 +328,7 @@ mod tests {
             error,
             HookAggregateStoreError::PrivateState(HookAggregateSelectionError)
         );
+        assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
         assert_eq!(store, before);
     }
 
@@ -330,7 +343,7 @@ mod tests {
                 .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap()
                 .key();
-            staged.commit();
+            assert_eq!(staged.commit(), StageCommit::Applied);
             (key, recording.completed_at())
         };
 
@@ -343,7 +356,7 @@ mod tests {
             .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap()
             .key();
-        staged.commit();
+        assert_eq!(staged.commit(), StageCommit::Applied);
 
         assert_ne!(new_key, old_key);
         assert_eq!(store.len(), 1);
@@ -358,7 +371,7 @@ mod tests {
         staged
             .select(HookAgent::Claude, HookSurface::PreToolUse)
             .unwrap();
-        staged.commit();
+        assert_eq!(staged.commit(), StageCommit::Applied);
 
         store.clear();
 

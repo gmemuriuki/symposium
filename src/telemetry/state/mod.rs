@@ -29,6 +29,7 @@ mod session_counts;
 mod session_pair;
 mod staged_entries;
 
+pub(in crate::telemetry) use aggregate::StageCommit;
 pub(in crate::telemetry) use codec::{StateContentError, StateDecodeError, decode, encode};
 pub(in crate::telemetry) use extension_invocation::{
     ExtensionSessionCountBaseline, ExtensionSessionCountSnapshot, ExtensionSessionCountUpdateError,

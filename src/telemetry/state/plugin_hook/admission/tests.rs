@@ -116,7 +116,7 @@ fn select_with_recovery(
         event_id: selected.event_id(),
         bucket: selected.bucket().clone(),
     };
-    staged.commit();
+    assert_eq!(staged.commit(), StageCommit::Applied);
     snapshot
 }
 
@@ -303,7 +303,7 @@ fn the_129th_public_plugin_joins_one_overflow_row() {
     assert_eq!(overflow.bucket().scope(), PluginScope::Overflow);
     assert_eq!(overflow.bucket().plugin(), None);
     assert_eq!(overflow.bucket().plugin_subject(), None);
-    staged.commit();
+    assert_eq!(staged.commit(), StageCommit::Applied);
     assert_eq!(store.admitted_public_rows(), MAX_PUBLIC_ROWS_PER_DAY);
 }
 
@@ -327,6 +327,48 @@ fn dropping_a_stage_rolls_back_admission_and_allowance_changes() {
         assert_eq!(selected.bucket().scope(), PluginScope::Public);
     }
 
+    assert_eq!(store, before);
+}
+
+#[test]
+fn committing_a_poisoned_stage_discards_every_edit() {
+    let mut state = state();
+    let recording = recording_at(&mut state, 3, 10);
+    let selected_attribution = PluginHookAttribution::Unnamed;
+    let selected_bucket =
+        AdmittedPluginBucket::from_attribution(&recording, selected_attribution.clone());
+    let selected_key = PluginHookMetricsKey::new(
+        &recording,
+        HookAgent::Claude,
+        HookSurface::PreToolUse,
+        &selected_bucket,
+    );
+    let other_bucket = AdmittedPluginBucket::from_attribution(
+        &recording,
+        PluginHookAttribution::Public(public_plugin("another-plugin")),
+    );
+    let mut store = PluginHookAggregateStore::new(recording.day());
+    store.entries.insert(
+        selected_key.clone(),
+        PluginHookAggregateState::new(&selected_key, other_bucket),
+    );
+    let before = store.clone();
+    let recovery = empty_recovery(recording.day());
+    let mut staged = store.stage(&recovery, &recording).unwrap();
+
+    let result = staged.select(
+        HookAgent::Claude,
+        HookSurface::PreToolUse,
+        selected_attribution,
+    );
+
+    assert_eq!(
+        result.err(),
+        Some(PluginHookAdmissionError::PrivateState(
+            PluginHookAggregateSelectionError,
+        ))
+    );
+    assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
     assert_eq!(store, before);
 }
 

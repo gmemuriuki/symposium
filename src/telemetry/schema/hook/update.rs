@@ -398,7 +398,10 @@ mod tests {
                 tracker,
             )
             .unwrap();
-            staged.commit();
+            assert_eq!(
+                staged.commit(),
+                crate::telemetry::state::StageCommit::Applied
+            );
         }
         let completed_at =
             UtcSecond::from_datetime(Utc.with_ymd_and_hms(2026, 8, 4, 10, 2, 11).unwrap());
