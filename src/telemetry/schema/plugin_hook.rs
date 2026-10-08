@@ -18,7 +18,10 @@ mod outcome;
 mod update;
 
 pub(in crate::telemetry) use bucket::{PluginHookAttribution, PluginScope, PublicPluginCoordinate};
-pub(in crate::telemetry) use outcome::PluginHookOutcome;
+#[cfg(test)]
+pub(in crate::telemetry) use outcome::PluginHookOutcomeSignals;
+pub(in crate::telemetry) use outcome::{PluginHookAttempt, PluginHookOutcome};
+pub(in crate::telemetry) use update::{PluginHookMetricObservation, PluginHookMetricsUpdateError};
 strict_versioned_row! {
     /// Version 1 daily aggregate for one plugin, agent, and hook surface.
     pub(in crate::telemetry) struct PluginHookMetricsV1 {

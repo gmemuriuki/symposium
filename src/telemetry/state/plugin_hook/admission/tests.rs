@@ -8,7 +8,7 @@ use crate::telemetry::{
         TelemetryRow, UtcSecond, classify_row, recorded_data_example_row,
     },
     state::{IDENTIFIER_WINDOW_TEST_STATE, MAX_PUBLIC_ROWS_PER_DAY, TelemetryStateV1},
-    storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
+    storage::metrics::{AggregateRecoveryIndex, MetricSnapshot},
 };
 
 fn state() -> TelemetryStateV1 {
@@ -34,8 +34,8 @@ fn public_plugin(name: &str) -> PublicPluginCoordinate {
     .unwrap()
 }
 
-fn empty_recovery(day: UtcDay) -> PublicAggregateRecoveryIndex {
-    MetricSnapshot::empty(day).public_recovery_index()
+fn empty_recovery(day: UtcDay) -> AggregateRecoveryIndex {
+    MetricSnapshot::empty(day).recovery_index()
 }
 
 fn event_id(value: u128) -> EventId {
@@ -67,14 +67,14 @@ fn plugin_recovery(
     plugin: &PublicPluginCoordinate,
     subject: PluginSubject,
     event_ids: impl IntoIterator<Item = EventId>,
-) -> PublicAggregateRecoveryIndex {
+) -> AggregateRecoveryIndex {
     let mut snapshot = MetricSnapshot::empty(day);
     for event_id in event_ids {
         snapshot
             .insert(plugin_row(plugin, subject, event_id))
             .unwrap();
     }
-    snapshot.public_recovery_index()
+    snapshot.recovery_index()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +104,7 @@ fn select(
 
 fn select_with_recovery(
     store: &mut PluginHookAggregateStore,
-    recovery: &PublicAggregateRecoveryIndex,
+    recovery: &AggregateRecoveryIndex,
     recording: &BoundRecordingObservation<'_>,
     attribution: PluginHookAttribution,
 ) -> SelectionSnapshot {
@@ -368,6 +368,7 @@ fn committing_a_poisoned_stage_discards_every_edit() {
             PluginHookAggregateSelectionError,
         ))
     );
+    assert!(staged.is_poisoned());
     assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
     assert_eq!(store, before);
 }

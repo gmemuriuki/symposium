@@ -15,15 +15,15 @@ use crate::telemetry::{
         ExtensionInvocationAggregateStore, IDENTIFIER_WINDOW_TEST_STATE, MAX_PUBLIC_ROWS_PER_DAY,
         StageCommit, TelemetryStateV1, recording_observation,
     },
-    storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
+    storage::metrics::{AggregateRecoveryIndex, MetricSnapshot},
 };
 
 fn state() -> TelemetryStateV1 {
     toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap()
 }
 
-fn empty_recovery(day: UtcDay) -> PublicAggregateRecoveryIndex {
-    MetricSnapshot::empty(day).public_recovery_index()
+fn empty_recovery(day: UtcDay) -> AggregateRecoveryIndex {
+    MetricSnapshot::empty(day).recovery_index()
 }
 
 fn public(name: &str) -> ExtensionInvocationAttribution {
@@ -79,7 +79,7 @@ fn with_committed_selection<R>(
     use_selection: impl FnOnce(SelectedExtensionInvocationAggregate<'_>) -> R,
 ) -> R {
     let recovery = empty_recovery(recording.day());
-    let mut staged = store.stage(&recovery, recording).unwrap();
+    let mut staged = store.stage_for_test(&recovery, recording).unwrap();
     let selected = staged
         .select(ExtensionInvocationAgent::Claude, attribution)
         .unwrap();
@@ -461,7 +461,7 @@ fn every_phase_counter_overflow_rejects_without_mutating_row_or_private_state() 
         let row_before = overflowing.clone();
         let store_before = store.clone();
         let recovery = empty_recovery(recording.day());
-        let mut staged = store.stage(&recovery, &recording).unwrap();
+        let mut staged = store.stage_for_test(&recovery, &recording).unwrap();
         let selected = staged
             .select(
                 ExtensionInvocationAgent::Claude,
@@ -494,7 +494,7 @@ fn update_rejects_another_target_without_mutation() {
         metric_observation(ExtensionInvocationPhase::Attempted, None),
     );
     let recovery = empty_recovery(recording.day());
-    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let mut staged = store.stage_for_test(&recovery, &recording).unwrap();
     let selected = staged
         .select(ExtensionInvocationAgent::Claude, public("second-skill"))
         .unwrap();
@@ -534,7 +534,7 @@ fn update_rejects_private_state_from_another_row_without_mutation() {
     );
     let second_store_before = second_store.clone();
     let recovery = empty_recovery(recording.day());
-    let mut staged = second_store.stage(&recovery, &recording).unwrap();
+    let mut staged = second_store.stage_for_test(&recovery, &recording).unwrap();
     let selected = staged
         .select(
             ExtensionInvocationAgent::Claude,
@@ -570,7 +570,7 @@ fn update_rejects_a_selection_from_another_identifier_epoch() {
         metric_observation(ExtensionInvocationPhase::Attempted, None),
     );
     let recovery = empty_recovery(row.day);
-    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let mut staged = store.stage_for_test(&recovery, &recording).unwrap();
     let selected = staged
         .select(
             ExtensionInvocationAgent::Claude,
@@ -614,7 +614,7 @@ fn day_rollover_rejects_the_previous_days_row_from_the_same_store() {
     let row_before = row.clone();
     let recording = recording_at(&mut state, 4);
     let recovery = empty_recovery(recording.day());
-    let mut staged = store.stage(&recovery, &recording).unwrap();
+    let mut staged = store.stage_for_test(&recovery, &recording).unwrap();
     let selected = staged
         .select(
             ExtensionInvocationAgent::Claude,

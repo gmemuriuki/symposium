@@ -13,7 +13,7 @@ use crate::telemetry::{
         extension_invocation::ExtensionSessionCountSnapshot,
         public_row_budget::MAX_PUBLIC_ROWS_PER_DAY, recording_observation,
     },
-    storage::metrics::{MetricSnapshot, PublicAggregateRecoveryIndex},
+    storage::metrics::{AggregateRecoveryIndex, MetricSnapshot},
 };
 
 fn state() -> TelemetryStateV1 {
@@ -24,8 +24,8 @@ fn day(day: u32) -> UtcDay {
     UtcDay::from_date(NaiveDate::from_ymd_opt(2026, 8, day).unwrap())
 }
 
-fn empty_recovery(day: UtcDay) -> PublicAggregateRecoveryIndex {
-    MetricSnapshot::empty(day).public_recovery_index()
+fn empty_recovery(day: UtcDay) -> AggregateRecoveryIndex {
+    MetricSnapshot::empty(day).recovery_index()
 }
 
 fn event_id(value: u128) -> EventId {
@@ -74,14 +74,14 @@ fn extension_recovery(
     target: &PublicSkillCoordinate,
     subject: ExtensionSubject,
     event_ids: impl IntoIterator<Item = EventId>,
-) -> PublicAggregateRecoveryIndex {
+) -> AggregateRecoveryIndex {
     let mut snapshot = MetricSnapshot::empty(day);
     for event_id in event_ids {
         snapshot
             .insert(extension_row(target, subject, event_id))
             .unwrap();
     }
-    snapshot.public_recovery_index()
+    snapshot.recovery_index()
 }
 
 fn recording_at(
@@ -133,7 +133,7 @@ fn select(
 
 fn select_with_recovery(
     store: &mut ExtensionInvocationAggregateStore,
-    recovery: &PublicAggregateRecoveryIndex,
+    recovery: &AggregateRecoveryIndex,
     recording: &BoundRecordingObservation<'_>,
     attribution: ExtensionInvocationAttribution,
 ) -> SelectionSnapshot {
@@ -334,6 +334,7 @@ fn committing_a_poisoned_stage_discards_every_edit() {
             ExtensionAggregateSelectionError,
         ))
     );
+    assert!(staged.is_poisoned());
     assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
     assert_eq!(store, before);
 }

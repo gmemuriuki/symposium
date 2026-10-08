@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::telemetry::{
     identity::{ExtensionSubject, PluginSubject},
     schema::{
-        AggregateRow, EventId, ExtensionInvocationAgent, HookAgent, HookSurface,
+        AggregateRow, EventId, ExtensionInvocationAgent, HookAgent, HookMetricsKey, HookSurface,
         PublicPluginCoordinate, PublicSkillCoordinate, UtcDay, VersionedRow,
     },
 };
@@ -24,18 +24,20 @@ use super::MetricSnapshot;
 /// in admission APIs makes aggregate selection unavailable after a failed
 /// snapshot load.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::telemetry) struct PublicAggregateRecoveryIndex {
+pub(in crate::telemetry) struct AggregateRecoveryIndex {
     day: UtcDay,
+    hook_rows: BTreeMap<HookMetricsKey, EventId>,
     plugin_hook_public_rows: u64,
     extension_invocation_public_rows: u64,
     plugin_hook_rows: BTreeMap<PluginHookRecoveryKey, EventId>,
     extension_invocation_rows: BTreeMap<ExtensionInvocationRecoveryKey, EventId>,
 }
 
-impl PublicAggregateRecoveryIndex {
+impl AggregateRecoveryIndex {
     fn from_snapshot(snapshot: &MetricSnapshot) -> Self {
         let mut index = Self {
             day: snapshot.day,
+            hook_rows: BTreeMap::new(),
             plugin_hook_public_rows: 0,
             extension_invocation_public_rows: 0,
             plugin_hook_rows: BTreeMap::new(),
@@ -44,7 +46,9 @@ impl PublicAggregateRecoveryIndex {
 
         for stored in &snapshot.rows {
             match &stored.row {
-                AggregateRow::Hook(_) => {}
+                AggregateRow::Hook(row) => {
+                    retain_lowest_event_id(&mut index.hook_rows, row.key(), row.event_id());
+                }
                 AggregateRow::PluginHook(row) => {
                     let Some((agent, hook, plugin, subject)) = row.public_recovery_identity()
                     else {
@@ -79,6 +83,12 @@ impl PublicAggregateRecoveryIndex {
     #[must_use]
     pub(in crate::telemetry) const fn day(&self) -> UtcDay {
         self.day
+    }
+
+    /// Find the deterministic surviving row for one hook aggregate key.
+    #[must_use]
+    pub(in crate::telemetry) fn hook_event_id(&self, key: HookMetricsKey) -> Option<EventId> {
+        self.hook_rows.get(&key).copied()
     }
 
     /// Count surviving public plugin-hook rows, including old epochs.
@@ -124,8 +134,8 @@ impl PublicAggregateRecoveryIndex {
 impl MetricSnapshot {
     /// Index the public rows that constrain admission or can recover an entry.
     #[must_use]
-    pub(in crate::telemetry) fn public_recovery_index(&self) -> PublicAggregateRecoveryIndex {
-        PublicAggregateRecoveryIndex::from_snapshot(self)
+    pub(in crate::telemetry) fn recovery_index(&self) -> AggregateRecoveryIndex {
+        AggregateRecoveryIndex::from_snapshot(self)
     }
 }
 

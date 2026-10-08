@@ -15,16 +15,24 @@ mod name;
 mod plugin_hook;
 mod resolution;
 
-pub(in crate::telemetry) use agent::{HookAgent, SupportedAgent};
+pub(in crate::telemetry) use agent::{HookAgent, SupportedAgent, VendorSessionId};
 pub(in crate::telemetry) use extension_invocation::{
-    ExtensionInvocationAgent, ExtensionInvocationAttribution, ExtensionInvocationPhase,
+    ExtensionInvocationAgent, ExtensionInvocationAttribution, ExtensionInvocationMetricObservation,
+    ExtensionInvocationMetricsUpdateError, ExtensionInvocationMetricsV1, ExtensionInvocationPhase,
     ExtensionTargetScope, UnnamedExtensionReason,
 };
 
-pub(in crate::telemetry) use hook::{HookMetricsKey, HookOutcome, HookSurface};
+pub(in crate::telemetry) use hook::{
+    HookMetricObservation, HookMetricsKey, HookMetricsUpdateError, HookMetricsV1, HookOutcome,
+    HookSurface,
+};
 pub(in crate::telemetry) use metrics::MAX_IDENTIFIED_SESSIONS;
+#[cfg(test)]
+pub(in crate::telemetry) use plugin_hook::PluginHookOutcomeSignals;
 pub(in crate::telemetry) use plugin_hook::{
-    PluginHookAttribution, PluginHookOutcome, PluginScope, PublicPluginCoordinate,
+    PluginHookAttempt, PluginHookAttribution, PluginHookMetricObservation,
+    PluginHookMetricsUpdateError, PluginHookMetricsV1, PluginHookOutcome, PluginScope,
+    PublicPluginCoordinate,
 };
 
 use std::{fmt, num::NonZeroU64, str::FromStr, sync::LazyLock};
@@ -42,10 +50,7 @@ use crate::telemetry::state::{IDENTIFIER_WINDOW_TEST_STATE, recording_observatio
 
 use agent::{AgentConfigurationV1, SessionStartV1};
 use command::CommandV1;
-use extension_invocation::ExtensionInvocationMetricsV1;
-use hook::HookMetricsV1;
 use macros::strict_versioned_row;
-use plugin_hook::PluginHookMetricsV1;
 pub(in crate::telemetry) use resolution::extension::PublicSkillCoordinate;
 use resolution::{
     ResolutionSummaryV1, extension::ExtensionResolutionV1, package::PackageResolutionV1,

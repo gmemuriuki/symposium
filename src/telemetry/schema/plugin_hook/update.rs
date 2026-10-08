@@ -314,8 +314,8 @@ mod tests {
         hook: HookSurface,
         use_selection: impl FnOnce(SelectedPluginHookAggregate<'_>) -> R,
     ) -> R {
-        let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
-        let mut staged = store.stage(&recovery, recording).unwrap();
+        let recovery = MetricSnapshot::empty(recording.day()).recovery_index();
+        let mut staged = store.stage_for_test(&recovery, recording).unwrap();
         let selected = staged.select(HookAgent::Claude, hook, attribution).unwrap();
         let result = use_selection(selected);
         assert_eq!(
@@ -332,8 +332,8 @@ mod tests {
         hook: HookSurface,
         use_selection: impl FnOnce(SelectedPluginHookAggregate<'_>) -> R,
     ) -> R {
-        let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
-        let mut staged = store.stage(&recovery, recording).unwrap();
+        let recovery = MetricSnapshot::empty(recording.day()).recovery_index();
+        let mut staged = store.stage_for_test(&recovery, recording).unwrap();
         let selected = staged.select(HookAgent::Claude, hook, attribution).unwrap();
         use_selection(selected)
     }

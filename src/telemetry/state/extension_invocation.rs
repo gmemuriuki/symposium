@@ -3,6 +3,7 @@
 mod admission;
 
 pub(in crate::telemetry) use admission::{
+    ExtensionInvocationAdmissionError, ExtensionInvocationAggregateStage,
     ExtensionInvocationAggregateStore, SelectedExtensionInvocationAggregate,
 };
 

@@ -76,7 +76,7 @@ fn an_old_epoch_public_row_counts_but_only_its_subject_is_adoptable() {
     let mut snapshot = MetricSnapshot::empty(day(3));
     snapshot.insert(row).unwrap();
 
-    let index = snapshot.public_recovery_index();
+    let index = snapshot.recovery_index();
 
     assert_eq!(index.plugin_hook_public_rows(), 1);
     assert_eq!(
@@ -104,7 +104,7 @@ fn duplicate_public_plugin_rows_choose_the_lowest_event_id_and_both_count() {
     snapshot.insert(higher).unwrap();
     snapshot.insert(lower).unwrap();
 
-    let index = snapshot.public_recovery_index();
+    let index = snapshot.recovery_index();
 
     assert_eq!(index.plugin_hook_public_rows(), 2);
     assert_eq!(
@@ -123,7 +123,7 @@ fn extension_rows_have_an_independent_count_and_adoption_lookup() {
     let mut snapshot = MetricSnapshot::empty(day(3));
     snapshot.insert(row).unwrap();
 
-    let index = snapshot.public_recovery_index();
+    let index = snapshot.recovery_index();
 
     assert_eq!(index.plugin_hook_public_rows(), 0);
     assert_eq!(index.extension_invocation_public_rows(), 1);
@@ -150,7 +150,7 @@ fn public_row_count_includes_rows_beyond_the_daily_allowance() {
         snapshot.insert(row).unwrap();
     }
 
-    let index = snapshot.public_recovery_index();
+    let index = snapshot.recovery_index();
 
     assert_eq!(index.plugin_hook_public_rows(), 129);
 }
@@ -180,7 +180,7 @@ fn unnamed_and_overflow_rows_are_neither_counted_nor_adoptable() {
     snapshot.insert(aggregate_value(&unnamed_value)).unwrap();
     snapshot.insert(aggregate_value(&overflow_value)).unwrap();
 
-    let index = snapshot.public_recovery_index();
+    let index = snapshot.recovery_index();
 
     assert_eq!(index.plugin_hook_public_rows(), 0);
     assert_eq!(

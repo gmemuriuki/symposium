@@ -16,7 +16,9 @@ use crate::telemetry::{
 
 mod admission;
 
-pub(in crate::telemetry) use admission::PluginHookAggregateStore;
+pub(in crate::telemetry) use admission::{
+    PluginHookAdmissionError, PluginHookAggregateStage, PluginHookAggregateStore,
+};
 
 /// Identity fields admitted for one plugin-hook aggregate row.
 ///

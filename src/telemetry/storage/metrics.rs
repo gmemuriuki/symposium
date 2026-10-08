@@ -38,7 +38,7 @@ use super::{
 
 mod recovery;
 
-pub(in crate::telemetry) use recovery::PublicAggregateRecoveryIndex;
+pub(in crate::telemetry) use recovery::AggregateRecoveryIndex;
 
 /// Maximum physical size of one aggregate snapshot.
 pub(super) const MAX_METRIC_SNAPSHOT_BYTES: usize = 512 * 1024;
@@ -75,6 +75,15 @@ impl MetricSnapshot {
             day,
             rows: Vec::new(),
         }
+    }
+
+    /// Iterate over the validated aggregate rows in this snapshot.
+    ///
+    /// The physical storage order is intentionally not exposed: preparation
+    /// applies the canonical wire-label ordering before replacement.
+    #[cfg(test)]
+    pub(in crate::telemetry) fn rows(&self) -> impl Iterator<Item = &AggregateRow> {
+        self.rows.iter().map(|stored| &stored.row)
     }
 
     /// Borrow the row with this exact persisted identifier.

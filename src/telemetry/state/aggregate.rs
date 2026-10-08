@@ -1,5 +1,7 @@
 //! Disjoint private stores for cumulative telemetry rows.
 
+pub(in crate::telemetry) mod recording;
+
 use super::{
     extension_invocation::ExtensionInvocationAggregateStore, hook::HookAggregateStore,
     plugin_hook::PluginHookAggregateStore,
@@ -26,12 +28,14 @@ pub(in crate::telemetry) enum StageCommit {
 /// extension-invocation rows. Keeping their stores as separate fields and
 /// returning all three borrows together gives the coordinator the complete
 /// private-state atomic unit without borrowing a parent object repeatedly.
-/// That coordinator creates all three stages on every recording, including
-/// operations with no aggregate observations, so their days advance together.
-/// It becomes the only code allowed to commit them: success applies all three,
-/// while any staging or row-update failure drops all three. Row-update failure
-/// is safe because touched trackers live in the overlays and each row mutates
-/// its tracker only after its other checked updates succeed.
+/// That coordinator creates all three stages for every hook invocation, even
+/// when no plugin or extension contributes, so their days advance together.
+/// The persistence transaction will apply the same empty staging step to
+/// low-volume-only operations. The coordinator is the only code allowed to
+/// commit invocation stages: success applies all three, while any staging or
+/// row-update failure drops all three. Row-update failure is safe because
+/// touched trackers live in the overlays and each row mutates its tracker only
+/// after its other checked updates succeed.
 ///
 /// When these stores join the persisted schema, decoding must validate each
 /// store day against the identity high-water day in `state/codec.rs`. A
@@ -55,7 +59,7 @@ impl AggregateState {
 
     /// Borrow every store that one top-level hook invocation can change.
     #[must_use]
-    pub(in crate::telemetry) const fn hook_invocation_stores(
+    const fn hook_invocation_stores(
         &mut self,
     ) -> (
         &mut HookAggregateStore,
@@ -82,7 +86,7 @@ mod tests {
     fn hook_invocation_stages_can_remain_live_together() {
         let mut state: TelemetryStateV1 = toml::from_str(IDENTIFIER_WINDOW_TEST_STATE).unwrap();
         let recording = recording_observation(&mut state);
-        let recovery = MetricSnapshot::empty(recording.day()).public_recovery_index();
+        let recovery = MetricSnapshot::empty(recording.day()).recovery_index();
         let mut aggregates = AggregateState::new(recording.day());
 
         let (hook, plugin_hook, extension_invocation) = aggregates.hook_invocation_stores();

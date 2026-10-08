@@ -15,7 +15,7 @@ use crate::telemetry::{
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
         staged_entries::StagedEntries,
     },
-    storage::metrics::PublicAggregateRecoveryIndex,
+    storage::metrics::AggregateRecoveryIndex,
 };
 
 /// Identity fields admitted for one extension-invocation aggregate row.
@@ -294,9 +294,9 @@ impl ExtensionInvocationAggregateStore {
     ///
     /// Returns an admission error if snapshot and observation days disagree,
     /// or the observation day moves backward.
-    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+    pub(in crate::telemetry::state) fn stage<'store, 'context, 'identity>(
         &'store mut self,
-        recovery: &'context PublicAggregateRecoveryIndex,
+        recovery: &'context AggregateRecoveryIndex,
         recording: &'context BoundRecordingObservation<'identity>,
     ) -> Result<
         ExtensionInvocationAggregateStage<'store, 'context, 'identity>,
@@ -320,6 +320,19 @@ impl ExtensionInvocationAggregateStore {
             recording,
             poisoned: false,
         })
+    }
+
+    /// Widen staged access only for row-level tests outside private state.
+    #[cfg(test)]
+    pub(in crate::telemetry) fn stage_for_test<'store, 'context, 'identity>(
+        &'store mut self,
+        recovery: &'context AggregateRecoveryIndex,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<
+        ExtensionInvocationAggregateStage<'store, 'context, 'identity>,
+        ExtensionInvocationAdmissionError,
+    > {
+        self.stage(recovery, recording)
     }
 
     /// Remove entries from the previous identifier epoch without restoring
@@ -356,12 +369,18 @@ pub(in crate::telemetry) struct ExtensionInvocationAggregateStage<'store, 'conte
     staged_budget: DailyPublicRowBudget,
     entries:
         StagedEntries<'store, ExtensionInvocationAggregateKey, ExtensionInvocationAggregateState>,
-    recovery: &'context PublicAggregateRecoveryIndex,
+    recovery: &'context AggregateRecoveryIndex,
     recording: &'context BoundRecordingObservation<'identity>,
     poisoned: bool,
 }
 
 impl ExtensionInvocationAggregateStage<'_, '_, '_> {
+    /// Return whether a failed selection made this stage unsafe to commit.
+    #[must_use]
+    pub(in crate::telemetry) const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Select or admit the aggregate for one attributed observation.
     ///
     /// Adoption happens before overflow and does not spend another public-row
@@ -402,7 +421,7 @@ impl ExtensionInvocationAggregateStage<'_, '_, '_> {
             ExtensionInvocationAggregateKey,
             ExtensionInvocationAggregateState,
         >,
-        recovery: &PublicAggregateRecoveryIndex,
+        recovery: &AggregateRecoveryIndex,
         recording: &BoundRecordingObservation<'_>,
         agent: ExtensionInvocationAgent,
         attribution: ExtensionInvocationAttribution,

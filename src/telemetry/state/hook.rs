@@ -29,6 +29,11 @@ impl HookAggregateStore {
         }
     }
 
+    #[must_use]
+    pub(in crate::telemetry::state) const fn day(&self) -> UtcDay {
+        self.day.day()
+    }
+
     /// Stage private-state edits for one hook recording operation.
     ///
     /// Day selection is applied to a copy. Dropping the returned stage leaves
@@ -42,7 +47,7 @@ impl HookAggregateStore {
     /// recording belongs to a closed day, or
     /// [`HookAggregateStoreError::PrivateState`] when a stored tracker does
     /// not match its map key.
-    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+    pub(in crate::telemetry::state) fn stage<'store, 'context, 'identity>(
         &'store mut self,
         recording: &'context BoundRecordingObservation<'identity>,
     ) -> Result<HookAggregateStage<'store, 'context, 'identity>, HookAggregateStoreError> {
@@ -58,6 +63,15 @@ impl HookAggregateStore {
             recording,
             poisoned: false,
         })
+    }
+
+    /// Widen staged access only for row-level tests outside private state.
+    #[cfg(test)]
+    pub(in crate::telemetry) fn stage_for_test<'store, 'context, 'identity>(
+        &'store mut self,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<HookAggregateStage<'store, 'context, 'identity>, HookAggregateStoreError> {
+        self.stage(recording)
     }
 
     /// Remove entries derived under the previous identifier epoch.
@@ -91,6 +105,12 @@ pub(in crate::telemetry) struct HookAggregateStage<'store, 'context, 'identity> 
 }
 
 impl HookAggregateStage<'_, '_, '_> {
+    /// Return whether a failed selection made this stage unsafe to commit.
+    #[must_use]
+    pub(in crate::telemetry) const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Select a staged tracker for one hook aggregate.
     ///
     /// Repeated selections reuse the same staged value. After day rollover,
@@ -328,6 +348,7 @@ mod tests {
             error,
             HookAggregateStoreError::PrivateState(HookAggregateSelectionError)
         );
+        assert!(staged.is_poisoned());
         assert_eq!(staged.commit(), StageCommit::DiscardedPoisoned);
         assert_eq!(store, before);
     }

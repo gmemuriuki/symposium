@@ -101,6 +101,8 @@ impl HookMetricsV1 {
     ) -> Result<(), HookMetricsUpdateError> {
         self.ensure_selected_by(recording, observation, session_counts)?;
 
+        // The invocation coordinator derives both values from one plugin
+        // collection. Keep this defensive check for direct row API callers.
         if observation.plugins_completed > observation.plugins_attempted {
             return Err(HookMetricsUpdateError::CompletedPluginsExceedAttempts {
                 attempted: observation.plugins_attempted,
@@ -378,7 +380,7 @@ mod tests {
         {
             let recording = recording_observation(&mut state);
             store = HookAggregateStore::new(recording.day());
-            let mut staged = store.stage(&recording).unwrap();
+            let mut staged = store.stage_for_test(&recording).unwrap();
             let tracker = staged
                 .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap();
@@ -410,7 +412,7 @@ mod tests {
         let row_day = row.day;
         let store_before = store.clone();
         {
-            let mut staged = store.stage(&later).unwrap();
+            let mut staged = store.stage_for_test(&later).unwrap();
             let tracker = staged
                 .select(HookAgent::Claude, HookSurface::PreToolUse)
                 .unwrap();

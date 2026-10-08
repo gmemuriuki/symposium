@@ -14,7 +14,7 @@ use crate::telemetry::{
         public_row_budget::{DailyPublicRowBudget, PublicRowAdmission},
         staged_entries::StagedEntries,
     },
-    storage::metrics::PublicAggregateRecoveryIndex,
+    storage::metrics::AggregateRecoveryIndex,
 };
 
 /// Daily private state for plugin-hook aggregate admission.
@@ -47,9 +47,9 @@ impl PluginHookAggregateStore {
     /// Returns an admission error if snapshot and observation days disagree,
     /// the observation day moves backward, or stored private state does not
     /// match its map key.
-    pub(in crate::telemetry) fn stage<'store, 'context, 'identity>(
+    pub(in crate::telemetry::state) fn stage<'store, 'context, 'identity>(
         &'store mut self,
-        recovery: &'context PublicAggregateRecoveryIndex,
+        recovery: &'context AggregateRecoveryIndex,
         recording: &'context BoundRecordingObservation<'identity>,
     ) -> Result<PluginHookAggregateStage<'store, 'context, 'identity>, PluginHookAdmissionError>
     {
@@ -71,6 +71,17 @@ impl PluginHookAggregateStore {
             recording,
             poisoned: false,
         })
+    }
+
+    /// Widen staged access only for row-level tests outside private state.
+    #[cfg(test)]
+    pub(in crate::telemetry) fn stage_for_test<'store, 'context, 'identity>(
+        &'store mut self,
+        recovery: &'context AggregateRecoveryIndex,
+        recording: &'context BoundRecordingObservation<'identity>,
+    ) -> Result<PluginHookAggregateStage<'store, 'context, 'identity>, PluginHookAdmissionError>
+    {
+        self.stage(recovery, recording)
     }
 
     /// Remove entries from the previous identifier epoch without restoring
@@ -106,12 +117,18 @@ pub(in crate::telemetry) struct PluginHookAggregateStage<'store, 'context, 'iden
     destination_budget: &'store mut DailyPublicRowBudget,
     staged_budget: DailyPublicRowBudget,
     entries: StagedEntries<'store, PluginHookMetricsKey, PluginHookAggregateState>,
-    recovery: &'context PublicAggregateRecoveryIndex,
+    recovery: &'context AggregateRecoveryIndex,
     recording: &'context BoundRecordingObservation<'identity>,
     poisoned: bool,
 }
 
 impl PluginHookAggregateStage<'_, '_, '_> {
+    /// Return whether a failed selection made this stage unsafe to commit.
+    #[must_use]
+    pub(in crate::telemetry) const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Select or admit the aggregate for one plugin-hook terminal result.
     ///
     /// Adoption happens before overflow and does not spend another public-row
@@ -149,7 +166,7 @@ impl PluginHookAggregateStage<'_, '_, '_> {
     fn select_inner<'a>(
         staged_budget: &mut DailyPublicRowBudget,
         entries: &'a mut StagedEntries<'_, PluginHookMetricsKey, PluginHookAggregateState>,
-        recovery: &PublicAggregateRecoveryIndex,
+        recovery: &AggregateRecoveryIndex,
         recording: &BoundRecordingObservation<'_>,
         agent: HookAgent,
         surface: HookSurface,
