@@ -136,12 +136,22 @@ impl WorkspaceDeps {
     /// exactly `crates` (rooted at `root`, no members).
     #[cfg(test)]
     pub(crate) fn fixture(root: impl Into<PathBuf>, crates: Vec<WorkspaceCrate>) -> Arc<Self> {
+        Self::fixture_with_members(root, crates, Vec::new())
+    }
+
+    /// A pre-resolved resolver with explicit dependencies and members.
+    #[cfg(test)]
+    pub(crate) fn fixture_with_members(
+        root: impl Into<PathBuf>,
+        crates: Vec<WorkspaceCrate>,
+        member_crates: Vec<WorkspaceCrate>,
+    ) -> Arc<Self> {
         let root = root.into();
         let cached = OnceLock::new();
         let _ = cached.set(Ok(Arc::new(LoadedWorkspace {
             root: root.clone(),
             crates,
-            member_crates: Vec::new(),
+            member_crates,
         })));
         Arc::new(Self {
             cwd: root,
@@ -196,6 +206,7 @@ impl WorkspaceDeps {
         }
     }
 
+    /// Workspace-member packages (empty if not in a workspace).
     pub fn member_crates(&self) -> &[WorkspaceCrate] {
         match self.load() {
             Some(w) => &w.member_crates,

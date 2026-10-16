@@ -18,8 +18,8 @@ use anyhow::{Context, Result};
 use symposium_install::UpdateLevel;
 
 use super::{
-    ANY_VERSION, ConfiguredRegistrySource, FetchedPackage, PackageId, PackageManager, PluginInfo,
-    RegistryListing, UnvalidatedPlugin, layout,
+    ANY_VERSION, ConfiguredRegistrySource, FetchedPackage, PackageId, PackageManager,
+    PackageProvenance, PluginInfo, RegistryListing, SourcedPackage, UnvalidatedPlugin, layout,
 };
 use crate::report::ReportEvent;
 
@@ -38,6 +38,10 @@ impl PathPm {
             dir: dir.into(),
         }
     }
+
+    fn provenance(&self) -> PackageProvenance {
+        PackageProvenance::Path
+    }
 }
 
 #[async_trait::async_trait]
@@ -54,7 +58,7 @@ impl PackageManager for PathPm {
     /// local registry's contents don't vary with the workspace; whether each
     /// plugin applies is decided later by its own predicates. A registry is a
     /// trust root, so these activate without consent.
-    async fn active_plugins(&self, _deps: &[PackageId]) -> Vec<UnvalidatedPlugin> {
+    async fn active_plugins(&self, _deps: &[SourcedPackage]) -> Vec<UnvalidatedPlugin> {
         self.registry_plugins()
             .await
             .map(|listing| listing.plugins)
@@ -79,7 +83,12 @@ impl PackageManager for PathPm {
             complete: true,
         };
         for entry in entries {
-            match crate::plugins::entry_plugin(&self.dir, &entry.subpath, &self.name) {
+            match crate::plugins::entry_plugin(
+                &self.dir,
+                &entry.subpath,
+                &self.name,
+                self.provenance(),
+            ) {
                 Some(Ok(p)) => listing.plugins.push(p),
                 Some(Err(e)) => {
                     listing.complete = false;
@@ -103,7 +112,12 @@ impl PackageManager for PathPm {
         if id.pm != self.name {
             return Vec::new();
         }
-        match crate::plugins::entry_plugin(&self.dir, Path::new(&id.name), &self.name) {
+        match crate::plugins::entry_plugin(
+            &self.dir,
+            Path::new(&id.name),
+            &self.name,
+            self.provenance(),
+        ) {
             Some(Ok(p)) => vec![p],
             Some(Err(e)) => {
                 tracing::warn!(registry = %self.name, id = %id, error = %e, "failed to load plugin");
@@ -114,7 +128,7 @@ impl PackageManager for PathPm {
     }
 
     /// A local directory contributes no workspace dependencies.
-    async fn list_deps(&self) -> Result<Vec<PackageId>> {
+    async fn list_deps(&self) -> Result<Vec<SourcedPackage>> {
         Ok(Vec::new())
     }
 
@@ -128,14 +142,19 @@ impl PackageManager for PathPm {
             .into_iter()
             .map(|entry| layout::subpath_key(&entry.subpath))
             .filter(|key| key.to_lowercase().contains(&query))
-            .map(|key| PluginInfo::from_id(PackageId::new(&self.name, key, ANY_VERSION)))
+            .map(|key| {
+                PluginInfo::from_package(SourcedPackage::new(
+                    PackageId::new(&self.name, key, ANY_VERSION),
+                    self.provenance(),
+                ))
+            })
             .collect())
     }
 
     /// The entry directory an id names — path entries are their own cache.
     async fn fetch(&self, id: &PackageId, _update: UpdateLevel) -> Result<FetchedPackage> {
         Ok(FetchedPackage {
-            id: id.clone(),
+            package: SourcedPackage::new(id.clone(), self.provenance()),
             root: self.dir.join(&id.name),
         })
     }
@@ -172,7 +191,12 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["style", "tools"]);
-        assert!(active.iter().all(|o| o.id.pm == "user-plugins"));
+        assert!(active.iter().all(|o| o.package.id.pm == "user-plugins"));
+        assert!(
+            active
+                .iter()
+                .all(|o| o.package.provenance == PackageProvenance::Path)
+        );
 
         // A bare SKILL.md is synthesized into a manifest with one group.
         let style = active
@@ -190,14 +214,19 @@ mod tests {
             .await;
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].manifest.name.as_deref(), Some("tools"));
+        assert_eq!(one[0].package.provenance, PackageProvenance::Path);
+
+        assert!(pm.list_deps().await.unwrap().is_empty());
 
         let hits = pm.search("too").await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id.name, "tools");
+        assert_eq!(hits[0].package.id.name, "tools");
+        assert_eq!(hits[0].package.provenance, PackageProvenance::Path);
 
         let hits = pm.search("TOO").await.unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id.name, "tools");
+        assert_eq!(hits[0].package.id.name, "tools");
+        assert_eq!(hits[0].package.provenance, PackageProvenance::Path);
     }
 
     #[tokio::test]
@@ -207,6 +236,7 @@ mod tests {
         let id = PackageId::new("local", "tools", ANY_VERSION);
         let fetched = pm.fetch(&id, UpdateLevel::None).await.unwrap();
         assert_eq!(fetched.root, tmp.path().join("registry/tools"));
-        assert_eq!(fetched.id, id);
+        assert_eq!(fetched.package.id, id);
+        assert_eq!(fetched.package.provenance, PackageProvenance::Path);
     }
 }
