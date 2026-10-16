@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::pm::WorkspaceCrate;
+use crate::pm::{PackageProvenance, WorkspaceCrate};
 use anyhow::{Context, Result};
 
 mod probe;
@@ -30,6 +30,8 @@ pub struct FetchResult {
     pub version: String,
     /// Path to the crate sources on disk.
     pub path: PathBuf,
+    /// Where Cargo obtained the resolved package's source content.
+    pub provenance: PackageProvenance,
 }
 
 /// Builder for accessing Rust crate source code.
@@ -77,6 +79,7 @@ impl<'a> RustCrateFetch<'a> {
                     name: wc.name.clone(),
                     version: wc.version.to_string(),
                     path: dir.clone(),
+                    provenance: wc.provenance.clone(),
                 });
             }
         }
@@ -150,6 +153,7 @@ mod tests {
         assert_eq!(result.name, "my-crate");
         assert_eq!(result.version, "0.1.0");
         assert_eq!(result.path, tmp.path());
+        assert_eq!(result.provenance, PackageProvenance::Path);
     }
 
     #[tokio::test]
@@ -165,6 +169,7 @@ mod tests {
 
         assert_eq!(result.name, "my_crate");
         assert_eq!(result.path, tmp.path());
+        assert_eq!(result.provenance, PackageProvenance::Path);
     }
 
     // -- Registry spec resolution (pure, no I/O) -----------------------
