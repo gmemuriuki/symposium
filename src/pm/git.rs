@@ -12,8 +12,8 @@ use symposium_install::UpdateLevel;
 use symposium_install::git::GitCacheManager;
 
 use super::{
-    FetchedPackage, PackageId, PackageManager, PathPm, PluginInfo, RegistryListing, RegistrySource,
-    UnvalidatedPlugin,
+    ConfiguredRegistrySource, FetchedPackage, PackageId, PackageManager, PathPm, PluginInfo,
+    RegistryListing, UnvalidatedPlugin,
 };
 use crate::config::REGISTRY_CACHE_SUBDIR;
 
@@ -108,8 +108,8 @@ impl PackageManager for GitPm {
         Ok(true)
     }
 
-    fn registry_source(&self) -> Option<RegistrySource> {
-        Some(RegistrySource::Git {
+    fn registry_source(&self) -> Option<ConfiguredRegistrySource> {
+        Some(ConfiguredRegistrySource::Git {
             url: self.git_url.clone(),
         })
     }
@@ -132,7 +132,7 @@ mod tests {
         .expect("a well-formed URL resolves to a cache path");
         assert_eq!(pm.name(), "symposium-recommendations");
         match pm.registry_source() {
-            Some(RegistrySource::Git { url }) => {
+            Some(ConfiguredRegistrySource::Git { url }) => {
                 assert_eq!(url, "https://github.com/symposium-dev/recommendations");
             }
             _ => panic!("expected a git registry source"),
