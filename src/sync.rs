@@ -28,6 +28,48 @@ use std::sync::Arc;
 /// user-managed skill directories (which lack the marker) untouched.
 pub(crate) const MARKER_FILE: &str = ".symposium";
 
+/// Private result of the one-pass resolution phase.
+///
+/// This value may retain raw package provenance and filesystem paths. It has
+/// neither `Debug` nor serialization; the next layer projects it into the
+/// telemetry-safe structured report.
+struct ResolvedSync {
+    #[expect(
+        dead_code,
+        reason = "the structured SyncReport consumes package outcomes in the next commit"
+    )]
+    packages: Vec<crate::pm::SourcedPackage>,
+    #[expect(
+        dead_code,
+        reason = "the structured SyncReport consumes the plugin count in the next commit"
+    )]
+    plugins: usize,
+    skills: Vec<crate::skills::SkillWithGroupContext>,
+    mcp_servers: Vec<sacp::schema::McpServer>,
+    #[expect(
+        dead_code,
+        reason = "the structured SyncReport consumes resolution completeness in the next commit"
+    )]
+    complete: bool,
+}
+
+/// One deduplicated skill ready for installation.
+///
+/// The first route supplies the safe witness. Later duplicate routes union
+/// only their package contributors so package extension matching remains
+/// complete without changing which concrete route selected the installation.
+struct ResolvedSkillInstall {
+    name: String,
+    origin_hash: String,
+    source: PathBuf,
+    evidence: Option<crate::telemetry::ResolutionEvidence>,
+}
+
+struct DeduplicatedSkills {
+    skills: Vec<ResolvedSkillInstall>,
+    name_counts: std::collections::BTreeMap<String, usize>,
+}
+
 /// Create `path` and any missing ancestors up to `boundary`.
 ///
 /// `boundary` is the workspace root — we never walk above it.
@@ -360,6 +402,119 @@ async fn resolve_custom_predicate_entries(
     entries
 }
 
+async fn resolve_sync(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+    registry: &plugins::PluginRegistry,
+    project_root: &Path,
+    custom_entries: std::collections::HashMap<String, crate::predicate::ResolvedPredicateEntry>,
+    predicate_cache_path: &Path,
+    update: UpdateLevel,
+) -> ResolvedSync {
+    let pms = sym.package_managers(deps);
+    let (packages, dependencies_complete) = match pms.list_deps().await {
+        Ok(packages) => (packages, true),
+        Err(error) => {
+            tracing::debug!(%error, "failed to list sourced dependencies for sync");
+            (Vec::new(), false)
+        }
+    };
+    let used = crate::discovery::used_plugins(sym, &pms, &registry.plugins, project_root);
+    let mut ctx = crate::predicate::SourcedPredicateContext::with_custom_predicates(
+        &packages,
+        custom_entries,
+    )
+    .with_used(&used)
+    .with_disk_cache(predicate_cache_path);
+    let retain_evidence = crate::telemetry::is_enabled(sym);
+
+    let active = plugins::resolve_active_plugins(
+        sym,
+        registry,
+        &pms,
+        Some(project_root),
+        &mut ctx,
+        update,
+        retain_evidence,
+    )
+    .await;
+    let resolved_skills =
+        skills::resolve_skills(sym, &active.plugins, &mut ctx, update, retain_evidence).await;
+
+    let mcp_servers = collect_mcp_servers(&active.plugins, &mut ctx);
+
+    if let Err(error) = ctx.persist_disk_cache(predicate_cache_path) {
+        // Cache persistence does not make resolution partial: it affects only
+        // whether a later run may reuse a boolean result.
+        tracing::warn!(
+            path = %predicate_cache_path.display(),
+            error = %error,
+            "failed to persist predicate cache"
+        );
+    }
+
+    ResolvedSync {
+        packages,
+        plugins: active.plugins.len(),
+        skills: resolved_skills.skills,
+        mcp_servers,
+        complete: dependencies_complete && active.complete && resolved_skills.complete,
+    }
+}
+
+/// Collect nested MCP servers without re-evaluating each plugin's selection
+/// gate.
+///
+/// The plugin walk has already admitted every item in `active`. Re-stamping
+/// its provenance here is still required because `workspace-member()` inside
+/// an MCP predicate belongs to that plugin, not to the plugin visited before
+/// it.
+fn collect_mcp_servers<'a>(
+    active: &[crate::plugins::ResolvedPlugin],
+    ctx: &mut crate::predicate::SourcedPredicateContext<'a>,
+) -> Vec<sacp::schema::McpServer> {
+    let mut servers = Vec::new();
+    for resolved in active {
+        ctx.set_workspace_member(resolved.plugin.is_workspace_member());
+        servers.extend(resolved.plugin.manifest.applicable_mcp_servers(ctx));
+    }
+    servers
+}
+
+fn deduplicate_skills(applicable: Vec<crate::skills::SkillWithGroupContext>) -> DeduplicatedSkills {
+    let mut by_key: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    let mut skills: Vec<ResolvedSkillInstall> = Vec::new();
+    let mut name_counts = std::collections::BTreeMap::new();
+
+    for entry in applicable {
+        let name = entry.skill.name().to_owned();
+        let key = (name.clone(), entry.origin_hash.clone());
+        if let Some(&index) = by_key.get(&key) {
+            if let (Some(existing), Some(duplicate)) =
+                (&mut skills[index].evidence, &entry.evidence)
+            {
+                existing.union_contributors(duplicate);
+            }
+            continue;
+        }
+
+        by_key.insert(key, skills.len());
+        *name_counts.entry(name.clone()).or_default() += 1;
+        skills.push(ResolvedSkillInstall {
+            name,
+            origin_hash: entry.origin_hash,
+            source: entry.skill.path,
+            evidence: entry.evidence,
+        });
+    }
+
+    DeduplicatedSkills {
+        skills,
+        name_counts,
+    }
+}
+
 /// Run the full sync: discover applicable skills, install into agent dirs,
 /// clean up stale installations.
 pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLevel) -> Result<()> {
@@ -397,71 +552,26 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
     // Resolve custom predicate installations.
     let custom_entries = resolve_custom_predicate_entries(sym, &registry, update).await;
 
-    // Resolve the workspace once and build the predicate context shared by
-    // skill resolution and MCP-server filtering. Attach the on-disk cache so
-    // custom predicate results survive across sync runs; results are persisted
-    // at the end of this evaluation pass.
-    let dep_ids = crate::pm::workspace_dep_ids(sym, deps).await;
-    let pms = sym.package_managers(deps);
-    let used = crate::discovery::used_plugins(sym, &pms, &registry.plugins, &project_root);
+    // Resolve sourced packages, plugins, skills, and MCP servers in one pass.
+    // Raw provenance stays inside the private result.
     let predicate_cache_path =
         crate::predicate_cache::PredicateCache::path_for_workspace(sym.cache_dir(), &project_root);
-    let mut ctx =
-        crate::predicate::PredicateContext::with_custom_predicates(&dep_ids, custom_entries)
-            .with_used(&used)
-            .with_disk_cache(&predicate_cache_path);
-
-    // The active plugin set: registry plugins plus the crate-sourced plugins
-    // reached through `[[plugins]]` chained references and dependency
-    // enablement. Every facet resolves over this one set, so a crate plugin's
-    // skills and MCP servers install exactly like a registry plugin's.
-    let active = plugins::active_plugins(
+    let resolved = resolve_sync(
         sym,
+        deps,
         &registry,
-        &pms,
-        Some(&project_root),
-        &mut ctx,
-        UpdateLevel::Check,
+        &project_root,
+        custom_entries,
+        &predicate_cache_path,
+        update,
     )
     .await;
-
-    // Find all applicable skills.
-    let applicable = skills::collect_skills(sym, &active, &mut ctx, update).await;
-
-    // Dedup by `(skill_name, origin_hash)`: two crate origins with the same
-    // (name, version, skill-path-within-crate) collapse (the same skill bytes
-    // reached through two plugins); skills from genuinely different locations —
-    // including two skills at different paths within one crate — survive
-    // independently. Skills that survive dedup are recorded with both their
-    // plain name and their origin hash so we can decide later whether each one
-    // needs an `<name>-<hash>` suffix to avoid collisions.
-    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut to_install: Vec<(String, String, &std::path::Path)> = Vec::new();
-    let mut name_counts: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-
-    for entry in &applicable {
-        let name = entry.skill.name().to_string();
-        if seen.insert((name.clone(), entry.origin_hash.clone())) {
-            *name_counts.entry(name.clone()).or_default() += 1;
-            to_install.push((name, entry.origin_hash.clone(), &entry.skill.path));
-        }
-    }
-
-    // Collect MCP servers from the same active plugin set.
-    let mut mcp_servers: Vec<sacp::schema::McpServer> = Vec::new();
-    for p in &active {
-        if p.applies(&mut ctx) {
-            mcp_servers.extend(p.manifest.applicable_mcp_servers(&mut ctx));
-        }
-    }
-    if let Err(e) = ctx.persist_disk_cache(&predicate_cache_path) {
-        tracing::warn!(
-            path = %predicate_cache_path.display(),
-            error = %e,
-            "failed to persist predicate cache"
-        );
-    }
+    // The first concrete route survives deduplication; later routes contribute
+    // only their package set for package-level extension matching.
+    let deduplicated = deduplicate_skills(resolved.skills);
+    let to_install = deduplicated.skills;
+    let name_counts = deduplicated.name_counts;
+    let mcp_servers = resolved.mcp_servers;
 
     // Sync each configured agent
     let agent_names: Vec<String> = sym.config.agents.iter().map(|a| a.name.clone()).collect();
@@ -567,7 +677,10 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
             }
         }
 
-        for (skill_name, origin_hash, skill_source) in &to_install {
+        for skill in &to_install {
+            let skill_name = &skill.name;
+            let origin_hash = &skill.origin_hash;
+            let skill_source = &skill.source;
             // `skill_source` is the path to the SKILL.md file; the skill
             // directory is its parent.
             let source_dir = match skill_source.parent() {
@@ -1061,5 +1174,119 @@ mod tests {
         assert!(sync_skill_dir(&src, &dst, tmp.path(), Duration::ZERO).unwrap());
         assert!(dst.join(MARKER_FILE).exists());
         assert_eq!(fs::read_to_string(dst.join("notes.txt")).unwrap(), "notes");
+    }
+
+    #[test]
+    fn deduplicated_routes_union_their_package_contributors() {
+        use crate::pm::{CARGO_PM, CRATES_IO_REGISTRY_URL, PackageId, PackageProvenance};
+        use crate::predicate::{Predicate, PredicateSet, SourcedPredicateContext};
+
+        let packages = ["first", "second"].map(|name| {
+            crate::pm::SourcedPackage::new(
+                PackageId::new(CARGO_PM, name, "1.0.0"),
+                PackageProvenance::Registry {
+                    url: CRATES_IO_REGISTRY_URL.to_owned(),
+                },
+            )
+        });
+        let evidence = packages.iter().map(|package| {
+            let mut context = SourcedPredicateContext::new(&packages);
+            crate::telemetry::evaluate_resolution_predicates(
+                &PredicateSet {
+                    predicates: vec![Predicate::DependsOn(package.id.name.clone(), None)],
+                },
+                &mut context,
+                &mut crate::telemetry::OptionalWitnessMode::new(true),
+            )
+            .unwrap()
+            .unwrap()
+        });
+        let source = PathBuf::from("shared/SKILL.md");
+        let skills = evidence
+            .map(|evidence| {
+                let mut frontmatter = std::collections::BTreeMap::new();
+                frontmatter.insert("name".to_owned(), "shared".to_owned());
+                crate::skills::SkillWithGroupContext {
+                    skill: crate::skills::Skill {
+                        frontmatter,
+                        predicates: PredicateSet::default(),
+                        path: source.clone(),
+                    },
+                    origin_hash: "same-origin".to_owned(),
+                    evidence: Some(evidence),
+                }
+            })
+            .collect();
+
+        let deduplicated = deduplicate_skills(skills);
+
+        assert_eq!(deduplicated.skills.len(), 1);
+        let contributors = deduplicated.skills[0]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .contributors();
+        assert_eq!(contributors.len(), 2);
+        assert!(
+            packages
+                .iter()
+                .all(|package| contributors.contains(package))
+        );
+    }
+
+    #[test]
+    fn mcp_predicates_use_their_own_plugins_provenance() {
+        use crate::plugins::{Plugin, PluginManifest, PluginMcpServer, ResolvedPlugin};
+        use crate::pm::{ANY_VERSION, PackageId, PackageProvenance, SourcedPackage};
+        use crate::predicate::{Predicate, PredicateSet, SourcedPredicateContext};
+
+        fn plugin(name: &str, provenance: PackageProvenance) -> Plugin {
+            Plugin {
+                manifest: PluginManifest {
+                    name: name.to_owned(),
+                    predicates: PredicateSet::default(),
+                    installations: Vec::new(),
+                    hooks: Vec::new(),
+                    skills: Vec::new(),
+                    mcp_servers: Vec::new(),
+                    subcommands: std::collections::BTreeMap::new(),
+                    custom_predicates: Vec::new(),
+                    chained: Vec::new(),
+                    requires_use: false,
+                },
+                package: SourcedPackage::new(PackageId::new("test", name, ANY_VERSION), provenance),
+            }
+        }
+
+        let workspace = ResolvedPlugin {
+            plugin: plugin("workspace", PackageProvenance::Workspace),
+            evidence: None,
+        };
+        let server = toml::from_str(
+            r#"
+                name = "private-server"
+                command = "server"
+                args = []
+                env = []
+            "#,
+        )
+        .unwrap();
+        let mut private = plugin("private", PackageProvenance::Path);
+        private.manifest.mcp_servers.push(PluginMcpServer {
+            predicates: PredicateSet {
+                predicates: vec![Predicate::WorkspaceMember],
+            },
+            server,
+        });
+        let private = ResolvedPlugin {
+            plugin: private,
+            evidence: None,
+        };
+        let packages = Vec::new();
+        let mut context = SourcedPredicateContext::new(&packages);
+
+        let servers = collect_mcp_servers(&[workspace, private], &mut context);
+
+        assert!(servers.is_empty());
     }
 }
