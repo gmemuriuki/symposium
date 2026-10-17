@@ -1,4 +1,4 @@
-use crate::predicate::PredicateEval;
+use crate::predicate::{PredicateContextImpl, PredicateDependencies, PredicateEval};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -334,7 +334,10 @@ impl Plugin {
     /// subcommands) on the same context. A dormant plugin
     /// ([`requires_use`](PluginManifest::requires_use)) applies only when an
     /// applicable `[plugins] use` entry names it.
-    pub fn applies(&self, ctx: &mut crate::predicate::PredicateContext) -> bool {
+    pub fn applies<D>(&self, ctx: &mut PredicateContextImpl<D>) -> bool
+    where
+        D: PredicateDependencies,
+    {
         ctx.set_workspace_member(self.is_workspace_member());
         if self.manifest.requires_use && !ctx.is_used(&self.package.id) {
             return false;
@@ -425,10 +428,13 @@ impl PluginManifest {
     ///
     /// ANDed with the plugin-level predicates, which the caller checks
     /// separately.
-    pub fn applicable_mcp_servers(
+    pub fn applicable_mcp_servers<D>(
         &self,
-        ctx: &mut crate::predicate::PredicateContext,
-    ) -> Vec<McpServerEntry> {
+        ctx: &mut PredicateContextImpl<D>,
+    ) -> Vec<McpServerEntry>
+    where
+        D: PredicateDependencies,
+    {
         self.mcp_servers
             .iter()
             .filter(|s| s.predicates.evaluate(ctx))
@@ -1155,14 +1161,17 @@ async fn load_registry_impl(
 /// crate follows `update`: per-invocation callers stay cache-only, while sync
 /// may ask Cargo to resolve it. `ctx.package_ids()` supplies the dependency
 /// list expansion evaluates against.
-pub async fn active_plugins(
+pub async fn active_plugins<D>(
     sym: &Symposium,
     registry: &PluginRegistry,
     pms: &crate::pm::PmRegistry,
     workspace_root: Option<&Path>,
-    ctx: &mut crate::predicate::PredicateContext<'_>,
+    ctx: &mut PredicateContextImpl<D>,
     update: UpdateLevel,
-) -> Vec<Plugin> {
+) -> Vec<Plugin>
+where
+    D: PredicateDependencies,
+{
     let mut active = Vec::new();
     // Sourced package identities already active through the set. Version and
     // provenance distinguish same-named packages from different sources while
@@ -1249,13 +1258,15 @@ fn plugin_key(package: &SourcedPackage) -> SourcedPackage {
 /// Gate `plugin` and, if it passes, record it into `active` and enqueue its
 /// `[[plugins]]` chained references (evaluated against this plugin's provenance)
 /// onto `worklist`.
-fn record_active(
+fn record_active<D>(
     plugin: Plugin,
-    ctx: &mut crate::predicate::PredicateContext<'_>,
+    ctx: &mut PredicateContextImpl<D>,
     visited: &mut std::collections::HashSet<SourcedPackage>,
     active: &mut Vec<Plugin>,
     worklist: &mut Vec<crate::pm::PackageId>,
-) {
+) where
+    D: PredicateDependencies,
+{
     if !plugin.applies(ctx) {
         tracing::debug!(
             report = %crate::report::ReportEvent::PluginConsidered {
@@ -3564,14 +3575,8 @@ mod tests {
         let registry =
             load_registry_with_workspace(&sym, workspace.load().map(AsRef::as_ref)).await;
         let pms = sym.package_managers(&workspace);
-        let deps: Vec<_> = pms
-            .list_deps()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|package| package.id)
-            .collect();
-        let mut context = crate::predicate::PredicateContext::new(&deps);
+        let deps = pms.list_deps().await.unwrap();
+        let mut context = crate::predicate::SourcedPredicateContext::new(&deps);
 
         let active = active_plugins(
             &sym,

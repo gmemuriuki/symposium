@@ -35,20 +35,28 @@ use crate::predicate_cache::{
 /// the SDK, which knows nothing about workspaces or the environment.
 pub trait PredicateEval {
     /// True if this holds in `ctx`.
-    fn evaluate(&self, ctx: &mut PredicateContext<'_>) -> bool;
+    fn evaluate<D>(&self, ctx: &mut PredicateContextImpl<D>) -> bool
+    where
+        D: PredicateDependencies;
 }
 
 impl PredicateEval for Predicate {
     /// Short-circuits: `any` stops at the first true child, `all` at the first
     /// false.
-    fn evaluate(&self, ctx: &mut PredicateContext<'_>) -> bool {
+    fn evaluate<D>(&self, ctx: &mut PredicateContextImpl<D>) -> bool
+    where
+        D: PredicateDependencies,
+    {
         evaluate_predicate(self, ctx, &mut BooleanMode).is_some()
     }
 }
 
 impl PredicateEval for PredicateSet {
     /// True if every predicate holds (or the set is empty).
-    fn evaluate(&self, ctx: &mut PredicateContext<'_>) -> bool {
+    fn evaluate<D>(&self, ctx: &mut PredicateContextImpl<D>) -> bool
+    where
+        D: PredicateDependencies,
+    {
         evaluate_predicate_set(self, ctx, &mut BooleanMode).is_some()
     }
 }
@@ -58,7 +66,7 @@ impl PredicateEval for PredicateSet {
 /// Boolean callers borrow package ids. Witnessed callers retain each id's
 /// coupled source provenance, so a mode cannot accidentally combine aligned
 /// but unrelated collections.
-pub(crate) trait PredicateDependencies {
+pub trait PredicateDependencies {
     type Dependency;
 
     fn dependencies(&self) -> &[Self::Dependency];
@@ -887,6 +895,18 @@ mod tests {
         let context = SourcedPredicateContext::new(&packages);
 
         assert_eq!(context.package_ids(), expected);
+    }
+
+    #[test]
+    fn boolean_evaluation_accepts_sourced_dependencies() {
+        let packages = vec![sourced_package(
+            "present",
+            crate::pm::PackageProvenance::Workspace,
+        )];
+        let mut context = SourcedPredicateContext::new(&packages);
+
+        assert!(Predicate::DependsOn("present".to_owned(), None).evaluate(&mut context));
+        assert!(!Predicate::DependsOn("missing".to_owned(), None).evaluate(&mut context));
     }
 
     #[test]

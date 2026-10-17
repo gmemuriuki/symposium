@@ -13,7 +13,9 @@ use symposium_install::UpdateLevel;
 use crate::config::Symposium;
 use crate::output::display_path;
 use crate::plugins::{Plugin, PluginSource, SkillGroup};
-use crate::predicate::{PredicateContext, PredicateSet};
+#[cfg(test)]
+use crate::predicate::PredicateContext;
+use crate::predicate::{PredicateContextImpl, PredicateDependencies, PredicateSet};
 
 fn source_display(source: &PluginSource) -> String {
     match source {
@@ -148,13 +150,16 @@ pub async fn skills_applicable_to(
 /// Provenance is re-stamped per plugin so a `source.path` group's
 /// `workspace-member()` predicate sees the plugin it belongs to. Skill git
 /// sources are fetched here (hence `update`), which is why this is separate
-/// from [`crate::plugins::active_plugins`].
-pub(crate) async fn collect_skills(
+/// from [`crate::plugins::active_plugins`] — the plugin walk never touches the network.
+pub(crate) async fn collect_skills<D>(
     sym: &Symposium,
     active: &[Plugin],
-    ctx: &mut PredicateContext<'_>,
+    ctx: &mut PredicateContextImpl<D>,
     update: UpdateLevel,
-) -> Vec<SkillWithGroupContext> {
+) -> Vec<SkillWithGroupContext>
+where
+    D: PredicateDependencies,
+{
     let mut results = Vec::new();
     for parsed in active {
         ctx.set_workspace_member(parsed.is_workspace_member());
@@ -181,13 +186,16 @@ pub(crate) async fn collect_skills(
 /// paired with the origin hash it was discovered through — its group's origin
 /// key combined
 /// with the SKILL.md's path within that origin, one per discovered SKILL.md.
-async fn load_skills_for_group(
+async fn load_skills_for_group<D>(
     sym: &Symposium,
     parsed: &Plugin,
     group: &SkillGroup,
-    ctx: &mut PredicateContext<'_>,
+    ctx: &mut PredicateContextImpl<D>,
     update: UpdateLevel,
-) -> Vec<(Skill, String)> {
+) -> Vec<(Skill, String)>
+where
+    D: PredicateDependencies,
+{
     let plugin = &parsed.manifest;
 
     // Pre-fetch filtering: skip groups whose predicates don't hold (crate
@@ -574,13 +582,15 @@ pub(crate) fn is_safe_dir_name(name: &str) -> bool {
 ///
 /// Plugin- and group-level predicates have already been evaluated by callers as
 /// a pre-filter, so only the skill-level set is checked here.
-fn collect_skill_applicable_to(
+fn collect_skill_applicable_to<D>(
     skill: Skill,
     origin_hash: String,
     plugin_name: &str,
-    ctx: &mut PredicateContext,
+    ctx: &mut PredicateContextImpl<D>,
     results: &mut Vec<SkillWithGroupContext>,
-) {
+) where
+    D: PredicateDependencies,
+{
     if !skill.predicates.evaluate(ctx) {
         tracing::debug!(
             report = %crate::report::ReportEvent::SkillConsidered {
