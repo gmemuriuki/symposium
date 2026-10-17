@@ -169,13 +169,6 @@ where
 ///
 /// This trait deliberately accepts only [`SourcedPredicateContext`]. An
 /// id-only context has no method that can request witnessed evaluation.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the resolution-witness stack commit consumes this seam"
-    )
-)]
 pub(crate) trait PredicateWitnessEval {
     fn evaluate_witness<'a, M>(
         &self,
@@ -342,7 +335,7 @@ impl<'a> PredicateContextImpl<SourcedDependencies<'a>> {
         not(test),
         expect(
             dead_code,
-            reason = "the resolution-witness stack commit constructs this context"
+            reason = "the structured sync report constructs this context in the next commit"
         )
     )]
     pub(crate) fn new(packages: &'a [SourcedPackage]) -> Self {

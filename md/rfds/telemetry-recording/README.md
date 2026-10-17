@@ -549,8 +549,7 @@ Verify:
 - Stale, corrupt, binding-mismatch, duplicate-slot, and cross-parent collision handling.
 - Raw paths, private names, and dependency snapshots stay out of telemetry.
 
-- [ ] PR: typed predicate witnesses
-- [ ] PR: safe resolution witnesses
+- [ ] PR: typed predicate and safe resolution witnesses
 - [ ] PR: structured sync report
 - [ ] PR: installed attribution bindings and indexes
 - [ ] PR: resolution recording and manual-sync activation
