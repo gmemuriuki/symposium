@@ -312,10 +312,10 @@ impl PmRegistry {
         update: UpdateLevel,
     ) -> Result<PackageId> {
         if let Some(plugin) = plugins.iter().find(|p| {
-            self.identity(&PackageId::any_version(&p.canonical.pm, &p.manifest.name))
-                == self.identity(&PackageId::any_version(&p.canonical.pm, name))
+            self.identity(&PackageId::any_version(&p.package.id.pm, &p.manifest.name))
+                == self.identity(&PackageId::any_version(&p.package.id.pm, name))
         }) {
-            return Ok(self.identity(&plugin.canonical));
+            return Ok(self.identity(&plugin.package.id));
         }
         for inst in &self.instances {
             if let Some(id) = inst.pm.find(name, update).await {
@@ -338,6 +338,20 @@ impl PmRegistry {
             deps.extend(inst.pm.list_deps().await?);
         }
         Ok(deps)
+    }
+
+    /// Plugins embedded in the exact dependency packages supplied by the
+    /// workspace resolver.
+    ///
+    /// Only untrusted transports participate: configured registries are trust
+    /// roots already present in the plugin registry, while a dependency needs
+    /// the user's enablement decision before its plugin becomes active.
+    pub async fn plugins_for_dependencies(&self, deps: &[SourcedPackage]) -> Vec<Plugin> {
+        let mut plugins = Vec::new();
+        for instance in self.instances.iter().filter(|instance| !instance.trusted) {
+            plugins.extend(instance.active_plugins(deps).await);
+        }
+        plugins
     }
 
     /// Load the plugin(s) an id maps to, asking every instance. Any instance may
@@ -556,7 +570,7 @@ mod tests {
         let (pms, plugins) = registry_beside(cargo, &tmp.path().join("reg")).await;
         let registry_id = |name: &str| {
             let plugin = plugins.iter().find(|p| p.manifest.name == name).unwrap();
-            pms.identity(&plugin.canonical)
+            pms.identity(&plugin.package.id)
         };
 
         assert_eq!(

@@ -141,12 +141,14 @@ pub async fn discover(
     // each against the `[plugins]` config.
     for inst in pms.instances().filter(|i| !i.trusted) {
         for plugin in inst.active_plugins(&dep_ids).await {
-            let name = plugin.canonical.name.clone();
+            let name = plugin.package.id.name.clone();
             let description = Some(describe_plugin(&plugin.manifest));
-            let enablement = decide(sym, &pms, &used, &plugin.canonical);
+            let enablement = decide(sym, &pms, &used, &plugin.package.id);
+            // Discovery persists routing identity only. Source policy remains
+            // on the live `Plugin` and must not be reconstructed from this id.
             let discovered = DiscoveredPlugin {
                 registry: inst.name.clone(),
-                id: plugin.canonical,
+                id: plugin.package.id,
                 recommends: name,
                 description,
                 enablement,
@@ -200,7 +202,9 @@ pub async fn enabled_dependencies(
 
     for (name, id) in used {
         let named = PackageId::any_version(&id.pm, name);
-        if !registry.iter().any(|p| pms.identity(&p.canonical) == id)
+        if !registry
+            .iter()
+            .any(|p| pms.identity(&p.package.id) == id)
             && !plugins.is_disabled(pms, &named)
             && known.insert(id)
         {
@@ -240,10 +244,10 @@ pub fn used_plugins(
     plugins
         .iter()
         .filter(|p| {
-            let named = PackageId::any_version(&p.canonical.pm, &p.manifest.name);
+            let named = PackageId::any_version(&p.package.id.pm, &p.manifest.name);
             sym.config.plugins.is_used_in(pms, &named, workspace_root)
         })
-        .map(|p| p.canonical.clone())
+        .map(|p| p.package.id.clone())
         .collect()
 }
 
@@ -725,7 +729,7 @@ mod tests {
             assert_eq!(plugins.len(), 1);
             assert!(plugins[0].manifest.requires_use);
             used_plugins(&sym, &sym.detached_managers(), &plugins, tmp.path())
-                == [plugins[0].canonical.clone()]
+                == [plugins[0].package.id.clone()]
         };
 
         assert!(used("my-plugin").await);
