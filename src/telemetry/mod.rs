@@ -17,12 +17,15 @@ mod resolution_witness;
 mod schema;
 mod state;
 mod storage;
+mod sync_report;
 
 pub(crate) use resolution_witness::{
     OptionalWitnessMode, ResolutionEvidence, chained as chained_resolution_evidence,
     evaluate_predicates as evaluate_resolution_predicates, plugin as plugin_resolution_evidence,
     skill as skill_resolution_evidence,
 };
+pub(crate) use schema::ResolutionOutcome as SyncOutcome;
+pub(crate) use sync_report::{SyncReport, SyncReportInput};
 
 /// Whether the user has opted into telemetry-derived work.
 ///

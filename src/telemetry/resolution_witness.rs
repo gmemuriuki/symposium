@@ -16,7 +16,7 @@ use symposium_sdk::predicate::syntax::PredicateSet;
 
 use super::{
     policy::{ExtensionNaming, PackageNaming},
-    schema::ResolutionWitness,
+    schema::{PublicExtensionCoordinate, ResolutionPath, ResolutionWitness},
 };
 
 /// Private one-pass resolution evidence.
@@ -28,6 +28,7 @@ use super::{
 pub(crate) struct ResolutionEvidence {
     contributors: BTreeSet<SourcedPackage>,
     witness: ResolutionWitness,
+    target: Option<PublicExtensionCoordinate>,
 }
 
 impl ResolutionEvidence {
@@ -35,6 +36,7 @@ impl ResolutionEvidence {
         Self {
             contributors: BTreeSet::new(),
             witness: ResolutionWitness::empty(),
+            target: None,
         }
     }
 
@@ -42,6 +44,7 @@ impl ResolutionEvidence {
         Self {
             contributors: BTreeSet::new(),
             witness,
+            target: None,
         }
     }
 
@@ -49,12 +52,21 @@ impl ResolutionEvidence {
         Self {
             contributors: BTreeSet::from([package.clone()]),
             witness: package_witness(&super::policy::package(package)),
+            target: None,
         }
     }
 
     fn append(&mut self, other: Self) {
         self.contributors.extend(other.contributors);
         self.witness.append(other.witness);
+    }
+
+    fn append_extension(&mut self, naming: &ExtensionNaming) {
+        self.target = match naming {
+            ExtensionNaming::Public(coordinate) => Some(coordinate.clone()),
+            ExtensionNaming::Unnamed => None,
+        };
+        self.witness.append(extension_witness(naming));
     }
 
     pub(crate) fn union_contributors(&mut self, other: &Self) {
@@ -66,10 +78,32 @@ impl ResolutionEvidence {
         &self.contributors
     }
 
+    pub(super) fn contributes(&self, package: &SourcedPackage) -> bool {
+        self.contributors.contains(package)
+    }
+
+    pub(super) fn names_public_extension(&self) -> bool {
+        self.target.is_some()
+    }
+
+    pub(super) fn safe_resolution(&self) -> Option<SafeExtensionResolution> {
+        Some(SafeExtensionResolution {
+            target: self.target.clone()?,
+            path: self.witness.clone().into_path()?,
+        })
+    }
+
     #[cfg(test)]
     fn into_witness(self) -> ResolutionWitness {
         self.witness
     }
+}
+
+/// Public extension target and bounded path safe to retain in a sync report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SafeExtensionResolution {
+    pub(super) target: PublicExtensionCoordinate,
+    pub(super) path: ResolutionPath,
 }
 
 /// Runtime-selectable evidence mode for the sync traversal.
@@ -195,6 +229,7 @@ fn combine_children(
     Some(ResolutionEvidence {
         contributors,
         witness: combine(witnesses),
+        target: None,
     })
 }
 
@@ -216,13 +251,11 @@ pub(crate) fn plugin(
     if let Some(predicates) = predicates {
         route.append(predicates);
     }
-    route
-        .witness
-        .append(extension_witness(&super::policy::extension(
-            &plugin_package.provenance,
-            super::schema::ExtensionKind::Plugin,
-            plugin_name,
-        )));
+    route.append_extension(&super::policy::extension(
+        &plugin_package.provenance,
+        super::schema::ExtensionKind::Plugin,
+        plugin_name,
+    ));
     Some(route)
 }
 
@@ -253,13 +286,11 @@ pub(crate) fn skill(
     if let Some(predicates) = skill_predicates {
         route.append(predicates);
     }
-    route
-        .witness
-        .append(extension_witness(&super::policy::extension(
-            provenance,
-            super::schema::ExtensionKind::Skill,
-            skill_name,
-        )));
+    route.append_extension(&super::policy::extension(
+        provenance,
+        super::schema::ExtensionKind::Skill,
+        skill_name,
+    ));
     Some(route)
 }
 
@@ -505,8 +536,16 @@ mod tests {
 
     #[test]
     fn private_git_skill_source_cannot_inherit_the_host_package_label() {
-        let evidence = skill(
+        let host = crates_io("public-host");
+        let plugin_route = plugin(
             Some(ResolutionEvidence::empty()),
+            None,
+            None,
+            &host,
+            "public-plugin",
+        );
+        let evidence = skill(
+            plugin_route,
             None,
             None,
             &PackageProvenance::Git {
@@ -516,9 +555,18 @@ mod tests {
         )
         .unwrap();
 
+        assert!(evidence.safe_resolution().is_none());
         assert_eq!(
             evidence_json(evidence),
-            json!([{ "type": "opaque", "reason": "private_source" }])
+            json!([
+                {
+                    "type": "extension",
+                    "extension_type": "plugin",
+                    "source": "crates-io",
+                    "name": "public-plugin"
+                },
+                { "type": "opaque", "reason": "private_source" }
+            ])
         );
     }
 

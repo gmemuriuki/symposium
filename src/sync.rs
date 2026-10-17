@@ -4,10 +4,11 @@
 //! installs them into each configured agent's skill directory, and cleans up
 //! stale skills by looking for a `.symposium` marker file in each skill dir.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use symposium_install::UpdateLevel;
@@ -34,22 +35,11 @@ pub(crate) const MARKER_FILE: &str = ".symposium";
 /// neither `Debug` nor serialization; the next layer projects it into the
 /// telemetry-safe structured report.
 struct ResolvedSync {
-    #[expect(
-        dead_code,
-        reason = "the structured SyncReport consumes package outcomes in the next commit"
-    )]
     packages: Vec<crate::pm::SourcedPackage>,
-    #[expect(
-        dead_code,
-        reason = "the structured SyncReport consumes the plugin count in the next commit"
-    )]
     plugins: usize,
+    plugin_evidence: Vec<crate::telemetry::ResolutionEvidence>,
     skills: Vec<crate::skills::SkillWithGroupContext>,
     mcp_servers: Vec<sacp::schema::McpServer>,
-    #[expect(
-        dead_code,
-        reason = "the structured SyncReport consumes resolution completeness in the next commit"
-    )]
     complete: bool,
 }
 
@@ -68,6 +58,275 @@ struct ResolvedSkillInstall {
 struct DeduplicatedSkills {
     skills: Vec<ResolvedSkillInstall>,
     name_counts: std::collections::BTreeMap<String, usize>,
+}
+
+/// Observable result of synchronizing one managed skill directory.
+///
+/// Declaration order is the fold precedence used when several agents share
+/// one destination: a result that changed content outranks a later no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SkillSyncStatus {
+    Debounced,
+    Unchanged,
+    Updated,
+    Installed,
+}
+
+impl SkillSyncStatus {
+    fn changed(self) -> bool {
+        matches!(self, Self::Installed | Self::Updated)
+    }
+}
+
+/// One managed installation retained for cleanup and the attribution index.
+///
+/// This type deliberately has no `Debug`: `destination` and the surrounding
+/// layout contain project-local paths.
+struct InstalledSkill {
+    slot: String,
+    skill_index: usize,
+    status: SkillSyncStatus,
+}
+
+/// Private filesystem result kept separate from the telemetry-safe report.
+///
+/// Cleanup scans every known agent parent, while indexing must touch only
+/// parents that actually hold managed content. Keeping both sets prevents a
+/// Codex-only sync from creating an empty Claude index.
+struct InstalledLayout {
+    skills: BTreeMap<PathBuf, InstalledSkill>,
+    cleanup_parents: BTreeSet<PathBuf>,
+    managed_parents: BTreeSet<PathBuf>,
+}
+
+impl InstalledLayout {
+    fn new() -> Self {
+        Self {
+            skills: BTreeMap::new(),
+            cleanup_parents: BTreeSet::new(),
+            managed_parents: BTreeSet::new(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        destination: PathBuf,
+        slot: String,
+        skill_index: usize,
+        status: SkillSyncStatus,
+    ) {
+        let parent = destination
+            .parent()
+            .expect("BUG: an installed skill directory must have a parent")
+            .to_path_buf();
+        self.managed_parents.insert(parent);
+
+        self.skills
+            .entry(destination)
+            .and_modify(|installed| {
+                debug_assert_eq!(
+                    installed.skill_index, skill_index,
+                    "one installed slot must identify one resolved skill"
+                );
+                debug_assert_eq!(
+                    installed.slot, slot,
+                    "one installed directory must retain one slot name"
+                );
+                // Shared parents are visited once per configured agent. A
+                // fresh install therefore commonly appears as Installed and
+                // then Debounced; preserve the strongest result for counts
+                // and for the next attribution-index slice.
+                installed.status = installed.status.max(status);
+            })
+            .or_insert(InstalledSkill {
+                slot,
+                skill_index,
+                status,
+            });
+    }
+}
+
+/// Complete internal result; only its safe report leaves this module.
+struct CompletedSync {
+    report: crate::telemetry::SyncReport,
+    layout: InstalledLayout,
+}
+
+/// Hard sync failure paired with the safe progress report accumulated so far.
+#[derive(Debug)]
+pub(crate) struct SyncFailure {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "resolution recording consumes failed reports in the activation stack"
+        )
+    )]
+    report: Box<crate::telemetry::SyncReport>,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for SyncFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl SyncFailure {
+    /// Return the safe report accumulated before the hard failure.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "resolution recording consumes failed reports in the activation stack"
+        )
+    )]
+    pub(crate) fn report(&self) -> &crate::telemetry::SyncReport {
+        &self.report
+    }
+
+    /// Recover the original command error for the compatibility entry point.
+    fn into_source(self) -> anyhow::Error {
+        self.source
+    }
+}
+
+impl std::error::Error for SyncFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Mutable report state for one operation.
+///
+/// This value has no `Debug`: before final projection it owns raw package
+/// provenance and resolved skill paths.
+struct SyncProgress {
+    started: Instant,
+    retain_telemetry: bool,
+    outcome: crate::telemetry::SyncOutcome,
+    packages: Vec<crate::pm::SourcedPackage>,
+    plugins: usize,
+    plugin_evidence: Vec<crate::telemetry::ResolutionEvidence>,
+    skills: Vec<ResolvedSkillInstall>,
+    name_counts: BTreeMap<String, usize>,
+    layout: InstalledLayout,
+    reaped: usize,
+}
+
+impl SyncProgress {
+    fn new(retain_telemetry: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            retain_telemetry,
+            outcome: crate::telemetry::SyncOutcome::Ok,
+            packages: Vec::new(),
+            plugins: 0,
+            plugin_evidence: Vec::new(),
+            skills: Vec::new(),
+            name_counts: BTreeMap::new(),
+            layout: InstalledLayout::new(),
+            reaped: 0,
+        }
+    }
+
+    fn mark_partial(&mut self) {
+        promote_to_partial(&mut self.outcome);
+    }
+
+    fn set_resolution(
+        &mut self,
+        packages: Vec<crate::pm::SourcedPackage>,
+        plugins: usize,
+        plugin_evidence: Vec<crate::telemetry::ResolutionEvidence>,
+        deduplicated: DeduplicatedSkills,
+        complete: bool,
+    ) {
+        self.packages = packages;
+        self.plugins = plugins;
+        self.plugin_evidence = plugin_evidence;
+        self.skills = deduplicated.skills;
+        self.name_counts = deduplicated.name_counts;
+        if !complete {
+            self.mark_partial();
+        }
+    }
+
+    fn report(&self, outcome: crate::telemetry::SyncOutcome) -> crate::telemetry::SyncReport {
+        let evidence = self.resolved_extension_evidence();
+
+        let installed = self
+            .layout
+            .skills
+            .values()
+            .filter(|skill| skill.status == SkillSyncStatus::Installed)
+            .count();
+        let updated = self
+            .layout
+            .skills
+            .values()
+            .filter(|skill| skill.status == SkillSyncStatus::Updated)
+            .count();
+
+        crate::telemetry::SyncReport::project(crate::telemetry::SyncReportInput {
+            outcome,
+            duration: self.started.elapsed(),
+            packages: if self.retain_telemetry {
+                &self.packages
+            } else {
+                &[]
+            },
+            extensions: evidence,
+            plugins: self.plugins,
+            skills: self.skills.len(),
+            installed,
+            updated,
+            reaped: self.reaped,
+        })
+    }
+
+    /// Return evidence for every resolved plugin and skill.
+    ///
+    /// Filesystem installation status affects the change counters and the
+    /// private attribution index, not whether an extension resolved.
+    fn resolved_extension_evidence(&self) -> Vec<&crate::telemetry::ResolutionEvidence> {
+        if !self.retain_telemetry {
+            return Vec::new();
+        }
+
+        self.plugin_evidence
+            .iter()
+            .chain(
+                self.skills
+                    .iter()
+                    .filter_map(|skill| skill.evidence.as_ref()),
+            )
+            .collect()
+    }
+
+    fn finish(self) -> CompletedSync {
+        let report = self.report(self.outcome);
+        CompletedSync {
+            report,
+            layout: self.layout,
+        }
+    }
+
+    fn fail(self, source: anyhow::Error) -> SyncFailure {
+        let report = self.report(crate::telemetry::SyncOutcome::Error);
+        // Hard failures are exceptional; boxing their report keeps every
+        // `Result<_, SyncFailure>` compact without adding work to success.
+        SyncFailure {
+            report: Box::new(report),
+            source,
+        }
+    }
+}
+
+fn promote_to_partial(outcome: &mut crate::telemetry::SyncOutcome) {
+    if *outcome == crate::telemetry::SyncOutcome::Ok {
+        *outcome = crate::telemetry::SyncOutcome::Partial;
+    }
 }
 
 /// Create `path` and any missing ancestors up to `boundary`.
@@ -268,22 +527,23 @@ fn dir_contents_differ(source_dir: &Path, dest_dir: &Path) -> Result<bool> {
 /// 3. Otherwise builds a complete, marked copy beside `dest_dir` and swaps it
 ///    in, so a failed copy leaves the slot as it was.
 ///
-/// Returns `Ok(true)` if the destination was created or updated (callers
-/// record it as installed). Returns `Ok(false)` if skipped (no-op).
+/// Returns the exact filesystem outcome so the structured sync report can
+/// distinguish new installs, updates, content-identical checks, and debounce
+/// skips without inspecting paths or mtimes a second time.
 fn sync_skill_dir(
     source_dir: &Path,
     dest_dir: &Path,
     project_root: &Path,
     debounce: Duration,
-) -> Result<bool> {
+) -> Result<SkillSyncStatus> {
     if dest_dir == source_dir {
-        return Ok(false);
+        return Ok(SkillSyncStatus::Unchanged);
     }
 
     // If the destination doesn't exist yet, do a fresh install.
     if !slot_taken(dest_dir) {
         install_skill_dir(source_dir, dest_dir, project_root)?;
-        return Ok(true);
+        return Ok(SkillSyncStatus::Installed);
     }
 
     // Debounce: if we synced recently, skip the content comparison.
@@ -295,19 +555,19 @@ fn sync_skill_dir(
         && elapsed < debounce
     {
         tracing::debug!(dest = %dest_dir.display(), "skill sync debounced");
-        return Ok(false);
+        return Ok(SkillSyncStatus::Debounced);
     }
 
     // Compare content (excluding managed metadata).
     if !dir_contents_differ(source_dir, dest_dir)? {
         // Content is identical — just touch the marker to reset debounce.
         touch_marker(&marker_path)?;
-        return Ok(false);
+        return Ok(SkillSyncStatus::Unchanged);
     }
 
     // Content changed: replace entirely.
     install_skill_dir(source_dir, dest_dir, project_root)?;
-    Ok(true)
+    Ok(SkillSyncStatus::Updated)
 }
 
 fn install_skill_dir(source_dir: &Path, dest_dir: &Path, project_root: &Path) -> Result<()> {
@@ -347,10 +607,11 @@ async fn resolve_custom_predicate_entries(
     sym: &Symposium,
     registry: &plugins::PluginRegistry,
     update: UpdateLevel,
-) -> std::collections::HashMap<String, crate::predicate::ResolvedPredicateEntry> {
+) -> ResolvedCustomPredicates {
     use crate::predicate::ResolvedPredicateEntry;
 
     let mut entries = std::collections::HashMap::new();
+    let mut complete = true;
 
     for (name, resolved) in registry.custom_predicates.iter() {
         let plugin = &registry.plugins[resolved.plugin_index];
@@ -360,6 +621,7 @@ async fn resolve_custom_predicate_entries(
                 command = &resolved.command,
                 "custom predicate references unknown installation"
             );
+            complete = false;
             continue;
         };
 
@@ -373,6 +635,7 @@ async fn resolve_custom_predicate_entries(
                         error = %e,
                         "failed to acquire custom predicate installation"
                     );
+                    complete = false;
                     continue;
                 }
             };
@@ -386,6 +649,7 @@ async fn resolve_custom_predicate_entries(
                         error = %e,
                         "failed to resolve custom predicate runnable"
                     );
+                    complete = false;
                     continue;
                 }
             };
@@ -399,7 +663,12 @@ async fn resolve_custom_predicate_entries(
         );
     }
 
-    entries
+    ResolvedCustomPredicates { entries, complete }
+}
+
+struct ResolvedCustomPredicates {
+    entries: std::collections::HashMap<String, crate::predicate::ResolvedPredicateEntry>,
+    complete: bool,
 }
 
 async fn resolve_sync(
@@ -442,6 +711,12 @@ async fn resolve_sync(
         skills::resolve_skills(sym, &active.plugins, &mut ctx, update, retain_evidence).await;
 
     let mcp_servers = collect_mcp_servers(&active.plugins, &mut ctx);
+    let plugins = active.plugins.len();
+    let plugin_evidence = active
+        .plugins
+        .into_iter()
+        .filter_map(|plugin| plugin.evidence)
+        .collect();
 
     if let Err(error) = ctx.persist_disk_cache(predicate_cache_path) {
         // Cache persistence does not make resolution partial: it affects only
@@ -455,7 +730,8 @@ async fn resolve_sync(
 
     ResolvedSync {
         packages,
-        plugins: active.plugins.len(),
+        plugins,
+        plugin_evidence,
         skills: resolved_skills.skills,
         mcp_servers,
         complete: dependencies_complete && active.complete && resolved_skills.complete,
@@ -515,25 +791,56 @@ fn deduplicate_skills(applicable: Vec<crate::skills::SkillWithGroupContext>) -> 
     }
 }
 
-/// Run the full sync: discover applicable skills, install into agent dirs,
-/// clean up stale installations.
+/// Run the full sync while preserving the established public `Result<()>` API.
 pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLevel) -> Result<()> {
+    sync_with_report(sym, deps, update)
+        .await
+        .map(drop)
+        .map_err(SyncFailure::into_source)
+}
+
+/// Run a full sync and return its telemetry-safe structured report.
+pub(crate) async fn sync_with_report(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+    update: UpdateLevel,
+) -> std::result::Result<crate::telemetry::SyncReport, SyncFailure> {
+    let CompletedSync { report, layout } = run_sync(sym, deps, update).await?;
+    // The following stack consumes the private layout to maintain attribution
+    // indexes. It is deliberately dropped before the safe report leaves sync.
+    drop(layout);
+    Ok(report)
+}
+
+/// Resolve, install, and clean up while retaining the private installed layout.
+async fn run_sync(
+    sym: &Symposium,
+    deps: &Arc<WorkspaceDeps>,
+    update: UpdateLevel,
+) -> std::result::Result<CompletedSync, SyncFailure> {
+    let mut progress = SyncProgress::new(crate::telemetry::is_enabled(sym));
     if let Some(error) = sym.config_error() {
-        anyhow::bail!(
+        return Err(progress.fail(anyhow::anyhow!(
             "not syncing: {} could not be read; fix or remove it, then run the command again\n{error}",
             display_path(&sym.config_dir().join("config.toml")),
-        );
+        )));
     }
     let out = &Output::quiet();
-    let loaded = deps.require()?;
+    let loaded = match deps.require() {
+        Ok(loaded) => loaded,
+        Err(error) => return Err(progress.fail(error)),
+    };
     let project_root = loaded.root.clone();
-    let workspace: Vec<_> = loaded.crates.clone();
+    let workspace_count = loaded.crates.len();
     let loaded = loaded.clone();
     let debounce = Duration::from_secs(sym.config.sync_debounce_secs);
     tracing::debug!(root = %project_root.display(), "resolved workspace root");
 
     // Load plugin registry (registry sources + workspace plugins)
     let registry = plugins::load_registry_with_workspace(sym, Some(&loaded)).await;
+    if !registry.warnings.is_empty() {
+        progress.mark_partial();
+    }
 
     for warning in &registry.warnings {
         tracing::info!(
@@ -545,12 +852,15 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
 
     tracing::info!(
         report = %crate::report::ReportEvent::Info {
-            message: format!("scanning {} workspace dependencies", workspace.len()),
+            message: format!("scanning {workspace_count} workspace dependencies"),
         },
     );
 
     // Resolve custom predicate installations.
-    let custom_entries = resolve_custom_predicate_entries(sym, &registry, update).await;
+    let custom = resolve_custom_predicate_entries(sym, &registry, update).await;
+    if !custom.complete {
+        progress.mark_partial();
+    }
 
     // Resolve sourced packages, plugins, skills, and MCP servers in one pass.
     // Raw provenance stays inside the private result.
@@ -561,25 +871,31 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
         deps,
         &registry,
         &project_root,
-        custom_entries,
+        custom.entries,
         &predicate_cache_path,
         update,
     )
     .await;
+    let ResolvedSync {
+        packages,
+        plugins,
+        plugin_evidence,
+        skills,
+        mcp_servers,
+        complete,
+    } = resolved;
     // The first concrete route survives deduplication; later routes contribute
     // only their package set for package-level extension matching.
-    let deduplicated = deduplicate_skills(resolved.skills);
-    let to_install = deduplicated.skills;
-    let name_counts = deduplicated.name_counts;
-    let mcp_servers = resolved.mcp_servers;
+    let deduplicated = deduplicate_skills(skills);
+    progress.set_resolution(packages, plugins, plugin_evidence, deduplicated, complete);
 
     // Sync each configured agent
     let agent_names: Vec<String> = sym.config.agents.iter().map(|a| a.name.clone()).collect();
 
     tracing::info!(
-        workspace_deps = workspace.len(),
+        workspace_deps = workspace_count,
         agents = agent_names.len(),
-        skills = to_install.len(),
+        skills = progress.skills.len(),
         "sync started"
     );
 
@@ -591,16 +907,13 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
                 message: "no agents configured, run `cargo agents init` to add one".into(),
             },
         );
+        return Ok(progress.finish());
     }
 
-    // Track every skill directory this sync wants, even one whose refresh
-    // failed. Anything we find later that has the marker file but isn't in
-    // this set is stale.
-    let mut installed_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     let skip_cleanup = !registry.unreadable_registries.is_empty();
-
     for agent_name in &agent_names {
         let Ok(agent) = Agent::from_config_name(agent_name) else {
+            progress.mark_partial();
             tracing::info!(
                 report = %crate::report::ReportEvent::Warning {
                     message: unknown_agent_warning(agent_name),
@@ -621,6 +934,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
             }
         };
         if let Err(e) = hooks {
+            progress.mark_partial();
             tracing::info!(
                 report = %crate::report::ReportEvent::Warning {
                     message: format!("failed to register hooks for {agent_name}: {e:#}"),
@@ -669,6 +983,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
                 record_mcp_registrations(sym, agent, &file, names);
             }
             Err(e) => {
+                progress.mark_partial();
                 tracing::info!(
                     report = %crate::report::ReportEvent::Warning {
                         message: format!("failed to register MCP servers for {agent_name}: {e:#}"),
@@ -677,7 +992,11 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
             }
         }
 
-        for skill in &to_install {
+        let skills = &progress.skills;
+        let name_counts = &progress.name_counts;
+        let layout = &mut progress.layout;
+        let outcome = &mut progress.outcome;
+        for (skill_index, skill) in skills.iter().enumerate() {
             let skill_name = &skill.name;
             let origin_hash = &skill.origin_hash;
             let skill_source = &skill.source;
@@ -689,6 +1008,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
                     out.warn(format!(
                         "skill {skill_name}: cannot determine source directory"
                     ));
+                    promote_to_partial(outcome);
                     continue;
                 }
             };
@@ -732,22 +1052,25 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
                         ),
                     },
                 );
+                promote_to_partial(outcome);
                 continue;
             }
 
-            installed_dirs.insert(dest_dir.clone());
             match sync_skill_dir(source_dir, &dest_dir, &project_root, debounce) {
-                Ok(true) => {
-                    tracing::info!(
-                        report = %crate::report::ReportEvent::SkillInstalled {
-                            skill: dir_name.clone(),
-                            agent: agent_name.clone(),
-                            dest: display_path(&dest_dir),
-                        },
-                    );
+                Ok(status) => {
+                    layout.record(dest_dir.clone(), dir_name.clone(), skill_index, status);
+                    if status.changed() {
+                        tracing::info!(
+                            report = %crate::report::ReportEvent::SkillInstalled {
+                                skill: dir_name.clone(),
+                                agent: agent_name.clone(),
+                                dest: display_path(&dest_dir),
+                            },
+                        );
+                    }
                 }
-                Ok(false) => {}
                 Err(e) => {
+                    promote_to_partial(outcome);
                     tracing::info!(
                         report = %crate::report::ReportEvent::Warning {
                             message: format!("failed to install skill {dir_name}: {e}"),
@@ -763,8 +1086,10 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
     // and remove subdirs containing the marker that we didn't just install.
     // Compared by resolved path, since one agent's skills dir can be a symlink
     // to another's. A symlink entry is user content and is never followed.
-    let installed: BTreeSet<PathBuf> = installed_dirs
-        .iter()
+    let installed: BTreeSet<PathBuf> = progress
+        .layout
+        .skills
+        .keys()
         .filter_map(|dir| dir.canonicalize().ok())
         .collect();
     let mut scanned: BTreeSet<PathBuf> = BTreeSet::new();
@@ -775,10 +1100,57 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
         if skip_cleanup || !scanned.insert(parent.clone()) {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&parent) else {
-            continue;
+        progress.layout.cleanup_parents.insert(parent.clone());
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                progress.mark_partial();
+                tracing::info!(
+                    report = %crate::report::ReportEvent::Warning {
+                        message: format!(
+                            "failed to scan skills directory {}: {error}",
+                            display_path(&parent),
+                        ),
+                    },
+                );
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    progress.mark_partial();
+                    tracing::info!(
+                        report = %crate::report::ReportEvent::Warning {
+                            message: format!(
+                                "failed to inspect an entry in {}: {error}",
+                                display_path(&parent),
+                            ),
+                        },
+                    );
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    progress.mark_partial();
+                    tracing::info!(
+                        report = %crate::report::ReportEvent::Warning {
+                            message: format!(
+                                "failed to inspect {}: {error}",
+                                display_path(&entry.path()),
+                            ),
+                        },
+                    );
+                    continue;
+                }
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
             let path = entry.path();
             if installed.contains(&path) || !is_managed_skill_dir(&path) {
                 continue;
@@ -790,8 +1162,13 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
                             path: display_path(&path),
                         },
                     );
+                    progress.reaped = progress
+                        .reaped
+                        .checked_add(1)
+                        .expect("BUG: reaped directory count must fit in usize");
                 }
                 Err(e) => {
+                    progress.mark_partial();
                     tracing::info!(
                         report = %crate::report::ReportEvent::Warning {
                             message: format!("failed to remove stale {}: {e}", display_path(&path)),
@@ -836,7 +1213,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
         out,
     );
 
-    if to_install.is_empty() {
+    if progress.skills.is_empty() {
         tracing::info!(
             report = %crate::report::ReportEvent::Info {
                 message: "no applicable skills found for workspace dependencies".into(),
@@ -844,7 +1221,7 @@ pub async fn sync(sym: &Symposium, deps: &Arc<WorkspaceDeps>, update: UpdateLeve
         );
     }
 
-    Ok(())
+    Ok(progress.finish())
 }
 
 fn lock_sync(sym: &Symposium) -> Result<fs::File> {
@@ -977,6 +1354,123 @@ fn unregister_recorded_mcp_servers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_skill(directory: &Path, body: &str) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn skill_sync_reports_each_filesystem_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("project/.agents/skills/example");
+        write_skill(&source, "first");
+
+        assert_eq!(
+            sync_skill_dir(&source, &destination, temp.path(), Duration::ZERO).unwrap(),
+            SkillSyncStatus::Installed
+        );
+        assert_eq!(
+            sync_skill_dir(&source, &destination, temp.path(), Duration::MAX).unwrap(),
+            SkillSyncStatus::Debounced
+        );
+        assert_eq!(
+            sync_skill_dir(&source, &destination, temp.path(), Duration::ZERO).unwrap(),
+            SkillSyncStatus::Unchanged
+        );
+
+        fs::write(source.join("SKILL.md"), "second").unwrap();
+        assert_eq!(
+            sync_skill_dir(&source, &destination, temp.path(), Duration::ZERO).unwrap(),
+            SkillSyncStatus::Updated
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn shared_parent_keeps_the_strongest_slot_status() {
+        let destination = PathBuf::from("project/.agents/skills/example");
+        let parent = destination.parent().unwrap().to_path_buf();
+        let mut layout = InstalledLayout::new();
+
+        layout.record(
+            destination.clone(),
+            "example".to_owned(),
+            2,
+            SkillSyncStatus::Installed,
+        );
+        layout.record(
+            destination.clone(),
+            "example".to_owned(),
+            2,
+            SkillSyncStatus::Debounced,
+        );
+
+        assert_eq!(layout.skills.len(), 1);
+        assert_eq!(
+            layout.skills[&destination].status,
+            SkillSyncStatus::Installed,
+            "a later agent sharing the parent must not hide this run's install"
+        );
+        assert_eq!(layout.managed_parents, BTreeSet::from([parent]));
+    }
+
+    #[test]
+    fn hard_failure_preserves_the_safe_progress_report() {
+        use std::error::Error as _;
+
+        let failure = SyncProgress::new(true).fail(anyhow::anyhow!("sentinel failure"));
+
+        assert_eq!(
+            failure.report().outcome(),
+            crate::telemetry::SyncOutcome::Error
+        );
+        assert_eq!(failure.to_string(), "sentinel failure");
+        assert_eq!(failure.source().unwrap().to_string(), "sentinel failure");
+
+        let source = SyncProgress::new(true)
+            .fail(anyhow::anyhow!("original failure"))
+            .into_source();
+        assert_eq!(format!("{source:#}"), "original failure");
+    }
+
+    #[test]
+    fn resolved_skill_evidence_does_not_depend_on_installation() {
+        use crate::pm::{CRATES_IO_REGISTRY_URL, PackageProvenance};
+        use crate::predicate::{PredicateSet, SourcedPredicateContext};
+
+        let mut context = SourcedPredicateContext::new(&[]);
+        let route = crate::telemetry::evaluate_resolution_predicates(
+            &PredicateSet::default(),
+            &mut context,
+            &mut crate::telemetry::OptionalWitnessMode::new(true),
+        )
+        .unwrap();
+        let evidence = crate::telemetry::skill_resolution_evidence(
+            route,
+            None,
+            None,
+            &PackageProvenance::Registry {
+                url: CRATES_IO_REGISTRY_URL.to_owned(),
+            },
+            "resolved-skill",
+        )
+        .unwrap();
+        let mut progress = SyncProgress::new(true);
+        progress.skills.push(ResolvedSkillInstall {
+            name: "resolved-skill".to_owned(),
+            origin_hash: "origin".to_owned(),
+            source: PathBuf::from("source/SKILL.md"),
+            evidence: Some(evidence),
+        });
+
+        assert!(progress.layout.skills.is_empty());
+        assert_eq!(progress.resolved_extension_evidence().len(), 1);
+    }
 
     /// A source tree holding, in order: a plain file, a nested directory, an
     /// empty directory, a link to a file outside the tree, a link to a
@@ -1232,6 +1726,73 @@ mod tests {
                 .iter()
                 .all(|package| contributors.contains(package))
         );
+    }
+
+    #[test]
+    fn evidence_retention_does_not_change_the_installed_slot_or_status() {
+        use crate::pm::{CARGO_PM, CRATES_IO_REGISTRY_URL, PackageId, PackageProvenance};
+        use crate::predicate::{Predicate, PredicateSet, SourcedPredicateContext};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        write_skill(&source_dir, "skill");
+        let source = source_dir.join("SKILL.md");
+        let package = crate::pm::SourcedPackage::new(
+            PackageId::new(CARGO_PM, "example-runtime", "1.0.0"),
+            PackageProvenance::Registry {
+                url: CRATES_IO_REGISTRY_URL.to_owned(),
+            },
+        );
+        let packages = vec![package.clone()];
+        let mut context = SourcedPredicateContext::new(&packages);
+        let evidence = crate::telemetry::evaluate_resolution_predicates(
+            &PredicateSet {
+                predicates: vec![Predicate::DependsOn(package.id.name.clone(), None)],
+            },
+            &mut context,
+            &mut crate::telemetry::OptionalWitnessMode::new(true),
+        )
+        .unwrap()
+        .unwrap();
+        let entry = |evidence| crate::skills::SkillWithGroupContext {
+            skill: crate::skills::Skill {
+                frontmatter: BTreeMap::from([("name".to_owned(), "example".to_owned())]),
+                predicates: PredicateSet::default(),
+                path: source.clone(),
+            },
+            origin_hash: "same-origin".to_owned(),
+            evidence,
+        };
+
+        let without_evidence = deduplicate_skills(vec![entry(None)]);
+        let with_evidence = deduplicate_skills(vec![entry(Some(evidence))]);
+        let plain = &without_evidence.skills[0];
+        let retained = &with_evidence.skills[0];
+        assert_eq!(
+            (&plain.name, &plain.origin_hash, &plain.source),
+            (&retained.name, &retained.origin_hash, &retained.source)
+        );
+        assert_eq!(without_evidence.name_counts, with_evidence.name_counts);
+
+        let plain_destination = temp.path().join("plain/.agents/skills/example");
+        let retained_destination = temp.path().join("retained/.agents/skills/example");
+        let plain_status = sync_skill_dir(
+            plain.source.parent().unwrap(),
+            &plain_destination,
+            temp.path(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let retained_status = sync_skill_dir(
+            retained.source.parent().unwrap(),
+            &retained_destination,
+            temp.path(),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_eq!(plain_status, retained_status);
+        assert_eq!(plain_status, SkillSyncStatus::Installed);
     }
 
     #[test]

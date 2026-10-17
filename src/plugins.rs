@@ -1455,7 +1455,9 @@ where
     D: PredicateDependencies,
     M: ActivePluginMode<D>,
 {
-    let mut complete = registry.warnings.is_empty();
+    // Registry loading owns its warnings. This bit reports only omissions
+    // encountered while expanding the active-plugin walk itself.
+    let mut complete = true;
     let mut walk = ActivePluginWalk::<D, M>::new(mode);
 
     // Seed with the trust-root plugins (registry + workspace), gated.
@@ -3801,6 +3803,31 @@ mod tests {
         assert!(resolved.plugins.is_empty());
         assert!(!resolved.complete);
         assert_eq!(load_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_warnings_are_not_plugin_walk_omissions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sym = Symposium::from_dir(root);
+        let registry = PluginRegistry {
+            plugins: Vec::new(),
+            warnings: vec![LoadWarning {
+                path: root.join("broken-plugin.toml"),
+                message: "fixture warning".to_owned(),
+            }],
+            unreadable_registries: Vec::new(),
+            custom_predicates: CustomPredicateRegistry::default(),
+        };
+        let pms = crate::pm::PmRegistry::new(Vec::new());
+        let packages = Vec::new();
+        let mut context = crate::predicate::SourcedPredicateContext::new(&packages);
+
+        let resolved =
+            resolve_active_plugins(&sym, &registry, &pms, None, &mut context, true).await;
+
+        assert!(resolved.plugins.is_empty());
+        assert!(resolved.complete);
     }
 
     #[tokio::test]
