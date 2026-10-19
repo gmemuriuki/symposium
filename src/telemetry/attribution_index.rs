@@ -9,14 +9,6 @@
 //! path-safe slot and returns [`InstalledSkillAttribution::NotIndexed`] before
 //! joining an invalid value onto a skills parent.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the installed-attribution sync and hook commits consume this module"
-    )
-)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
@@ -28,7 +20,10 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
-use super::schema::SafeSkillAttribution;
+use super::{
+    resolution_witness::ResolutionEvidence,
+    schema::{PublicSkillCoordinate, SafeSkillAttribution},
+};
 
 pub(crate) const INDEX_DIRECTORY_NAME: &str = ".symposium-index";
 pub(crate) const MARKER_FILE_NAME: &str = ".symposium";
@@ -311,6 +306,26 @@ pub(crate) struct InstallationIndexEntry {
 }
 
 impl InstallationIndexEntry {
+    /// Project one installed skill's retained evidence into index-safe form.
+    #[must_use]
+    pub(crate) fn from_skill_evidence(
+        slot: String,
+        binding: InstallationBinding,
+        evidence: Option<&ResolutionEvidence>,
+    ) -> Self {
+        let Some(resolution) = evidence.and_then(ResolutionEvidence::safe_resolution) else {
+            return Self::ineligible(slot, binding);
+        };
+        let Ok(target) = PublicSkillCoordinate::try_from(resolution.target) else {
+            return Self::ineligible(slot, binding);
+        };
+        Self::public(
+            slot,
+            binding,
+            SafeSkillAttribution::new(target, resolution.path),
+        )
+    }
+
     #[must_use]
     pub(in crate::telemetry) fn public(
         slot: String,
@@ -383,23 +398,6 @@ pub(crate) struct PreparedInstallationIndex {
     retained_entries: usize,
     demoted_public_entries: usize,
     omitted_entries: usize,
-}
-
-impl PreparedInstallationIndex {
-    #[must_use]
-    pub(crate) fn retained_entries(&self) -> usize {
-        self.retained_entries
-    }
-
-    #[must_use]
-    pub(crate) fn demoted_public_entries(&self) -> usize {
-        self.demoted_public_entries
-    }
-
-    #[must_use]
-    pub(crate) fn omitted_entries(&self) -> usize {
-        self.omitted_entries
-    }
 }
 
 struct MeasuredEntry {
@@ -749,6 +747,13 @@ fn remove_owned_file(path: &Path, report: &mut IndexCleanupReport) {
 }
 
 /// Closed attribution result for one exact agent-provided slot.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the hook attribution commit consumes the lookup result"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::telemetry) enum InstalledSkillAttribution {
     Public(SafeSkillAttribution),
@@ -770,6 +775,13 @@ pub(in crate::telemetry) enum InstalledSkillAttribution {
 /// derive every parent from one project root; any future caller that accepts
 /// aliases must prevent equivalent paths from becoming distinct candidates.
 #[must_use]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the hook attribution commit consumes the lookup entry point"
+    )
+)]
 pub(in crate::telemetry) fn lookup_installed_skill(
     skills_parents: impl IntoIterator<Item = PathBuf>,
     slot: &str,
@@ -1082,6 +1094,104 @@ mod tests {
     }
 
     #[test]
+    fn non_skill_evidence_degrades_to_an_ineligible_index_entry() {
+        use crate::{
+            pm::{CARGO_PM, CRATES_IO_REGISTRY_URL, PackageId, PackageProvenance, SourcedPackage},
+            predicate::{PredicateSet, SourcedPredicateContext},
+        };
+
+        let package = SourcedPackage::new(
+            PackageId::new(CARGO_PM, "example", "1.2.3"),
+            PackageProvenance::Registry {
+                url: CRATES_IO_REGISTRY_URL.to_owned(),
+            },
+        );
+        let mut context = SourcedPredicateContext::new(&[]);
+        let route = crate::telemetry::evaluate_resolution_predicates(
+            &PredicateSet::default(),
+            &mut context,
+            &mut crate::telemetry::OptionalWitnessMode::new(true),
+        )
+        .unwrap();
+        let evidence =
+            crate::telemetry::plugin_resolution_evidence(route, None, None, &package, "example")
+                .unwrap();
+
+        let entry = InstallationIndexEntry::from_skill_evidence(
+            "example".to_owned(),
+            binding(1),
+            Some(&evidence),
+        );
+
+        assert!(matches!(entry.attribution, IndexedAttribution::Ineligible));
+    }
+
+    #[test]
+    fn sync_marker_and_index_reader_bind_the_same_installed_content() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let parent = root.path().join("project/.agents/skills");
+        let destination = parent.join("debugging");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "first").unwrap();
+
+        crate::sync::sync_skill_dir_for_attribution_test(
+            &source,
+            &destination,
+            root.path(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let first = read_marker(&destination.join(MARKER_FILE_NAME))
+            .unwrap()
+            .unwrap();
+        replace_entries(
+            &parent,
+            vec![InstallationIndexEntry::public(
+                "debugging".to_owned(),
+                first,
+                attribution("debugging"),
+            )],
+        );
+        assert!(matches!(
+            lookup_installed_skill([parent.clone()], "debugging"),
+            InstalledSkillAttribution::Public(_)
+        ));
+
+        fs::write(source.join("SKILL.md"), "second").unwrap();
+        crate::sync::sync_skill_dir_for_attribution_test(
+            &source,
+            &destination,
+            root.path(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let second = read_marker(&destination.join(MARKER_FILE_NAME))
+            .unwrap()
+            .unwrap();
+
+        assert!(first != second);
+        assert_eq!(
+            lookup_installed_skill([parent.clone()], "debugging"),
+            InstalledSkillAttribution::NotIndexed,
+            "rotating the sync-owned marker must invalidate the old index"
+        );
+
+        replace_entries(
+            &parent,
+            vec![InstallationIndexEntry::public(
+                "debugging".to_owned(),
+                second,
+                attribution("debugging"),
+            )],
+        );
+        assert!(matches!(
+            lookup_installed_skill([parent], "debugging"),
+            InstalledSkillAttribution::Public(_)
+        ));
+    }
+
+    #[test]
     fn malformed_legacy_and_unknown_markers_are_repaired() {
         let cases: [&[u8]; 3] = [
             b"",
@@ -1187,9 +1297,9 @@ mod tests {
             decoded[1].attribution,
             IndexedAttribution::Ineligible
         ));
-        assert_eq!(prepared.retained_entries(), 2);
-        assert_eq!(prepared.demoted_public_entries(), 0);
-        assert_eq!(prepared.omitted_entries(), 0);
+        assert_eq!(prepared.retained_entries, 2);
+        assert_eq!(prepared.demoted_public_entries, 0);
+        assert_eq!(prepared.omitted_entries, 0);
     }
 
     #[test]
@@ -1293,9 +1403,9 @@ mod tests {
         assert_eq!(decoded.len(), MAX_INDEX_ENTRIES);
         assert!(prepared.encoded.len() <= MAX_INDEX_BYTES);
         assert!(public_count > 0);
-        assert!(prepared.demoted_public_entries() > 0);
+        assert!(prepared.demoted_public_entries > 0);
         assert_eq!(
-            public_count + prepared.demoted_public_entries(),
+            public_count + prepared.demoted_public_entries,
             MAX_INDEX_ENTRIES
         );
     }
@@ -1315,8 +1425,8 @@ mod tests {
             let decoded = decode_index(&prepared.encoded).unwrap();
 
             assert!(decoded.is_empty());
-            assert_eq!(prepared.retained_entries(), 0);
-            assert_eq!(prepared.omitted_entries(), input_len);
+            assert_eq!(prepared.retained_entries, 0);
+            assert_eq!(prepared.omitted_entries, input_len);
         }
     }
 
