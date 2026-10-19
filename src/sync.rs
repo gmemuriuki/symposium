@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// Cleanup walks each agent's skills parent dir and removes any subdir
 /// containing this marker that isn't in the freshly-installed set, leaving
 /// user-managed skill directories (which lack the marker) untouched.
-pub(crate) const MARKER_FILE: &str = ".symposium";
+pub(crate) use crate::telemetry::attribution_index::MARKER_FILE_NAME as MARKER_FILE;
 
 /// Private result of the one-pass resolution phase.
 ///
