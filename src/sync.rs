@@ -1666,7 +1666,7 @@ mod tests {
         layout.preserve(destination.clone(), "example".to_owned(), 2);
 
         assert_eq!(layout.skills[&destination].status, None);
-        assert_eq!(layout.skills[&destination].binding, None);
+        assert!(layout.skills[&destination].binding.is_none());
         assert_eq!(layout.managed_parents, BTreeSet::from([parent]));
     }
 
@@ -1692,6 +1692,7 @@ mod tests {
             source: source.join("SKILL.md"),
             evidence: Some(public_skill_evidence("debugging")),
         }];
+        let parent = parent.canonicalize().unwrap();
 
         maintain_attribution_index(true, &parent, &layout, &skills);
 
@@ -1732,6 +1733,7 @@ mod tests {
             .join(attribution_index::INDEX_DIRECTORY_NAME)
             .join("index.json");
         let before = fs::read(&index_file).unwrap();
+        let parent = parent.canonicalize().unwrap();
         let mut layout = InstalledLayout::new();
         layout.record(
             destination,
@@ -1767,6 +1769,7 @@ mod tests {
         let stale_binding = attribution_index::reconcile_marker(&stale, MarkerAction::Rotate)
             .unwrap()
             .binding();
+        let parent = parent.canonicalize().unwrap();
 
         let mut progress = SyncProgress::new(true);
         progress.skills = vec![ResolvedSkillInstall {
@@ -2058,7 +2061,9 @@ mod tests {
 
         fs::set_permissions(&notes, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
-            sync_skill_dir(&src, &dst, tmp.path(), Duration::ZERO).unwrap(),
+            sync_skill_dir(&src, &dst, tmp.path(), Duration::ZERO)
+                .unwrap()
+                .status,
             SkillSyncStatus::Installed,
         );
         assert!(dst.join(MARKER_FILE).exists());
