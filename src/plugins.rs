@@ -3823,8 +3823,16 @@ mod tests {
         let packages = Vec::new();
         let mut context = crate::predicate::SourcedPredicateContext::new(&packages);
 
-        let resolved =
-            resolve_active_plugins(&sym, &registry, &pms, None, &mut context, true).await;
+        let resolved = resolve_active_plugins(
+            &sym,
+            &registry,
+            &pms,
+            None,
+            &mut context,
+            UpdateLevel::None,
+            true,
+        )
+        .await;
 
         assert!(resolved.plugins.is_empty());
         assert!(resolved.complete);

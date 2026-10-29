@@ -899,7 +899,10 @@ async fn run_sync(
         "sync started"
     );
 
-    let _lock = lock_sync(sym)?;
+    let _lock = match lock_sync(sym) {
+        Ok(lock) => lock,
+        Err(error) => return Err(progress.fail(error)),
+    };
 
     if agent_names.is_empty() {
         tracing::info!(
