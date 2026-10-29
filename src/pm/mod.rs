@@ -35,13 +35,6 @@ mod cargo;
 mod git;
 pub mod layout;
 mod path;
-#[cfg_attr(
-    not(test),
-    expect(
-        unused_imports,
-        reason = "the telemetry naming policy consumes this in the next stacked branch"
-    )
-)]
 pub(crate) use cargo::CRATES_IO_REGISTRY_URL;
 pub(crate) use cargo::classify_package_source;
 pub use cargo::{
@@ -557,8 +550,18 @@ mod tests {
         let deps = WorkspaceDeps::fixture(
             tmp.path(),
             vec![
-                WorkspaceCrate::new("widget-lib".into(), semver::Version::new(1, 0, 0), None),
-                WorkspaceCrate::new("serde".into(), semver::Version::new(1, 0, 0), None),
+                WorkspaceCrate::new(
+                    "widget-lib".into(),
+                    semver::Version::new(1, 0, 0),
+                    PackageProvenance::Unknown,
+                    None,
+                ),
+                WorkspaceCrate::new(
+                    "serde".into(),
+                    semver::Version::new(1, 0, 0),
+                    PackageProvenance::Unknown,
+                    None,
+                ),
             ],
         );
         let cargo = PmInstance {

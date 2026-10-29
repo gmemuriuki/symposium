@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].package.provenance, provenance);
 
-        let loaded = pm.load_plugin(&id).await;
+        let loaded = pm.load_plugin(&id, UpdateLevel::None).await;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].package.provenance, provenance);
 

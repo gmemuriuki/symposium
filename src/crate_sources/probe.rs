@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::{MetadataCommand, Source};
 
 use super::{FetchResult, normalize_crate_name};
-use crate::pm::classify_package_source;
+use crate::pm::{CRATES_IO_REGISTRY_URL, PackageProvenance, classify_package_source};
 
 const PROBE_PACKAGE: &str = "symposium-crate-probe";
 const CRATES_IO_SRC_PREFIX: &str = "index.crates.io-";
@@ -93,6 +93,9 @@ pub fn find_cached(crate_name: &str, version_req: &str, cargo_home: &Path) -> Re
         name,
         version: version.to_string(),
         path,
+        provenance: PackageProvenance::Registry {
+            url: CRATES_IO_REGISTRY_URL.to_owned(),
+        },
     })
 }
 
@@ -397,6 +400,12 @@ mod tests {
         assert_eq!(found.name, "foo");
         assert_eq!(found.version, "1.10.0");
         assert_eq!(found.path, newest);
+        assert_eq!(
+            found.provenance,
+            PackageProvenance::Registry {
+                url: CRATES_IO_REGISTRY_URL.to_owned(),
+            }
+        );
 
         let found = find_cached("foo", "=1.2.0", cargo_home.path()).unwrap();
         assert_eq!(found.version, "1.2.0");

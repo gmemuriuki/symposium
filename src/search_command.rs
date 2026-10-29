@@ -58,7 +58,7 @@ pub async fn find_matches(sym: &Symposium, query: &str) -> Vec<SearchMatch> {
     for (instance, info) in sym.detached_managers().search(query).await {
         if matches
             .iter()
-            .any(|m| m.origin == instance && m.name == info.id.name)
+            .any(|m| m.origin == instance && m.name == info.package.id.name)
         {
             continue;
         }

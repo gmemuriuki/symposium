@@ -202,9 +202,7 @@ pub async fn enabled_dependencies(
 
     for (name, id) in used {
         let named = PackageId::any_version(&id.pm, name);
-        if !registry
-            .iter()
-            .any(|p| pms.identity(&p.package.id) == id)
+        if !registry.iter().any(|p| pms.identity(&p.package.id) == id)
             && !plugins.is_disabled(pms, &named)
             && known.insert(id)
         {

@@ -2106,6 +2106,10 @@ mod tests {
             crate::pm::CARGO_PM
         }
 
+        fn canonical_name(&self, name: &str) -> String {
+            crate::crate_sources::normalize_crate_name(name)
+        }
+
         async fn active_plugins(
             &self,
             _deps: &[SourcedPackage],
@@ -2113,7 +2117,11 @@ mod tests {
             Vec::new()
         }
 
-        async fn load_plugin(&self, _id: &PackageId) -> Vec<crate::pm::UnvalidatedPlugin> {
+        async fn load_plugin(
+            &self,
+            _id: &PackageId,
+            _update: UpdateLevel,
+        ) -> Vec<crate::pm::UnvalidatedPlugin> {
             self.load_calls.fetch_add(1, Ordering::Relaxed);
             Vec::new()
         }
@@ -3415,7 +3423,15 @@ mod tests {
         let deps = Vec::new();
         let mut context = crate::predicate::PredicateContext::new(&deps);
 
-        let active = active_plugins(&sym, &registry, &pms, Some(root), &mut context).await;
+        let active = active_plugins(
+            &sym,
+            &registry,
+            &pms,
+            Some(root),
+            &mut context,
+            UpdateLevel::None,
+        )
+        .await;
         let matching: Vec<_> = active
             .iter()
             .filter(|plugin| plugin.manifest.name == "different-plugin-name")
@@ -3475,9 +3491,18 @@ mod tests {
             }),
         }]);
         let dependencies = Vec::new();
-        let mut context = ctx(&dependencies).with_used_names(&["dormant-plugin"]);
+        let used = registry.plugins[0].package.id.clone();
+        let mut context = ctx(&dependencies).with_used(std::slice::from_ref(&used));
 
-        let active = active_plugins(&sym, &registry, &pms, Some(root), &mut context).await;
+        let active = active_plugins(
+            &sym,
+            &registry,
+            &pms,
+            Some(root),
+            &mut context,
+            UpdateLevel::None,
+        )
+        .await;
 
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].manifest.name, "dormant-plugin");
@@ -3548,7 +3573,15 @@ mod tests {
             .collect();
         let mut context = crate::predicate::PredicateContext::new(&deps);
 
-        let active = active_plugins(&sym, &registry, &pms, Some(root), &mut context).await;
+        let active = active_plugins(
+            &sym,
+            &registry,
+            &pms,
+            Some(root),
+            &mut context,
+            UpdateLevel::None,
+        )
+        .await;
         let member_plugin = active
             .iter()
             .find(|plugin| plugin.manifest.name == "member-plugin")
@@ -3655,9 +3688,7 @@ mod tests {
         assert!(!plugin.applies(&mut ctx(&deps)));
         assert!(!plugin.applies(&mut ctx(&deps).with_used(&[other])));
         assert!(
-            plugin.applies(
-                &mut ctx(&deps).with_used(std::slice::from_ref(&plugin.package.id))
-            )
+            plugin.applies(&mut ctx(&deps).with_used(std::slice::from_ref(&plugin.package.id)))
         );
     }
 

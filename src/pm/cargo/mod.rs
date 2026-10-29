@@ -179,20 +179,26 @@ impl PackageManager for CargoPm {
     async fn find(&self, name: &str, update: UpdateLevel) -> Option<PackageId> {
         let wanted = self.canonical_name(name);
         let same = |id: &PackageId| self.canonical_name(&id.name) == wanted;
-        if let Some(dep) = self.list_deps().await.ok()?.into_iter().find(same) {
-            return Some(dep);
+        if let Some(dep) = self
+            .list_deps()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|package| same(&package.id))
+        {
+            return Some(dep.id);
         }
         if let Ok(cached) = self
             .fetch(&Self::id_for(name, None), UpdateLevel::None)
             .await
         {
-            return Some(cached.id);
+            return Some(cached.package.id);
         }
         if matches!(update, UpdateLevel::None) {
             return None;
         }
         let found = self.search(name).await.ok()?;
-        found.into_iter().map(|info| info.id).find(same)
+        found.into_iter().map(|info| info.package.id).find(same)
     }
 
     /// The plugins embedded in the workspace's dependencies: every dep in
