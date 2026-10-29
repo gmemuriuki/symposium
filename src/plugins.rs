@@ -2363,6 +2363,10 @@ mod tests {
             crate::crate_sources::normalize_crate_name(name)
         }
 
+        async fn find(&self, name: &str, _update: UpdateLevel) -> Option<PackageId> {
+            Some(PackageId::any_version(crate::pm::CARGO_PM, name))
+        }
+
         async fn active_plugins(
             &self,
             _deps: &[SourcedPackage],

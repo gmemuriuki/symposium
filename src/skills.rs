@@ -412,6 +412,9 @@ fn collect_skills_from_dirs(resolved: Vec<ResolvedSkillDir>, group: &SkillGroup)
                     tracing::warn!(
                         source = %entry.source_label,
                         error = %e,
+                        report = %crate::report::ReportEvent::Warning {
+                            message: format!("skipping {e:#}"),
+                        },
                         "failed to load skill",
                     );
                 }

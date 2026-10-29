@@ -85,7 +85,9 @@ impl SkillSyncStatus {
 struct InstalledSkill {
     slot: String,
     skill_index: usize,
-    status: SkillSyncStatus,
+    /// `None` retains an existing managed slot after a failed refresh without
+    /// counting the failed attempt as an installation or update.
+    status: Option<SkillSyncStatus>,
 }
 
 /// Private filesystem result kept separate from the telemetry-safe report.
@@ -115,6 +117,20 @@ impl InstalledLayout {
         skill_index: usize,
         status: SkillSyncStatus,
     ) {
+        self.record_present(destination, slot, skill_index, Some(status));
+    }
+
+    fn preserve(&mut self, destination: PathBuf, slot: String, skill_index: usize) {
+        self.record_present(destination, slot, skill_index, None);
+    }
+
+    fn record_present(
+        &mut self,
+        destination: PathBuf,
+        slot: String,
+        skill_index: usize,
+        status: Option<SkillSyncStatus>,
+    ) {
         let parent = destination
             .parent()
             .expect("BUG: an installed skill directory must have a parent")
@@ -136,7 +152,9 @@ impl InstalledLayout {
                 // fresh install therefore commonly appears as Installed and
                 // then Debounced; preserve the strongest result for counts
                 // and for the next attribution-index slice.
-                installed.status = installed.status.max(status);
+                if let Some(status) = status {
+                    installed.status = Some(installed.status.map_or(status, |old| old.max(status)));
+                }
             })
             .or_insert(InstalledSkill {
                 slot,
@@ -259,13 +277,13 @@ impl SyncProgress {
             .layout
             .skills
             .values()
-            .filter(|skill| skill.status == SkillSyncStatus::Installed)
+            .filter(|skill| skill.status == Some(SkillSyncStatus::Installed))
             .count();
         let updated = self
             .layout
             .skills
             .values()
-            .filter(|skill| skill.status == SkillSyncStatus::Updated)
+            .filter(|skill| skill.status == Some(SkillSyncStatus::Updated))
             .count();
 
         crate::telemetry::SyncReport::project(crate::telemetry::SyncReportInput {
@@ -910,7 +928,6 @@ async fn run_sync(
                 message: "no agents configured, run `cargo agents init` to add one".into(),
             },
         );
-        return Ok(progress.finish());
     }
 
     let skip_cleanup = !registry.unreadable_registries.is_empty();
@@ -1073,6 +1090,9 @@ async fn run_sync(
                     }
                 }
                 Err(e) => {
+                    if is_managed_skill_dir(&dest_dir) {
+                        layout.preserve(dest_dir.clone(), dir_name.clone(), skill_index);
+                    }
                     promote_to_partial(outcome);
                     tracing::info!(
                         report = %crate::report::ReportEvent::Warning {
@@ -1416,9 +1436,21 @@ mod tests {
         assert_eq!(layout.skills.len(), 1);
         assert_eq!(
             layout.skills[&destination].status,
-            SkillSyncStatus::Installed,
+            Some(SkillSyncStatus::Installed),
             "a later agent sharing the parent must not hide this run's install"
         );
+        assert_eq!(layout.managed_parents, BTreeSet::from([parent]));
+    }
+
+    #[test]
+    fn failed_refresh_preserves_the_slot_without_a_success_status() {
+        let destination = PathBuf::from("project/.agents/skills/example");
+        let parent = destination.parent().unwrap().to_path_buf();
+        let mut layout = InstalledLayout::new();
+
+        layout.preserve(destination.clone(), "example".to_owned(), 2);
+
+        assert_eq!(layout.skills[&destination].status, None);
         assert_eq!(layout.managed_parents, BTreeSet::from([parent]));
     }
 
@@ -1668,7 +1700,10 @@ mod tests {
         assert_eq!(fs::read_dir(&skills).unwrap().count(), 0);
 
         fs::set_permissions(&notes, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(sync_skill_dir(&src, &dst, tmp.path(), Duration::ZERO).unwrap());
+        assert_eq!(
+            sync_skill_dir(&src, &dst, tmp.path(), Duration::ZERO).unwrap(),
+            SkillSyncStatus::Installed,
+        );
         assert!(dst.join(MARKER_FILE).exists());
         assert_eq!(fs::read_to_string(dst.join("notes.txt")).unwrap(), "notes");
     }
