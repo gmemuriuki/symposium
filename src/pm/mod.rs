@@ -37,7 +37,7 @@ pub mod remote;
 
 pub use admission::ResolvedContent;
 use admission::ResolvedDependency;
-pub(crate) use admission::ResolvedPackage;
+pub(crate) use admission::{PackageNamingView, ResolvedPackage};
 pub use git::GitPm;
 pub use path::PathPm;
 pub use remote::{RemotePm, RemotePmCommand};
@@ -467,10 +467,9 @@ impl PmInstance {
                     continue;
                 }
             };
-            plugin.root = content.root;
-            let resolved = content.package;
-            let handle = resolved.handle();
-            match crate::plugins::validate_plugin(plugin, Some(resolved), self.kind) {
+            plugin.root = content.root().to_owned();
+            let handle = content.package().handle();
+            match crate::plugins::validate_plugin(plugin, Some(content), self.kind) {
                 Ok(plugin) => candidates.push((handle, plugin)),
                 Err(error) => self.skipped(&format!("`{id}`: {error:#}")),
             }
@@ -547,6 +546,20 @@ pub(crate) fn builtin_cargo_instance(workspace: std::sync::Arc<WorkspaceDeps>) -
         Box::new(CargoPm::new(workspace)),
         admission::PackageAuthority::BuiltinCargo,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn resolved_content_for_test(root: &std::path::Path) -> ResolvedContent {
+    let admission = admission::PackageAdmission::new(
+        CARGO_PM.to_string(),
+        admission::PackageAuthority::BuiltinCargo,
+    );
+    let resolution = PackageResolution::new(
+        PackageId::new(CARGO_PM, "test-package", "1.0.0"),
+        PackageSourceClaim::CratesIo,
+        PackageKey::new("test-package-key").unwrap(),
+    );
+    admission.admit_content(resolution, root).unwrap()
 }
 
 /// Whether a directory a package manager gave for `id` is absolute. A relative
@@ -942,8 +955,8 @@ mod tests {
             .admit_content(resolution(CARGO_PM, "configured"), Path::new("."))
             .unwrap();
         assert!(matches!(
-            configured.package.authority(),
-            admission::PackageAuthority::Remote
+            configured.package().naming_view().authority(),
+            admission::PackageNamingAuthority::Remote
         ));
 
         let builtin = builtin_cargo_instance(std::sync::Arc::new(WorkspaceDeps::detached()));
@@ -952,8 +965,8 @@ mod tests {
             .admit_content(resolution(CARGO_PM, "builtin"), Path::new("."))
             .unwrap();
         assert!(matches!(
-            admitted.package.authority(),
-            admission::PackageAuthority::BuiltinCargo
+            admitted.package().naming_view().authority(),
+            admission::PackageNamingAuthority::BuiltinCargo
         ));
     }
 
@@ -976,8 +989,8 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            admitted.package.authority(),
-            admission::PackageAuthority::Recommendations
+            admitted.package().naming_view().authority(),
+            admission::PackageNamingAuthority::Recommendations
         ));
 
         let same_name = PmInstance::new(
@@ -997,8 +1010,8 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            admitted.package.authority(),
-            admission::PackageAuthority::Remote
+            admitted.package().naming_view().authority(),
+            admission::PackageNamingAuthority::Remote
         ));
     }
 
@@ -1553,6 +1566,10 @@ mod tests {
             )
             .await;
         assert!(loaded[0].resolved_package().is_some());
+        assert_eq!(
+            loaded[0].resolved_content().unwrap().root(),
+            dunce::canonicalize(std::env::current_dir().unwrap()).unwrap()
+        );
         let ids: Vec<_> = loaded.iter().map(|p| p.canonical.to_string()).collect();
         assert_eq!(ids, vec!["cargo:foo:*"]);
     }

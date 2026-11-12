@@ -1035,7 +1035,7 @@ mod tests {
     fn registry_plugin(pm: &str, name: &str, dormant: bool) -> crate::plugins::Plugin {
         crate::plugins::Plugin {
             canonical: PackageId::any_version(pm, name),
-            resolved_package: None,
+            resolved_content: None,
             manifest: crate::plugins::PluginManifest {
                 name: name.to_string(),
                 requires_use: dormant,

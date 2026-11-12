@@ -240,7 +240,7 @@ mod tests {
             },
             workspace_member: false,
             canonical: PackageId::new("test", name, ANY_VERSION),
-            resolved_package: None,
+            resolved_content: None,
         }
     }
 

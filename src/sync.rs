@@ -451,10 +451,11 @@ pub async fn sync(sym: &Symposium, ws: &Arc<Workspace>, update: UpdateLevel) -> 
         std::collections::BTreeMap::new();
 
     for entry in &applicable {
-        let name = entry.skill.name().to_string();
-        if seen.insert((name.clone(), entry.origin_hash.clone())) {
+        let name = entry.skill().name().to_string();
+        let origin_hash = entry.origin_hash().to_string();
+        if seen.insert((name.clone(), origin_hash.clone())) {
             *name_counts.entry(name.clone()).or_default() += 1;
-            to_install.push((name, entry.origin_hash.clone(), &entry.skill.path));
+            to_install.push((name, origin_hash, &entry.skill().path));
         }
     }
 

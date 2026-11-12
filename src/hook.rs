@@ -1339,7 +1339,7 @@ mod tests {
             manifest: plugin,
             workspace_member: false,
             canonical: PackageId::new("test", "test-plugin", ANY_VERSION),
-            resolved_package: None,
+            resolved_content: None,
         }
     }
 
