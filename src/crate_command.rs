@@ -28,10 +28,10 @@ pub async fn dispatch_crate(
         if let Some(member) = deps
             .member_crates()
             .iter()
-            .find(|m| normalize_crate_name(&m.name) == normalized)
+            .find(|m| normalize_crate_name(m.name()) == normalized)
             && let Some(dir) = &member.path
         {
-            return crate_info(&member.name, &member.version.to_string(), dir);
+            return crate_info(member.name(), member.version(), dir);
         }
     }
     let id = CargoPm::id_for(name, version);
@@ -40,7 +40,7 @@ pub async fn dispatch_crate(
         .fetch(&id, symposium_install::UpdateLevel::Check)
         .await
     {
-        Ok(result) => crate_info(&result.id.name, &result.id.version, &result.root),
+        Ok(result) => crate_info(&result.id().name, &result.id().version, &result.root),
         Err(e) => DispatchResult::Err(format!("{e}")),
     }
 }

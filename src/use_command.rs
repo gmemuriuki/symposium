@@ -49,9 +49,14 @@ async fn candidates(
     if !nearest.is_empty() {
         return nearest
             .iter()
-            .map(|id| match registry.iter().find(|p| p.canonical == *id) {
-                Some(p) => Candidate::new(id, p.manifest.requires_use, true),
-                None => Candidate::new(id, false, false),
+            .map(|id| {
+                match registry
+                    .iter()
+                    .find(|plugin| crate::discovery::registry_plugin_id(plugin) == *id)
+                {
+                    Some(p) => Candidate::new(id, p.manifest.requires_use, true),
+                    None => Candidate::new(id, false, false),
+                }
             })
             .collect();
     }
@@ -301,7 +306,7 @@ async fn entry_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pm::{PackageManager, PluginKind, PmInstance, UnvalidatedPlugin};
+    use crate::pm::{PackageManager, PluginKind, PmInstance};
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
@@ -340,9 +345,9 @@ mod tests {
 
         async fn load_plugin(
             &self,
-            _: &PackageId,
+            _: &crate::pm::PackageLoadTarget,
             _: UpdateLevel,
-        ) -> Result<Vec<UnvalidatedPlugin>> {
+        ) -> Result<crate::pm::PluginListing> {
             unreachable!("a qualified lookup must not load from another PM")
         }
 

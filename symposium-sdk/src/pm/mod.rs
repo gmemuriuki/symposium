@@ -265,10 +265,10 @@ impl PluginInfo {
 /// not need to. A package manager says which plugins exist and what they
 /// contain; whether any of them runs is decided separately, from the user's
 /// configuration and from the source the plugin came from.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UnvalidatedPlugin {
-    /// The exact resolved identity: never a version requirement.
-    pub id: PackageId,
+    /// The package manager's complete resolution fact for this content.
+    pub package: PackageResolution,
     /// Directory holding the package's content: what a relative path in the
     /// manifest names a file in. Relative `source.path` skill groups resolve
     /// against it, and so do the `executable` and `script` paths of
@@ -288,9 +288,13 @@ pub struct UnvalidatedPlugin {
 
 impl UnvalidatedPlugin {
     /// A plugin whose paths are displayed relative to its own root.
-    pub fn new(id: PackageId, root: impl Into<PathBuf>, manifest: RawPluginManifest) -> Self {
+    pub fn new(
+        package: PackageResolution,
+        root: impl Into<PathBuf>,
+        manifest: RawPluginManifest,
+    ) -> Self {
         Self {
-            id,
+            package,
             root: root.into(),
             manifest,
             label_root: None,
@@ -306,6 +310,11 @@ impl UnvalidatedPlugin {
     /// The directory paths are displayed relative to.
     pub fn label_root(&self) -> &std::path::Path {
         self.label_root.as_deref().unwrap_or(&self.root)
+    }
+
+    /// The coordinate reported for this plugin's package.
+    pub fn id(&self) -> &PackageId {
+        self.package.id()
     }
 }
 
@@ -365,11 +374,18 @@ pub struct ProjectInfo {
 /// A fetched package: the exact id it resolved to, and the directory holding
 /// its content. The PM owns that directory and keeps it valid for as long as
 /// the PM runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FetchedPackage {
-    /// The exact resolved id: never a requirement.
-    pub id: PackageId,
+    /// The exact package resolution: never a version requirement.
+    pub package: PackageResolution,
     pub root: PathBuf,
+}
+
+impl FetchedPackage {
+    /// The exact resolved coordinate.
+    pub fn id(&self) -> &PackageId {
+        self.package.id()
+    }
 }
 
 /// The operations every package manager implements: a registry Symposium
@@ -409,20 +425,20 @@ pub trait PackageManager: Send + Sync {
     /// registry lists its own entries and ignores `deps`; an ecosystem
     /// surfaces the plugins its dependencies embed. Whether any of them may
     /// run is the caller's decision.
-    async fn active_plugins(&self, _deps: &[PackageId]) -> Result<PluginListing> {
+    async fn active_plugins(&self, _deps: &[PackageResolution]) -> Result<PluginListing> {
         Ok(PluginListing::complete(Vec::new()))
     }
 
-    /// The plugin(s) a specific id maps to: zero, one, or many. Under
-    /// [`UpdateLevel::None`] only what is already on disk is served.
+    /// The plugin(s) a coordinate or exact resolved key maps to: zero, one, or
+    /// many. Under [`UpdateLevel::None`] only what is already on disk is served.
     async fn load_plugin(
         &self,
-        id: &PackageId,
+        target: &PackageLoadTarget,
         update: UpdateLevel,
-    ) -> Result<Vec<UnvalidatedPlugin>>;
+    ) -> Result<PluginListing>;
 
     /// The workspace's dependencies in this PM's ecosystem.
-    async fn list_deps(&self) -> Result<Vec<PackageId>> {
+    async fn list_deps(&self) -> Result<Vec<PackageResolution>> {
         Ok(Vec::new())
     }
 

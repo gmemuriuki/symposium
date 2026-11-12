@@ -693,8 +693,6 @@ pub struct PackageManagerConfig {
 /// Cache subdirectory holding git registries' unpacked content.
 pub const REGISTRY_CACHE_SUBDIR: &str = "plugin-sources";
 
-const BUILTIN_RECOMMENDATIONS_URL: &str = "https://github.com/symposium-dev/recommendations";
-
 /// Full application context: parsed config + resolved directory paths.
 ///
 /// Thread `&Symposium` through all call sites instead of using global state.
@@ -815,15 +813,8 @@ impl Symposium {
         // `[[package-manager]]` named `cargo` replaces the built-in in-process
         // instance, which is how the cargo PM is run out of process.
         let configured = &self.config.package_managers;
-        let builtin_cargo =
-            (!configured.iter().any(|pm| pm.name == crate::pm::CARGO_PM)).then(|| {
-                crate::pm::PmInstance::new(
-                    crate::pm::CARGO_PM,
-                    false,
-                    crate::pm::PluginKind::Package,
-                    Box::new(crate::pm::CargoPm::new(Arc::clone(workspace))),
-                )
-            });
+        let builtin_cargo = (!configured.iter().any(|pm| pm.name == crate::pm::CARGO_PM))
+            .then(|| crate::pm::builtin_cargo_instance(Arc::clone(workspace)));
         let instances = builtin_cargo
             .into_iter()
             .chain(
@@ -983,7 +974,7 @@ impl Symposium {
         if self.config.defaults.symposium_recommendations {
             configs.push(RegistryConfig {
                 name: "symposium-recommendations".to_string(),
-                git: Some(BUILTIN_RECOMMENDATIONS_URL.to_string()),
+                git: Some(crate::pm::BUILTIN_RECOMMENDATIONS_URL.to_string()),
                 path: None,
                 auto_update: true,
             });

@@ -342,10 +342,14 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\),"method".*/\1/')
   case "$line" in
     *'"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocol_version":1,"name":"other"}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocol_version":2,"name":"other"}}\n' "$id" ;;
     *'"canonical_name"'*)
       name=$(printf '%s' "$line" | sed 's/.*"name":"\([^"]*\)".*/\1/')
       printf '{"jsonrpc":"2.0","id":%s,"result":{"name":"%s"}}\n' "$id" "$name" ;;
+    *'"list_deps"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"deps":[]}}\n' "$id" ;;
+    *'"fetch"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"not found"}}\n' "$id" ;;
     *'"search"'*)
       q=$(printf '%s' "$line" | sed 's/.*"query":"\([^"]*\)".*/\1/')
       printf '{"jsonrpc":"2.0","id":%s,"result":{"plugins":[{"id":{"pm":"other","name":"%s","version":"*"}}]}}\n' "$id" "$q" ;;
